@@ -7,8 +7,9 @@ import time
 from flask import Flask, request, abort
 from cachetools import TTLCache
 import re
+from web3 import Web3
 
-# Configuration du logging avec sortie explicite
+# Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -19,28 +20,38 @@ TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.getenv("PORT", 8080))  # Port défini dès le début
+PORT = int(os.getenv("PORT", 8080))
 
 # Validation des variables critiques
 if not TOKEN:
-    logger.error("TELEGRAM_TOKEN manquant. Le bot ne peut pas démarrer.")
+    logger.error("TELEGRAM_TOKEN manquant.")
     raise ValueError("TELEGRAM_TOKEN manquant")
+if not all([WALLET_ADDRESS, PRIVATE_KEY]):
+    logger.warning("WALLET_ADDRESS ou PRIVATE_KEY manquant. Trading désactivé.")
 if not WEBHOOK_URL:
-    logger.warning("WEBHOOK_URL manquant. Le webhook ne sera pas configuré.")
+    logger.warning("WEBHOOK_URL manquant.")
 
 # Initialisation
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
+w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org/"))
+if not w3.is_connected():
+    logger.error("Connexion BSC échouée. Trading désactivé.")
+    w3 = None
+
+# Configuration PancakeSwap (ABI à compléter)
+PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+PANCAKE_ROUTER_ABI = []  # Remplace par l’ABI réel de PancakeSwap Router V2
 
 # Configuration de base
 test_mode = True
-mise_depart = 5  # En BNB
-stop_loss_threshold = 10  # Stop loss dynamique (-10%)
-take_profit_steps = [2, 3, 5]  # Vente progressive à +100%, +200%, +400%
-gas_fee = 0.001  # Estimation des frais en BNB
+mise_depart = 0.01  # Réduit pour tests (en BNB)
+stop_loss_threshold = 10
+take_profit_steps = [2, 3, 5]
+gas_fee = 0.001
 detected_tokens = {}
 trade_active = False
-cache = TTLCache(maxsize=100, ttl=300)  # Cache de 5 minutes
+cache = TTLCache(maxsize=100, ttl=300)
 
 # APIs externes
 GMGN_API_URL = "https://api.gmgn.ai/new_tokens"
@@ -114,7 +125,7 @@ def callback_query(call):
 def show_config_menu(chat_id):
     markup = InlineKeyboardMarkup()
     markup.add(
-        InlineKeyboardButton("💰 Augmenter mise (+1 BNB)", callback_data="increase_mise"),
+        InlineKeyboardButton("💰 Augmenter mise (+0.01 BNB)", callback_data="increase_mise"),
         InlineKeyboardButton("🎯 Toggle Mode Test", callback_data="toggle_test")
     )
     try:
@@ -128,7 +139,7 @@ def config_callback(call):
     chat_id = call.message.chat.id
     try:
         if call.data == "increase_mise":
-            mise_depart += 1
+            mise_depart += 0.01
             bot.send_message(chat_id, f"💰 Mise augmentée à {mise_depart} BNB")
         elif call.data == "toggle_test":
             test_mode = not test_mode
@@ -164,9 +175,11 @@ def is_valid_token_bscscan(contract_address):
 # Surveillance gmgn.ai
 def detect_new_tokens(chat_id):
     global detected_tokens
+    bot.send_message(chat_id, "🔍 Recherche de tokens sur gmgn.ai...")
     try:
         response = requests.get(GMGN_API_URL, timeout=5)
         tokens = response.json()
+        bot.send_message(chat_id, f"📡 {len(tokens)} tokens trouvés sur gmgn.ai")
         for token in tokens:
             ca = token["contract_address"]
             if ca in cache:
@@ -174,16 +187,25 @@ def detect_new_tokens(chat_id):
             if is_valid_token_tokensniffer(ca) and is_valid_token_bscscan(ca):
                 detected_tokens[ca] = {"status": "safe", "entry_price": None}
                 bot.send_message(chat_id, f"✅ Nouveau token détecté : {token['name']} ({ca})")
+                if trade_active and w3:
+                    buy_token(chat_id, ca, mise_depart)
+            else:
+                bot.send_message(chat_id, f"❌ {ca} rejeté par les filtres de sécurité")
+        if not tokens:
+            bot.send_message(chat_id, "ℹ️ Aucun token trouvé sur gmgn.ai")
     except Exception as e:
         logger.error(f"Erreur detect_new_tokens: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur gmgn.ai: {str(e)}")
 
 # Surveillance Twitter
 def monitor_twitter_for_tokens(chat_id):
     headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
     params = {"query": "contract address memecoin $ -is:retweet", "max_results": 10}
+    bot.send_message(chat_id, "🔍 Recherche de tokens sur Twitter...")
     try:
         response = requests.get(TWITTER_TRACK_URL, headers=headers, params=params, timeout=5)
         tweets = response.json()
+        bot.send_message(chat_id, f"📡 {len(tweets['data'])} tweets trouvés sur Twitter")
         for tweet in tweets["data"]:
             ca_match = re.search(r"0x[a-fA-F0-9]{40}", tweet["text"])
             if ca_match:
@@ -192,9 +214,45 @@ def monitor_twitter_for_tokens(chat_id):
                     if is_valid_token_tokensniffer(ca) and is_valid_token_bscscan(ca):
                         detected_tokens[ca] = {"status": "safe", "entry_price": None}
                         bot.send_message(chat_id, f"🚀 Token détecté sur X : {ca}")
-                    cache[ca] = True
+                        if trade_active and w3:
+                            buy_token(chat_id, ca, mise_depart)
+                    else:
+                        bot.send_message(chat_id, f"❌ {ca} rejeté par les filtres de sécurité")
+                else:
+                    bot.send_message(chat_id, f"ℹ️ {ca} déjà vu ou en cache")
+        if not tweets["data"]:
+            bot.send_message(chat_id, "ℹ️ Aucun tweet trouvé sur Twitter")
     except Exception as e:
         logger.error(f"Erreur monitor_twitter_for_tokens: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur Twitter: {str(e)}")
+
+# Achat de token sur PancakeSwap
+def buy_token(chat_id, contract_address, amount):
+    if not w3 or test_mode:
+        bot.send_message(chat_id, f"🧪 [Mode Test] Achat simulé de {amount} BNB de {contract_address}")
+        detected_tokens[contract_address]["entry_price"] = 0.01  # Prix fictif
+        return
+    try:
+        router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
+        amount_in = w3.to_wei(amount, 'ether')
+        tx = router.functions.swapExactETHForTokens(
+            0,  # Montant minimum (slippage à ajuster)
+            [w3.to_checksum_address("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"), w3.to_checksum_address(contract_address)],  # WBNB -> Token
+            w3.to_checksum_address(WALLET_ADDRESS),
+            int(time.time()) + 60 * 10  # Deadline
+        ).build_transaction({
+            'from': WALLET_ADDRESS,
+            'value': amount_in,
+            'gas': 200000,
+            'gasPrice': w3.to_wei('5', 'gwei'),
+            'nonce': w3.eth.get_transaction_count(WALLET_ADDRESS)
+        })
+        signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        bot.send_message(chat_id, f"🚀 Achat de {amount} BNB de {contract_address}, TX: {tx_hash.hex()}")
+    except Exception as e:
+        logger.error(f"Erreur achat token: {str(e)}")
+        bot.send_message(chat_id, f"❌ Échec achat {contract_address}: {str(e)}")
 
 # Configuration du webhook
 def set_webhook():
@@ -203,8 +261,6 @@ def set_webhook():
             bot.remove_webhook()
             bot.set_webhook(url=WEBHOOK_URL)
             logger.info("Webhook configuré avec succès")
-        else:
-            logger.warning("WEBHOOK_URL non défini, webhook non configuré")
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
 
@@ -218,4 +274,4 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
     except Exception as e:
         logger.error(f"Erreur critique au démarrage: {str(e)}")
-        raise  # Relance pour que Cloud Run signale l’échec
+        raise
