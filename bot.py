@@ -5,12 +5,12 @@ import logging
 import requests
 import time
 from flask import Flask, request, abort
-from web3 import Web3
 from cachetools import TTLCache
 import re
 
-# Configuration du logging
+# Configuration du logging avec sortie explicite
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 # Chargement des variables d'environnement
 TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -19,26 +19,18 @@ TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PORT = int(os.getenv("PORT", 8080))  # Port défini dès le début
 
 # Validation des variables critiques
 if not TOKEN:
-    logging.error("TELEGRAM_TOKEN manquant. Le bot ne peut pas démarrer.")
+    logger.error("TELEGRAM_TOKEN manquant. Le bot ne peut pas démarrer.")
     raise ValueError("TELEGRAM_TOKEN manquant")
 if not WEBHOOK_URL:
-    logging.warning("WEBHOOK_URL manquant. Le webhook ne sera pas configuré.")
+    logger.warning("WEBHOOK_URL manquant. Le webhook ne sera pas configuré.")
 
 # Initialisation
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
-
-# Configuration Web3 (avec gestion d'erreur)
-try:
-    w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org/"))
-    if not w3.is_connected():
-        logging.warning("Connexion à BSC échouée. Les trades ne fonctionneront pas.")
-except Exception as e:
-    logging.error(f"Erreur initialisation Web3: {str(e)}")
-    w3 = None
 
 # Configuration de base
 test_mode = True
@@ -54,19 +46,20 @@ cache = TTLCache(maxsize=100, ttl=300)  # Cache de 5 minutes
 GMGN_API_URL = "https://api.gmgn.ai/new_tokens"
 BSC_SCAN_API_URL = "https://api.bscscan.com/api"
 TWITTER_TRACK_URL = "https://api.twitter.com/2/tweets/search/recent"
-PANCAKE_POOL_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"  # Exemple PancakeSwap
 
 # Webhook Telegram
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
+        logger.info("Webhook reçu")
         if request.headers.get("content-type") == "application/json":
             update = telebot.types.Update.de_json(request.get_json())
             bot.process_new_updates([update])
             return "OK", 200
+        logger.warning("Requête webhook invalide")
         return abort(403)
     except Exception as e:
-        logging.error(f"Erreur dans webhook: {str(e)}")
+        logger.error(f"Erreur dans webhook: {str(e)}")
         return abort(500)
 
 # Commande /start
@@ -76,7 +69,7 @@ def start_message(message):
         bot.send_message(message.chat.id, "🤖 Bienvenue sur ton bot de trading de memecoins !")
         show_main_menu(message.chat.id)
     except Exception as e:
-        logging.error(f"Erreur dans start_message: {str(e)}")
+        logger.error(f"Erreur dans start_message: {str(e)}")
 
 # Menu principal
 def show_main_menu(chat_id):
@@ -90,7 +83,7 @@ def show_main_menu(chat_id):
     try:
         bot.send_message(chat_id, "Que veux-tu faire ?", reply_markup=markup)
     except Exception as e:
-        logging.error(f"Erreur dans show_main_menu: {str(e)}")
+        logger.error(f"Erreur dans show_main_menu: {str(e)}")
 
 # Gestion des callbacks
 @bot.callback_query_handler(func=lambda call: True)
@@ -114,7 +107,7 @@ def callback_query(call):
             trade_active = False
             bot.send_message(chat_id, "⏹ Trading arrêté.")
     except Exception as e:
-        logging.error(f"Erreur dans callback_query: {str(e)}")
+        logger.error(f"Erreur dans callback_query: {str(e)}")
         bot.send_message(chat_id, "⚠️ Une erreur est survenue.")
 
 # Menu de configuration
@@ -127,7 +120,7 @@ def show_config_menu(chat_id):
     try:
         bot.send_message(chat_id, "⚙️ Configuration :", reply_markup=markup)
     except Exception as e:
-        logging.error(f"Erreur dans show_config_menu: {str(e)}")
+        logger.error(f"Erreur dans show_config_menu: {str(e)}")
 
 @bot.callback_query_handler(func=lambda call: call.data in ["increase_mise", "toggle_test"])
 def config_callback(call):
@@ -141,7 +134,7 @@ def config_callback(call):
             test_mode = not test_mode
             bot.send_message(chat_id, f"🎯 Mode Test {'activé' if test_mode else 'désactivé'}")
     except Exception as e:
-        logging.error(f"Erreur dans config_callback: {str(e)}")
+        logger.error(f"Erreur dans config_callback: {str(e)}")
 
 # Vérification TokenSniffer
 def is_valid_token_tokensniffer(contract_address):
@@ -152,7 +145,7 @@ def is_valid_token_tokensniffer(contract_address):
             return True
         return False
     except Exception as e:
-        logging.error(f"Erreur TokenSniffer: {str(e)}")
+        logger.error(f"Erreur TokenSniffer: {str(e)}")
         return False
 
 # Vérification BscScan
@@ -165,7 +158,7 @@ def is_valid_token_bscscan(contract_address):
             return True
         return False
     except Exception as e:
-        logging.error(f"Erreur BscScan: {str(e)}")
+        logger.error(f"Erreur BscScan: {str(e)}")
         return False
 
 # Surveillance gmgn.ai
@@ -182,7 +175,7 @@ def detect_new_tokens(chat_id):
                 detected_tokens[ca] = {"status": "safe", "entry_price": None}
                 bot.send_message(chat_id, f"✅ Nouveau token détecté : {token['name']} ({ca})")
     except Exception as e:
-        logging.error(f"Erreur detect_new_tokens: {str(e)}")
+        logger.error(f"Erreur detect_new_tokens: {str(e)}")
 
 # Surveillance Twitter
 def monitor_twitter_for_tokens(chat_id):
@@ -201,7 +194,7 @@ def monitor_twitter_for_tokens(chat_id):
                         bot.send_message(chat_id, f"🚀 Token détecté sur X : {ca}")
                     cache[ca] = True
     except Exception as e:
-        logging.error(f"Erreur monitor_twitter_for_tokens: {str(e)}")
+        logger.error(f"Erreur monitor_twitter_for_tokens: {str(e)}")
 
 # Configuration du webhook
 def set_webhook():
@@ -209,20 +202,20 @@ def set_webhook():
         if WEBHOOK_URL:
             bot.remove_webhook()
             bot.set_webhook(url=WEBHOOK_URL)
-            logging.info("Webhook configuré avec succès !")
+            logger.info("Webhook configuré avec succès")
         else:
-            logging.warning("WEBHOOK_URL non défini, webhook non configuré.")
+            logger.warning("WEBHOOK_URL non défini, webhook non configuré")
     except Exception as e:
-        logging.error(f"Erreur configuration webhook: {str(e)}")
+        logger.error(f"Erreur configuration webhook: {str(e)}")
 
-# Démarrage
+# Point d’entrée principal
 if __name__ == "__main__":
-    logging.info("Bot starting...")
+    logger.info("Initialisation du bot...")
     try:
+        logger.info("Configuration du webhook Telegram...")
         set_webhook()
-        port = int(os.getenv("PORT", 8080))
-        logging.info(f"Starting Flask on port {port}...")
-        app.run(host="0.0.0.0", port=port, debug=False)
+        logger.info(f"Démarrage de Flask sur le port {PORT}...")
+        app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
     except Exception as e:
-        logging.error(f"Erreur démarrage bot: {str(e)}")
-        raise  # Relance l’erreur pour que Cloud Run signale le problème
+        logger.error(f"Erreur critique au démarrage: {str(e)}")
+        raise  # Relance pour que Cloud Run signale l’échec
