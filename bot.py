@@ -99,4 +99,130 @@ def callback_query(call):
     chat_id = call.message.chat.id
     try:
         if call.data == "status":
-            bot.send_message(chat_id, f"📊 Statut :\
+            bot.send_message(chat_id, f"📊 Statut :\n- Mise: {mise_depart} BNB\n- Mode test: {test_mode}\n- Trading actif: {trade_active}")
+        elif call.data == "config":
+            show_config_menu(chat_id)
+        elif call.data == "launch":
+            if not trade_active:
+                trade_active = True
+                bot.send_message(chat_id, "🚀 Trading lancé !")
+                detect_new_tokens(chat_id)
+                monitor_twitter_for_tokens(chat_id)
+            else:
+                bot.send_message(chat_id, "⚠️ Trading déjà en cours.")
+        elif call.data == "stop":
+            trade_active = False
+            bot.send_message(chat_id, "⏹ Trading arrêté.")
+    except Exception as e:
+        logging.error(f"Erreur dans callback_query: {str(e)}")
+        bot.send_message(chat_id, "⚠️ Une erreur est survenue.")
+
+# Menu de configuration
+def show_config_menu(chat_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("💰 Augmenter mise (+1 BNB)", callback_data="increase_mise"),
+        InlineKeyboardButton("🎯 Toggle Mode Test", callback_data="toggle_test")
+    )
+    try:
+        bot.send_message(chat_id, "⚙️ Configuration :", reply_markup=markup)
+    except Exception as e:
+        logging.error(f"Erreur dans show_config_menu: {str(e)}")
+
+@bot.callback_query_handler(func=lambda call: call.data in ["increase_mise", "toggle_test"])
+def config_callback(call):
+    global mise_depart, test_mode
+    chat_id = call.message.chat.id
+    try:
+        if call.data == "increase_mise":
+            mise_depart += 1
+            bot.send_message(chat_id, f"💰 Mise augmentée à {mise_depart} BNB")
+        elif call.data == "toggle_test":
+            test_mode = not test_mode
+            bot.send_message(chat_id, f"🎯 Mode Test {'activé' if test_mode else 'désactivé'}")
+    except Exception as e:
+        logging.error(f"Erreur dans config_callback: {str(e)}")
+
+# Vérification TokenSniffer
+def is_valid_token_tokensniffer(contract_address):
+    try:
+        url = f"https://tokensniffer.com/token/{contract_address}"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200 and "Rug Pull" not in response.text and "honeypot" not in response.text:
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"Erreur TokenSniffer: {str(e)}")
+        return False
+
+# Vérification BscScan
+def is_valid_token_bscscan(contract_address):
+    try:
+        params = {'module': 'token', 'action': 'getTokenInfo', 'contractaddress': contract_address, 'apikey': BSC_SCAN_API_KEY}
+        response = requests.get(BSC_SCAN_API_URL, params=params, timeout=5)
+        data = response.json()
+        if data['status'] == '1' and float(data['result']['totalSupply']) >= 1000:
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"Erreur BscScan: {str(e)}")
+        return False
+
+# Surveillance gmgn.ai
+def detect_new_tokens(chat_id):
+    global detected_tokens
+    try:
+        response = requests.get(GMGN_API_URL, timeout=5)
+        tokens = response.json()
+        for token in tokens:
+            ca = token["contract_address"]
+            if ca in cache:
+                continue
+            if is_valid_token_tokensniffer(ca) and is_valid_token_bscscan(ca):
+                detected_tokens[ca] = {"status": "safe", "entry_price": None}
+                bot.send_message(chat_id, f"✅ Nouveau token détecté : {token['name']} ({ca})")
+    except Exception as e:
+        logging.error(f"Erreur detect_new_tokens: {str(e)}")
+
+# Surveillance Twitter
+def monitor_twitter_for_tokens(chat_id):
+    headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
+    params = {"query": "contract address memecoin $ -is:retweet", "max_results": 10}
+    try:
+        response = requests.get(TWITTER_TRACK_URL, headers=headers, params=params, timeout=5)
+        tweets = response.json()
+        for tweet in tweets["data"]:
+            ca_match = re.search(r"0x[a-fA-F0-9]{40}", tweet["text"])
+            if ca_match:
+                ca = ca_match.group(0)
+                if ca not in detected_tokens and ca not in cache:
+                    if is_valid_token_tokensniffer(ca) and is_valid_token_bscscan(ca):
+                        detected_tokens[ca] = {"status": "safe", "entry_price": None}
+                        bot.send_message(chat_id, f"🚀 Token détecté sur X : {ca}")
+                    cache[ca] = True
+    except Exception as e:
+        logging.error(f"Erreur monitor_twitter_for_tokens: {str(e)}")
+
+# Configuration du webhook
+def set_webhook():
+    try:
+        if WEBHOOK_URL:
+            bot.remove_webhook()
+            bot.set_webhook(url=WEBHOOK_URL)
+            logging.info("Webhook configuré avec succès !")
+        else:
+            logging.warning("WEBHOOK_URL non défini, webhook non configuré.")
+    except Exception as e:
+        logging.error(f"Erreur configuration webhook: {str(e)}")
+
+# Démarrage
+if __name__ == "__main__":
+    logging.info("Bot starting...")
+    try:
+        set_webhook()
+        port = int(os.getenv("PORT", 8080))
+        logging.info(f"Starting Flask on port {port}...")
+        app.run(host="0.0.0.0", port=port, debug=False)
+    except Exception as e:
+        logging.error(f"Erreur démarrage bot: {str(e)}")
+        raise  # Relance l’erreur pour que Cloud Run signale le problème
