@@ -218,8 +218,10 @@ def callback_query(call):
             if not trade_active:
                 trade_active = True
                 bot.send_message(chat_id, "🚀 Trading lancé !")
+                cycle_count = 0
                 while trade_active:
-                    bot.send_message(chat_id, "ℹ️ Début d'un nouveau cycle de détection...")
+                    cycle_count += 1
+                    bot.send_message(chat_id, f"ℹ️ Début du cycle de détection #{cycle_count}...")
                     try:
                         detect_new_tokens_bsc(chat_id)
                         bot.send_message(chat_id, "✅ Détection BSC terminée, passage à Solana...")
@@ -490,7 +492,7 @@ def buy_token_bsc(chat_id, contract_address, amount):
             "market_cap_at_buy": detected_tokens[contract_address]["market_cap"],
             "current_market_cap": detected_tokens[contract_address]["market_cap"]
         }
-        monitor_and_sell(chat_id, contract_address, amount, "bsc")
+        # Ne pas appeler monitor_and_sell en mode test pour éviter le blocage
         return
     try:
         router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
@@ -536,7 +538,7 @@ def buy_token_solana(chat_id, contract_address, amount):
             "market_cap_at_buy": detected_tokens[contract_address]["market_cap"],
             "current_market_cap": detected_tokens[contract_address]["market_cap"]
         }
-        monitor_and_sell(chat_id, contract_address, amount, "solana")
+        # Ne pas appeler monitor_and_sell en mode test
         return
     try:
         amount_in = int(amount * 10**9)
@@ -572,13 +574,16 @@ def buy_token_solana(chat_id, contract_address, amount):
         logger.error(f"Erreur achat Solana: {str(e)}")
         bot.send_message(chat_id, f"❌ Échec achat {contract_address}: {str(e)}")
 
-# Surveillance et vente
+# Surveillance et vente (limité à 5 itérations en mode test)
 def monitor_and_sell(chat_id, contract_address, amount, chain):
+    logger.info(f"Surveillance de {contract_address} sur {chain}")
     entry_price = portfolio[contract_address]["entry_price"]
     market_cap = portfolio[contract_address]["market_cap_at_buy"]
     position_open = True
     sold_half = False
-    while position_open and trade_active:
+    iteration = 0
+    max_iterations = 5  # Limite pour éviter un blocage infini
+    while position_open and trade_active and iteration < max_iterations:
         try:
             current_price = entry_price * (1 + (market_cap / 1000000))
             profit_pct = ((current_price - entry_price) / entry_price) * 100
@@ -593,11 +598,14 @@ def monitor_and_sell(chat_id, contract_address, amount, chain):
             elif profit_pct <= -stop_loss_threshold:
                 sell_token(chat_id, contract_address, amount, chain, current_price)
                 position_open = False
+            iteration += 1
             time.sleep(10)
         except Exception as e:
             logger.error(f"Erreur surveillance: {str(e)}")
             bot.send_message(chat_id, f"⚠️ Erreur surveillance {contract_address}: {str(e)}")
             break
+    if iteration >= max_iterations:
+        bot.send_message(chat_id, f"ℹ️ Surveillance de {contract_address} terminée après {max_iterations} itérations.")
 
 # Vente de token (BSC)
 def sell_token(chat_id, contract_address, amount, chain, current_price):
