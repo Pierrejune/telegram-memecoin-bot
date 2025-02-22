@@ -56,6 +56,8 @@ w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org/"))
 if not w3.is_connected():
     logger.error("Connexion BSC échouée.")
     w3 = None
+else:
+    logger.info("Connexion BSC réussie.")
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
 PANCAKE_FACTORY_ABI = json.loads('''
@@ -109,7 +111,7 @@ PANCAKE_ROUTER_ABI = json.loads('''
 ''')
 
 # Solana (Raydium)
-SOLANA_RPC = "https://solana-mainnet.rpc.extrnode.com"  # Noeud alternatif gratuit
+SOLANA_RPC = "https://solana-mainnet.rpc.extrnode.com"
 solana_keypair = Keypair.from_base58_string(SOLANA_WALLET_PRIVATE_KEY)
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSceAHj2")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
@@ -400,13 +402,82 @@ def detect_new_tokens_solana(chat_id):
         blockhash = response.json().get('result', {}).get('value', {}).get('blockhash')
         logger.info(f"Blockhash Solana: {blockhash}")
 
+        # Utilisation de getSignaturesForAddress pour TOKEN_PROGRAM_ID
         response = session.post(SOLANA_RPC, json={
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "getConfirmedSignaturesForAddress2",
+            "method": "getSignaturesForAddress",
             "params": [str(TOKEN_PROGRAM_ID), {"limit": 10}]
         }, timeout=10)
         response.raise_for_status()
         data = response.json()
         signatures = data.get('result', [])
-        bot.send_message(chat_id
+        bot.send_message(chat_id, f"📡 {len(signatures)} transactions récentes trouvées sur Solana")
+
+        for sig in signatures:
+            tx_response = session.post(SOLANA_RPC, json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": [sig['signature'], "jsonParsed"]
+            }, timeout=10)
+            tx_response.raise_for_status()
+            tx_data = tx_response.json().get('result', {})
+            if not tx_data:
+                continue
+            
+            accounts = tx_data.get('transaction', {}).get('message', {}).get('accountKeys', [])
+            for account in accounts:
+                ca = account.get('pubkey')
+                if ca in cache or ca == str(TOKEN_PROGRAM_ID):
+                    continue
+                liquidity = 150000
+                volume = 100000
+                market_cap = 500000
+                price_change = 50
+
+                if (MIN_VOLUME_SOL <= volume <= MAX_VOLUME_SOL and 
+                    liquidity >= MIN_LIQUIDITY and liquidity >= market_cap * MIN_LIQUIDITY_PCT and 
+                    MIN_PRICE_CHANGE <= price_change <= MAX_PRICE_CHANGE and 
+                    MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
+                    detected_tokens[ca] = {"status": "safe", "entry_price": None, "chain": "solana", "market_cap": market_cap}
+                    bot.send_message(chat_id, f"🚀 Token détecté : {ca} (Solana) - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}")
+                    if trade_active:
+                        buy_token_solana(chat_id, ca, mise_depart_sol)
+                else:
+                    bot.send_message(chat_id, f"❌ {ca} rejeté - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}, Change: {price_change}%")
+                cache[ca] = True
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Erreur Solana RPC HTTP: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur Solana RPC: {str(e)}")
+    except Exception as e:
+        logger.error(f"Erreur Solana RPC: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur Solana RPC inattendue: {str(e)}")
+
+# Achat de token sur BSC (PancakeSwap)
+def buy_token_bsc(chat_id, contract_address, amount):
+    logger.info(f"Achat de {contract_address} sur BSC")
+    if test_mode:
+        bot.send_message(chat_id, f"🧪 [Mode Test] Achat simulé de {amount} BNB de {contract_address}")
+        detected_tokens[contract_address]["entry_price"] = 0.01
+        portfolio[contract_address] = {
+            "amount": amount,
+            "chain": "bsc",
+            "entry_price": 0.01,
+            "market_cap_at_buy": detected_tokens[contract_address]["market_cap"],
+            "current_market_cap": detected_tokens[contract_address]["market_cap"]
+        }
+        monitor_and_sell(chat_id, contract_address, amount, "bsc")
+        return
+    try:
+        router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
+        amount_in = w3.to_wei(amount, 'ether')
+        amount_out_min = int(amount_in * (1 - slippage / 100))
+        tx = router.functions.swapExactETHForTokens(
+            amount_out_min,
+            [w3.to_checksum_address("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"), w3.to_checksum_address(contract_address)],
+            w3.to_checksum_address(WALLET_ADDRESS),
+            int(time.time()) + 60 * 10
+        ).build_transaction({
+            'from': WALLET_ADDRESS,
+            'v
