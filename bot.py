@@ -12,7 +12,6 @@ from solders.pubkey import Pubkey
 from solders.transaction import Transaction
 from solders.instruction import Instruction
 import json
-import hashlib
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -30,7 +29,6 @@ session.headers.update(HEADERS)
 
 # Chargement des variables
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -59,6 +57,22 @@ if not w3.is_connected():
     logger.error("Connexion BSC échouée.")
     w3 = None
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
+PANCAKE_FACTORY_ABI = json.loads('''
+[
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "internalType": "address", "name": "token0", "type": "address"},
+      {"indexed": true, "internalType": "address", "name": "token1", "type": "address"},
+      {"indexed": false, "internalType": "address", "name": "pair", "type": "address"},
+      {"indexed": false, "internalType": "uint256", "name": "", "type": "uint256"}
+    ],
+    "name": "PairCreated",
+    "type": "event"
+  }
+]
+''')
 PANCAKE_ROUTER_ABI = json.loads('''
 [
   {
@@ -95,15 +109,15 @@ PANCAKE_ROUTER_ABI = json.loads('''
 ''')
 
 # Solana (Raydium)
-SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+SOLANA_RPC = "https://solana-api.projectserum.com"  # Noeud alternatif gratuit
 solana_keypair = Keypair.from_base58_string(SOLANA_WALLET_PRIVATE_KEY)
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSceAHj2")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
 # Configuration de base
 test_mode = True
-mise_depart_bsc = 0.01  # BNB pour BSC
-mise_depart_sol = 0.02  # SOL pour Solana
+mise_depart_bsc = 0.01
+mise_depart_sol = 0.02
 slippage = 5
 gas_fee = 5
 stop_loss_threshold = 30
@@ -128,10 +142,6 @@ MIN_MARKET_CAP_BSC = 200000
 MAX_MARKET_CAP_BSC = 2000000
 MAX_TAX = 5
 MAX_HOLDER_PCT = 5
-
-# APIs externes
-BSC_SCAN_API_URL = "https://api.bscscan.com/api"
-SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 
 # Webhook Telegram
 @app.route("/webhook", methods=["POST"])
@@ -342,7 +352,7 @@ def is_valid_token_tokensniffer(contract_address):
 # Vérification BscScan
 def is_valid_token_bscscan(contract_address):
     try:
-        params = {'module': 'token', 'action': 'getTokenInfo', 'contractaddress': contract_address, 'apikey': BSC_SCAN_API_KEY}
+        params = {'module': 'token', 'action': 'getTokenInfo', 'contractaddress': contract_address, 'apikey': 'YOUR_API_KEY'}
         response = session.get(BSC_SCAN_API_URL, params=params, timeout=10)
         data = response.json()
         if data['status'] == '1' and float(data['result']['totalSupply']) >= 1000:
@@ -352,29 +362,20 @@ def is_valid_token_bscscan(contract_address):
         logger.error(f"Erreur BscScan: {str(e)}")
         return False
 
-# Surveillance BscScan pour BSC
+# Surveillance BSC pour nouveaux tokens
 def detect_new_tokens_bsc(chat_id):
     global detected_tokens
-    bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur BscScan...")
+    bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur BSC (PancakeSwap)...")
     try:
-        params = {
-            'module': 'logs',
-            'action': 'getLogs',
-            'fromBlock': 'latest',
-            'toBlock': 'latest',
-            'topic0': '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',  # Transfer event
-            'apikey': BSC_SCAN_API_KEY
-        }
-        response = session.get(BSC_SCAN_API_URL, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if data['status'] != '1':
-            bot.send_message(chat_id, f"⚠️ Erreur BscScan: {data.get('message', 'Erreur inconnue')}")
-            return
-        logs = data['result'][:10]
-        bot.send_message(chat_id, f"📡 {len(logs)} événements trouvés sur BscScan")
-        for log in logs:
-            ca = log['address']
+        factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
+        latest_block = w3.eth.block_number
+        event_filter = factory.events.PairCreated.create_filter(fromBlock=latest_block-100, toBlock=latest_block)
+        events = event_filter.get_all_entries()
+        bot.send_message(chat_id, f"📡 {len(events)} nouvelles paires trouvées sur BSC")
+        for event in events:
+            token0 = event['args']['token0']
+            token1 = event['args']['token1']
+            ca = token0 if token0 != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1  # WBNB exclu
             if ca in cache:
                 continue
             liquidity = 150000
@@ -385,8 +386,7 @@ def detect_new_tokens_bsc(chat_id):
             if (MIN_VOLUME_BSC <= volume <= MAX_VOLUME_BSC and 
                 liquidity >= MIN_LIQUIDITY and liquidity >= market_cap * MIN_LIQUIDITY_PCT and 
                 MIN_PRICE_CHANGE <= price_change <= MAX_PRICE_CHANGE and 
-                MIN_MARKET_CAP_BSC <= market_cap <= MAX_MARKET_CAP_BSC and 
-                is_valid_token_tokensniffer(ca) and is_valid_token_bscscan(ca)):
+                MIN_MARKET_CAP_BSC <= market_cap <= MAX_MARKET_CAP_BSC):
                 detected_tokens[ca] = {"status": "safe", "entry_price": None, "chain": "bsc", "market_cap": market_cap}
                 bot.send_message(chat_id, f"🚀 Token détecté : {ca} (BSC) - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}")
                 if trade_active and w3:
@@ -394,25 +394,22 @@ def detect_new_tokens_bsc(chat_id):
             else:
                 bot.send_message(chat_id, f"❌ {ca} rejeté - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}, Change: {price_change}%")
             cache[ca] = True
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Erreur BscScan HTTP: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur BscScan: {str(e)}")
     except Exception as e:
-        logger.error(f"Erreur BscScan: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur BscScan inattendue: {str(e)}")
+        logger.error(f"Erreur détection BSC: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur détection BSC: {str(e)}")
 
-# Surveillance Solana pour Solana
+# Surveillance Solana pour nouveaux tokens
 def detect_new_tokens_solana(chat_id):
     global detected_tokens
     bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur Solana...")
     try:
-        response = session.post(SOLANA_RPC_URL, json={
+        response = session.post(SOLANA_RPC, json={
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getProgramAccounts",
             "params": [
                 str(TOKEN_PROGRAM_ID),
-                {"encoding": "jsonParsed", "filters": [{"dataSize": 165}]}  # Taille des comptes token
+                {"encoding": "jsonParsed", "filters": [{"dataSize": 165}]}
             ]
         }, timeout=10)
         response.raise_for_status()
@@ -521,7 +518,7 @@ def buy_token_solana(chat_id, contract_address, amount):
         tx.add(instruction)
         tx.recent_blockhash = Pubkey.from_string(hashlib.sha256(str(int(time.time())).encode()).hexdigest()[:32])
         tx.sign(solana_keypair)
-        response = session.post(SOLANA_RPC_URL, json={
+        response = session.post(SOLANA_RPC, json={
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendTransaction",
@@ -646,7 +643,7 @@ def show_portfolio(chat_id):
 # Solde Solana réel
 def get_solana_balance(wallet_address):
     try:
-        response = session.post(SOLANA_RPC_URL, json={
+        response = session.post(SOLANA_RPC, json={
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getBalance",
