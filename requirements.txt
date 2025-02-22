@@ -4,4 +4,3 @@ flask==2.3.2
 cachetools==5.3.1
 python-dotenv==1.0.0
 web3==6.11.0
-solders==0.21.0
