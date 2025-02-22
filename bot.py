@@ -14,6 +14,14 @@ from bs4 import BeautifulSoup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Headers pour simuler un navigateur
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Connection": "keep-alive"
+}
+
 # Chargement des variables d'environnement
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
@@ -45,28 +53,28 @@ PANCAKE_ROUTER_ABI = []  # Ajoute l’ABI réel ici
 # Configuration de base
 test_mode = True
 mise_depart = 0.01
-stop_loss_threshold = 30  # Trailing stop -30%
-take_profit_steps = [2, 3, 5]  # x2, x3, x5
+stop_loss_threshold = 30
+take_profit_steps = [2, 3, 5]
 gas_fee = 0.001
 detected_tokens = {}
 trade_active = False
 cache = TTLCache(maxsize=100, ttl=300)
 
 # Critères personnalisés
-MIN_VOLUME_SOL = 50000   # Volume min Solana
-MAX_VOLUME_SOL = 500000  # Volume max Solana
-MIN_VOLUME_BSC = 75000   # Volume min BSC
-MAX_VOLUME_BSC = 750000  # Volume max BSC
-MIN_LIQUIDITY = 100000   # Liquidité min absolue
-MIN_LIQUIDITY_PCT = 0.02 # 2% du market cap
-MIN_PRICE_CHANGE = 30    # +30%
-MAX_PRICE_CHANGE = 200   # +200%
+MIN_VOLUME_SOL = 50000
+MAX_VOLUME_SOL = 500000
+MIN_VOLUME_BSC = 75000
+MAX_VOLUME_BSC = 750000
+MIN_LIQUIDITY = 100000
+MIN_LIQUIDITY_PCT = 0.02
+MIN_PRICE_CHANGE = 30
+MAX_PRICE_CHANGE = 200
 MIN_MARKET_CAP_SOL = 100000
 MAX_MARKET_CAP_SOL = 1000000
 MIN_MARKET_CAP_BSC = 200000
 MAX_MARKET_CAP_BSC = 2000000
-MAX_TAX = 5              # Taxe max 5%
-MAX_HOLDER_PCT = 5       # Pas de wallet > 5%
+MAX_TAX = 5
+MAX_HOLDER_PCT = 5
 
 # APIs externes
 BSC_SCAN_API_URL = "https://api.bscscan.com/api"
@@ -125,9 +133,10 @@ def callback_query(call):
             if not trade_active:
                 trade_active = True
                 bot.send_message(chat_id, "🚀 Trading lancé !")
-                while trade_active:  # Boucle pour trading continu
+                while trade_active:
                     detect_new_tokens(chat_id)
-                    time.sleep(60)  # Vérifie toutes les minutes
+                    monitor_twitter_for_tokens(chat_id)
+                    time.sleep(60)
             else:
                 bot.send_message(chat_id, "⚠️ Trading déjà en cours.")
         elif call.data == "stop":
@@ -167,12 +176,11 @@ def config_callback(call):
 def is_valid_token_tokensniffer(contract_address):
     try:
         url = f"https://tokensniffer.com/token/{contract_address}"
-        response = requests.get(url, timeout=5)
+        response = requests.get(url, headers=HEADERS, timeout=5)
         if response.status_code == 200:
             text = response.text.lower()
             if "rug pull" in text or "honeypot" in text:
                 return False
-            # Vérifie contrat renoncé et taxes (simplifié)
             if "owner renounced" not in text or "tax > 5%" in text:
                 return False
             return True
@@ -199,7 +207,8 @@ def detect_new_tokens(chat_id):
     global detected_tokens
     bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur DexScreener...")
     try:
-        response = requests.get(DEXSCREENER_URL, timeout=5)
+        response = requests.get(DEXSCREENER_URL, headers=HEADERS, timeout=10)
+        response.raise_for_status()  # Vérifie les erreurs HTTP
         soup = BeautifulSoup(response.text, 'html.parser')
         pairs = soup.select('div.pair-row')[:10]  # Ajuste selon la structure réelle
         bot.send_message(chat_id, f"📡 {len(pairs)} nouveaux tokens trouvés sur DexScreener")
@@ -212,13 +221,12 @@ def detect_new_tokens(chat_id):
             if ca in cache or not chain:
                 continue
             
-            # Récupérer métriques (simplifié, à ajuster selon HTML réel)
+            # Récupérer métriques (simulé, à ajuster)
             liquidity = float(pair.select_one('span.liquidity').text.replace('$', '').replace(',', '')) if pair.select_one('span.liquidity') else 0
             volume = float(pair.select_one('span.volume').text.replace('$', '').replace(',', '')) if pair.select_one('span.volume') else 0
             market_cap = float(pair.select_one('span.market-cap').text.replace('$', '').replace(',', '')) if pair.select_one('span.market-cap') else 0
             price_change = float(pair.select_one('span.price-change').text.replace('%', '')) if pair.select_one('span.price-change') else 0
 
-            # Critères
             min_volume = MIN_VOLUME_SOL if chain == "solana" else MIN_VOLUME_BSC
             max_volume = MAX_VOLUME_SOL if chain == "solana" else MAX_VOLUME_BSC
             min_mc = MIN_MARKET_CAP_SOL if chain == "solana" else MIN_MARKET_CAP_BSC
@@ -238,9 +246,51 @@ def detect_new_tokens(chat_id):
             cache[ca] = True
         if not pairs:
             bot.send_message(chat_id, "ℹ️ Aucun token trouvé sur DexScreener")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Erreur DexScreener HTTP: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur DexScreener: {str(e)}")
     except Exception as e:
         logger.error(f"Erreur DexScreener: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur DexScreener: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur DexScreener inattendue: {str(e)}")
+
+# Surveillance Twitter
+def monitor_twitter_for_tokens(chat_id):
+    if not TWITTER_BEARER_TOKEN:
+        bot.send_message(chat_id, "ℹ️ Twitter désactivé (TWITTER_BEARER_TOKEN manquant)")
+        return
+    headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
+    params = {"query": "memecoin contract 0x -is:retweet", "max_results": 10}
+    bot.send_message(chat_id, "🔍 Recherche de tokens sur Twitter...")
+    try:
+        response = requests.get(TWITTER_TRACK_URL, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        tweets = response.json()
+        if 'data' not in tweets:
+            error_msg = tweets.get('error', 'Réponse invalide') if 'error' in tweets else 'Aucune donnée'
+            bot.send_message(chat_id, f"⚠️ Réponse Twitter invalide: {error_msg}")
+            return
+        bot.send_message(chat_id, f"📡 {len(tweets['data'])} tweets trouvés sur Twitter")
+        for tweet in tweets["data"]:
+            ca_match = re.search(r"0x[a-fA-F0-9]{40}", tweet["text"])
+            if ca_match:
+                ca = ca_match.group(0)
+                if ca not in detected_tokens and ca not in cache:
+                    if is_valid_token_tokensniffer(ca) and is_valid_token_bscscan(ca):
+                        detected_tokens[ca] = {"status": "safe", "entry_price": None, "chain": "bsc", "market_cap": 100000}  # À ajuster
+                        bot.send_message(chat_id, f"🚀 Token détecté sur X : {ca} (BSC)")
+                        if trade_active and w3:
+                            buy_token(chat_id, ca, mise_depart, "bsc")
+                    else:
+                        bot.send_message(chat_id, f"❌ {ca} rejeté par les filtres")
+                cache[ca] = True
+        if not tweets["data"]:
+            bot.send_message(chat_id, "ℹ️ Aucun tweet trouvé sur Twitter")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Erreur Twitter HTTP: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur Twitter: {str(e)}")
+    except Exception as e:
+        logger.error(f"Erreur monitor_twitter_for_tokens: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur Twitter inattendue: {str(e)}")
 
 # Achat de token
 def buy_token(chat_id, contract_address, amount, chain):
@@ -280,11 +330,9 @@ def monitor_and_sell(chat_id, contract_address, amount, chain):
     sold_half = False
     while position_open and trade_active:
         try:
-            # Simuler prix actuel (à remplacer par API réelle)
-            current_price = entry_price * (1 + (market_cap / 1000000))  # Simulation basique
+            current_price = entry_price * (1 + (market_cap / 1000000))  # Simulation
             profit_pct = ((current_price - entry_price) / entry_price) * 100
 
-            # Take-profit progressif
             if profit_pct >= take_profit_steps[0] * 100 and not sold_half:
                 sell_token(chat_id, contract_address, amount / 2, chain, current_price)
                 sold_half = True
@@ -293,18 +341,11 @@ def monitor_and_sell(chat_id, contract_address, amount, chain):
             elif profit_pct >= take_profit_steps[2] * 100:
                 sell_token(chat_id, contract_address, amount / 4, chain, current_price)
                 position_open = False
-
-            # Trailing stop
-            if profit_pct <= -stop_loss_threshold:
+            elif profit_pct <= -stop_loss_threshold:
                 sell_token(chat_id, contract_address, amount, chain, current_price)
                 position_open = False
 
-            # Détection whale dump (simulé)
-            if market_cap * 0.05 < volume_drop:  # À implémenter avec API réelle
-                sell_token(chat_id, contract_address, amount, chain, current_price)
-                position_open = False
-
-            time.sleep(10)  # Vérifie toutes les 10 secondes
+            time.sleep(10)
         except Exception as e:
             logger.error(f"Erreur surveillance: {str(e)}")
             bot.send_message(chat_id, f"⚠️ Erreur surveillance {contract_address}: {str(e)}")
@@ -318,7 +359,6 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
             del detected_tokens[contract_address]
         return
     try:
-        # Logique de vente réelle à implémenter avec PancakeSwap/Raydium
         bot.send_message(chat_id, f"💸 Vente simulée de {amount} {chain.upper()} de {contract_address} à {current_price} (à implémenter)")
         if contract_address in detected_tokens:
             del detected_tokens[contract_address]
