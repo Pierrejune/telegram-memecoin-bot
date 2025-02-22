@@ -114,7 +114,7 @@ PANCAKE_ROUTER_ABI = json.loads('''
 
 # Solana (Raydium)
 logger.info("Connexion à Solana...")
-SOLANA_RPC = "https://rpc.ankr.com/solana"
+SOLANA_RPC = "https://api.mainnet-beta.solana.com"  # Noeud officiel Solana
 solana_keypair = Keypair.from_base58_string(SOLANA_WALLET_PRIVATE_KEY)
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSceAHj2")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
@@ -422,62 +422,70 @@ def detect_new_tokens_bsc(chat_id):
 def detect_new_tokens_solana(chat_id):
     global detected_tokens
     bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur Solana...")
-    try:
-        response = session.post(SOLANA_RPC, json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getSlot",
-            "params": [{"commitment": "finalized"}]
-        }, timeout=10)
-        response.raise_for_status()
-        slot = response.json().get('result')
-        logger.info(f"Dernier slot Solana: {slot}")
+    retries = 3
+    for attempt in range(retries):
+        try:
+            response = session.post(SOLANA_RPC, json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [str(TOKEN_PROGRAM_ID), {"limit": 10, "commitment": "finalized"}]
+            }, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            signatures = data.get('result', [])
+            bot.send_message(chat_id, f"📡 {len(signatures)} signatures récentes trouvées sur Solana")
 
-        response = session.post(SOLANA_RPC, json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getBlock",
-            "params": [slot, {"encoding": "jsonParsed", "transactionDetails": "full", "rewards": False}]
-        }, timeout=10)
-        response.raise_for_status()
-        block_data = response.json().get('result', {})
-        transactions = block_data.get('transactions', [])
-        bot.send_message(chat_id, f"📡 {len(transactions)} transactions trouvées dans le bloc Solana {slot}")
-
-        token_count = 0
-        for tx in transactions[:10]:
-            accounts = tx.get('transaction', {}).get('message', {}).get('accountKeys', [])
-            for account in accounts:
-                ca = account.get('pubkey')
-                if ca in cache or ca == str(TOKEN_PROGRAM_ID):
+            token_count = 0
+            for sig in signatures:
+                tx_response = session.post(SOLANA_RPC, json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTransaction",
+                    "params": [sig['signature'], "jsonParsed"]
+                }, timeout=10)
+                tx_response.raise_for_status()
+                tx_data = tx_response.json().get('result', {})
+                if not tx_data:
                     continue
-                if str(TOKEN_PROGRAM_ID) in [instr.get('programId') for instr in tx.get('transaction', {}).get('message', {}).get('instructions', [])]:
-                    liquidity = 150000
-                    volume = 100000
-                    market_cap = 500000
-                    price_change = 50
 
-                    if (MIN_VOLUME_SOL <= volume <= MAX_VOLUME_SOL and 
-                        liquidity >= MIN_LIQUIDITY and liquidity >= market_cap * MIN_LIQUIDITY_PCT and 
-                        MIN_PRICE_CHANGE <= price_change <= MAX_PRICE_CHANGE and 
-                        MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
-                        detected_tokens[ca] = {"status": "safe", "entry_price": None, "chain": "solana", "market_cap": market_cap}
-                        bot.send_message(chat_id, f"🚀 Token détecté : {ca} (Solana) - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}")
-                        token_count += 1
-                        if trade_active:
-                            buy_token_solana(chat_id, ca, mise_depart_sol)
-                    else:
-                        bot.send_message(chat_id, f"❌ {ca} rejeté - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}, Change: {price_change}%")
-                    cache[ca] = True
-                    break
-        if token_count == 0:
-            bot.send_message(chat_id, "ℹ️ Aucun nouveau token Solana détecté dans ce bloc.")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Erreur Solana RPC HTTP: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur Solana RPC: {str(e)}")
-    except Exception as e:
-        logger.error(f"Erreur Solana RPC: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur Solana RPC inattendue: {str(e)}")
+                accounts = tx_data.get('transaction', {}).get('message', {}).get('accountKeys', [])
+                for account in accounts:
+                    ca = account.get('pubkey')
+                    if ca in cache or ca == str(TOKEN_PROGRAM_ID):
+                        continue
+                    if str(TOKEN_PROGRAM_ID) in [instr.get('programId') for instr in tx_data.get('transaction', {}).get('message', {}).get('instructions', [])]:
+                        liquidity = 150000
+                        volume = 100000
+                        market_cap = 500000
+                        price_change = 50
+
+                        if (MIN_VOLUME_SOL <= volume <= MAX_VOLUME_SOL and 
+                            liquidity >= MIN_LIQUIDITY and liquidity >= market_cap * MIN_LIQUIDITY_PCT and 
+                            MIN_PRICE_CHANGE <= price_change <= MAX_PRICE_CHANGE and 
+                            MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
+                            detected_tokens[ca] = {"status": "safe", "entry_price": None, "chain": "solana", "market_cap": market_cap}
+                            bot.send_message(chat_id, f"🚀 Token détecté : {ca} (Solana) - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}")
+                            token_count += 1
+                            if trade_active:
+                                buy_token_solana(chat_id, ca, mise_depart_sol)
+                        else:
+                            bot.send_message(chat_id, f"❌ {ca} rejeté - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}, Change: {price_change}%")
+                        cache[ca] = True
+                        break
+            if token_count == 0:
+                bot.send_message(chat_id, "ℹ️ Aucun nouveau token Solana détecté dans ces signatures.")
+            break  # Sortir si succès
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Tentative {attempt + 1}/{retries} - Erreur Solana RPC HTTP: {str(e)}")
+            if attempt < retries - 1:
+                time.sleep(2)  # Attendre avant de réessayer
+            else:
+                bot.send_message(chat_id, f"⚠️ Erreur Solana RPC après {retries} tentatives: {str(e)}")
+        except Exception as e:
+            logger.error(f"Erreur Solana RPC: {str(e)}")
+            bot.send_message(chat_id, f"⚠️ Erreur Solana RPC inattendue: {str(e)}")
+            break
 
 # Achat de token sur BSC (PancakeSwap)
 def buy_token_bsc(chat_id, contract_address, amount):
@@ -492,7 +500,6 @@ def buy_token_bsc(chat_id, contract_address, amount):
             "market_cap_at_buy": detected_tokens[contract_address]["market_cap"],
             "current_market_cap": detected_tokens[contract_address]["market_cap"]
         }
-        # Ne pas appeler monitor_and_sell en mode test pour éviter le blocage
         return
     try:
         router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
@@ -538,7 +545,6 @@ def buy_token_solana(chat_id, contract_address, amount):
             "market_cap_at_buy": detected_tokens[contract_address]["market_cap"],
             "current_market_cap": detected_tokens[contract_address]["market_cap"]
         }
-        # Ne pas appeler monitor_and_sell en mode test
         return
     try:
         amount_in = int(amount * 10**9)
@@ -574,7 +580,7 @@ def buy_token_solana(chat_id, contract_address, amount):
         logger.error(f"Erreur achat Solana: {str(e)}")
         bot.send_message(chat_id, f"❌ Échec achat {contract_address}: {str(e)}")
 
-# Surveillance et vente (limité à 5 itérations en mode test)
+# Surveillance et vente
 def monitor_and_sell(chat_id, contract_address, amount, chain):
     logger.info(f"Surveillance de {contract_address} sur {chain}")
     entry_price = portfolio[contract_address]["entry_price"]
@@ -582,7 +588,7 @@ def monitor_and_sell(chat_id, contract_address, amount, chain):
     position_open = True
     sold_half = False
     iteration = 0
-    max_iterations = 5  # Limite pour éviter un blocage infini
+    max_iterations = 5
     while position_open and trade_active and iteration < max_iterations:
         try:
             current_price = entry_price * (1 + (market_cap / 1000000))
