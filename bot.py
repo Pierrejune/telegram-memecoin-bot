@@ -109,7 +109,7 @@ PANCAKE_ROUTER_ABI = json.loads('''
 ''')
 
 # Solana (Raydium)
-SOLANA_RPC = "https://solana-api.projectserum.com"  # Noeud alternatif gratuit
+SOLANA_RPC = "https://rpc.ankr.com/solana"  # Noeud Ankr gratuit
 solana_keypair = Keypair.from_base58_string(SOLANA_WALLET_PRIVATE_KEY)
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSceAHj2")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
@@ -349,19 +349,6 @@ def is_valid_token_tokensniffer(contract_address):
         logger.error(f"Erreur TokenSniffer: {str(e)}")
         return False
 
-# Vérification BscScan
-def is_valid_token_bscscan(contract_address):
-    try:
-        params = {'module': 'token', 'action': 'getTokenInfo', 'contractaddress': contract_address, 'apikey': 'YOUR_API_KEY'}
-        response = session.get(BSC_SCAN_API_URL, params=params, timeout=10)
-        data = response.json()
-        if data['status'] == '1' and float(data['result']['totalSupply']) >= 1000:
-            return True
-        return False
-    except Exception as e:
-        logger.error(f"Erreur BscScan: {str(e)}")
-        return False
-
 # Surveillance BSC pour nouveaux tokens
 def detect_new_tokens_bsc(chat_id):
     global detected_tokens
@@ -378,7 +365,7 @@ def detect_new_tokens_bsc(chat_id):
             ca = token0 if token0 != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1  # WBNB exclu
             if ca in cache:
                 continue
-            liquidity = 150000
+            liquidity = 150000  # À remplacer par données réelles
             volume = 100000
             market_cap = 500000
             price_change = 50
