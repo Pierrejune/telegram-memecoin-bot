@@ -114,7 +114,7 @@ PANCAKE_ROUTER_ABI = json.loads('''
 
 # Solana (Raydium)
 logger.info("Connexion à Solana...")
-SOLANA_RPC = "https://solana-mainnet.rpc.extrnode.com"
+SOLANA_RPC = "https://rpc.ankr.com/solana"
 solana_keypair = Keypair.from_base58_string(SOLANA_WALLET_PRIVATE_KEY)
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSceAHj2")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
@@ -124,15 +124,15 @@ try:
     response = session.post(SOLANA_RPC, json={
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "getRecentBlockhash",
-        "params": []
+        "method": "getLatestBlockhash",
+        "params": [{"commitment": "finalized"}]
     }, timeout=5)
     response.raise_for_status()
     blockhash = response.json().get('result', {}).get('value', {}).get('blockhash')
     logger.info(f"Connexion Solana réussie, blockhash: {blockhash}")
 except Exception as e:
     logger.error(f"Erreur initiale Solana RPC: {str(e)}")
-    # Ne pas bloquer le démarrage, juste loguer
+    # Ne pas bloquer le démarrage
 
 # Configuration de base
 test_mode = True
@@ -220,8 +220,19 @@ def callback_query(call):
                 trade_active = True
                 bot.send_message(chat_id, "🚀 Trading lancé !")
                 while trade_active:
-                    detect_new_tokens_bsc(chat_id)
-                    detect_new_tokens_solana(chat_id)
+                    logger.info("Début du cycle de détection...")
+                    try:
+                        detect_new_tokens_bsc(chat_id)
+                    except Exception as e:
+                        logger.error(f"Erreur dans detect_new_tokens_bsc: {str(e)}")
+                        bot.send_message(chat_id, f"⚠️ Erreur BSC: {str(e)}")
+                    logger.info("Après détection BSC, avant Solana...")
+                    try:
+                        detect_new_tokens_solana(chat_id)
+                    except Exception as e:
+                        logger.error(f"Erreur dans detect_new_tokens_solana: {str(e)}")
+                        bot.send_message(chat_id, f"⚠️ Erreur Solana: {str(e)}")
+                    logger.info("Fin du cycle de détection, attente 60s...")
                     time.sleep(60)
             else:
                 bot.send_message(chat_id, "⚠️ Trading déjà en cours.")
@@ -252,7 +263,7 @@ def callback_query(call):
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_gas_fee)
     except Exception as e:
         logger.error(f"Erreur dans callback_query: {str(e)}")
-        bot.send_message(chat_id, "⚠️ Une erreur est survenue.")
+        bot.send_message(chat_id, f"⚠️ Une erreur est survenue: {str(e)}")
 
 # Menu de configuration
 def show_config_menu(chat_id):
@@ -410,62 +421,57 @@ def detect_new_tokens_solana(chat_id):
     global detected_tokens
     bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur Solana...")
     try:
-        # Récupérer un blockhash récent
+        # Récupérer le dernier slot finalisé
         response = session.post(SOLANA_RPC, json={
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "getRecentBlockhash",
-            "params": []
+            "method": "getSlot",
+            "params": [{"commitment": "finalized"}]
         }, timeout=10)
         response.raise_for_status()
-        blockhash = response.json().get('result', {}).get('value', {}).get('blockhash')
-        logger.info(f"Blockhash Solana: {blockhash}")
+        slot = response.json().get('result')
+        logger.info(f"Dernier slot Solana: {slot}")
 
-        # Récupérer les signatures récentes du programme Tokenkeg
+        # Récupérer les transactions du dernier bloc
         response = session.post(SOLANA_RPC, json={
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [str(TOKEN_PROGRAM_ID), {"limit": 10}]
+            "method": "getBlock",
+            "params": [slot, {"encoding": "jsonParsed", "transactionDetails": "full", "rewards": False}]
         }, timeout=10)
         response.raise_for_status()
-        data = response.json()
-        signatures = data.get('result', [])
-        bot.send_message(chat_id, f"📡 {len(signatures)} transactions récentes trouvées sur Solana")
+        block_data = response.json().get('result', {})
+        transactions = block_data.get('transactions', [])
+        bot.send_message(chat_id, f"📡 {len(transactions)} transactions trouvées dans le bloc Solana {slot}")
 
-        for sig in signatures:
-            tx_response = session.post(SOLANA_RPC, json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getTransaction",
-                "params": [sig['signature'], "jsonParsed"]
-            }, timeout=10)
-            tx_response.raise_for_status()
-            tx_data = tx_response.json().get('result', {})
-            if not tx_data:
-                continue
-            
-            accounts = tx_data.get('transaction', {}).get('message', {}).get('accountKeys', [])
+        token_count = 0
+        for tx in transactions[:10]:  # Limiter à 10 pour éviter surcharge
+            accounts = tx.get('transaction', {}).get('message', {}).get('accountKeys', [])
             for account in accounts:
                 ca = account.get('pubkey')
                 if ca in cache or ca == str(TOKEN_PROGRAM_ID):
                     continue
-                liquidity = 150000
-                volume = 100000
-                market_cap = 500000
-                price_change = 50
+                # Vérifier si le programme Tokenkeg est impliqué
+                if str(TOKEN_PROGRAM_ID) in [instr.get('programId') for instr in tx.get('transaction', {}).get('message', {}).get('instructions', [])]:
+                    liquidity = 150000
+                    volume = 100000
+                    market_cap = 500000
+                    price_change = 50
 
-                if (MIN_VOLUME_SOL <= volume <= MAX_VOLUME_SOL and 
-                    liquidity >= MIN_LIQUIDITY and liquidity >= market_cap * MIN_LIQUIDITY_PCT and 
-                    MIN_PRICE_CHANGE <= price_change <= MAX_PRICE_CHANGE and 
-                    MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
-                    detected_tokens[ca] = {"status": "safe", "entry_price": None, "chain": "solana", "market_cap": market_cap}
-                    bot.send_message(chat_id, f"🚀 Token détecté : {ca} (Solana) - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}")
-                    if trade_active:
-                        buy_token_solana(chat_id, ca, mise_depart_sol)
-                else:
-                    bot.send_message(chat_id, f"❌ {ca} rejeté - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}, Change: {price_change}%")
-                cache[ca] = True
+                    if (MIN_VOLUME_SOL <= volume <= MAX_VOLUME_SOL and 
+                        liquidity >= MIN_LIQUIDITY and liquidity >= market_cap * MIN_LIQUIDITY_PCT and 
+                        MIN_PRICE_CHANGE <= price_change <= MAX_PRICE_CHANGE and 
+                        MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
+                        detected_tokens[ca] = {"status": "safe", "entry_price": None, "chain": "solana", "market_cap": market_cap}
+                        bot.send_message(chat_id, f"🚀 Token détecté : {ca} (Solana) - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}")
+                        token_count += 1
+                        if trade_active:
+                            buy_token_solana(chat_id, ca, mise_depart_sol)
+                    else:
+                        bot.send_message(chat_id, f"❌ {ca} rejeté - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}, Change: {price_change}%")
+                    cache[ca] = True
+        if token_count == 0:
+            bot.send_message(chat_id, "ℹ️ Aucun nouveau token Solana détecté dans ce bloc.")
     except requests.exceptions.RequestException as e:
         logger.error(f"Erreur Solana RPC HTTP: {str(e)}")
         bot.send_message(chat_id, f"⚠️ Erreur Solana RPC: {str(e)}")
