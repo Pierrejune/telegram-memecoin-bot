@@ -16,13 +16,16 @@ logger = logging.getLogger(__name__)
 
 # Headers pour simuler un navigateur
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124",
+    "Accept": "text/html,application/xhtml+xml",
     "Accept-Language": "en-US,en;q=0.5",
-    "Connection": "keep-alive"
 }
 
-# Chargement des variables d'environnement
+# Session persistante pour requests
+session = requests.Session()
+session.headers.update(HEADERS)
+
+# Chargement des variables
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
@@ -31,12 +34,12 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 8080))
 
-# Validation des variables
+# Validation
 if not TOKEN:
     logger.error("TELEGRAM_TOKEN manquant.")
     raise ValueError("TELEGRAM_TOKEN manquant")
 if not all([WALLET_ADDRESS, PRIVATE_KEY]):
-    logger.warning("WALLET_ADDRESS ou PRIVATE_KEY manquant. Trading désactivé.")
+    logger.warning("WALLET_ADDRESS ou PRIVATE_KEY manquant.")
 
 # Initialisation
 bot = telebot.TeleBot(TOKEN)
@@ -46,9 +49,9 @@ if not w3.is_connected():
     logger.error("Connexion BSC échouée.")
     w3 = None
 
-# Configuration PancakeSwap (ABI à compléter)
+# Configuration PancakeSwap
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
-PANCAKE_ROUTER_ABI = []  # Ajoute l’ABI réel ici
+PANCAKE_ROUTER_ABI = []  # Ajoute l’ABI réel
 
 # Configuration de base
 test_mode = True
@@ -59,6 +62,7 @@ gas_fee = 0.001
 detected_tokens = {}
 trade_active = False
 cache = TTLCache(maxsize=100, ttl=300)
+portfolio = {}  # Stocke les tokens achetés
 
 # Critères personnalisés
 MIN_VOLUME_SOL = 50000
@@ -80,17 +84,16 @@ MAX_HOLDER_PCT = 5
 BSC_SCAN_API_URL = "https://api.bscscan.com/api"
 TWITTER_TRACK_URL = "https://api.twitter.com/2/tweets/search/recent"
 DEXSCREENER_URL = "https://dexscreener.com/new-pairs?sort=created&order=desc"
+JUPITER_API_URL = "https://quote-api.jup.ag/v6/quote"
 
 # Webhook Telegram
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        logger.info("Webhook reçu")
         if request.headers.get("content-type") == "application/json":
             update = telebot.types.Update.de_json(request.get_json())
             bot.process_new_updates([update])
             return "OK", 200
-        logger.warning("Requête webhook invalide")
         return abort(403)
     except Exception as e:
         logger.error(f"Erreur dans webhook: {str(e)}")
@@ -112,7 +115,8 @@ def show_main_menu(chat_id):
         InlineKeyboardButton("📈 Statut", callback_data="status"),
         InlineKeyboardButton("⚙️ Configurer", callback_data="config"),
         InlineKeyboardButton("🚀 Lancer", callback_data="launch"),
-        InlineKeyboardButton("❌ Arrêter", callback_data="stop")
+        InlineKeyboardButton("❌ Arrêter", callback_data="stop"),
+        InlineKeyboardButton("💼 Portefeuille", callback_data="portfolio")
     )
     try:
         bot.send_message(chat_id, "Que veux-tu faire ?", reply_markup=markup)
@@ -142,6 +146,14 @@ def callback_query(call):
         elif call.data == "stop":
             trade_active = False
             bot.send_message(chat_id, "⏹ Trading arrêté.")
+        elif call.data == "portfolio":
+            show_portfolio(chat_id)
+        elif call.data.startswith("refresh_"):
+            token = call.data.split("_")[1]
+            refresh_token(chat_id, token)
+        elif call.data.startswith("sell_"):
+            token = call.data.split("_")[1]
+            sell_token_immediate(chat_id, token)
     except Exception as e:
         logger.error(f"Erreur dans callback_query: {str(e)}")
         bot.send_message(chat_id, "⚠️ Une erreur est survenue.")
@@ -172,11 +184,11 @@ def config_callback(call):
     except Exception as e:
         logger.error(f"Erreur dans config_callback: {str(e)}")
 
-# Vérification TokenSniffer (anti-scam)
+# Vérification TokenSniffer
 def is_valid_token_tokensniffer(contract_address):
     try:
         url = f"https://tokensniffer.com/token/{contract_address}"
-        response = requests.get(url, headers=HEADERS, timeout=5)
+        response = session.get(url, timeout=10)
         if response.status_code == 200:
             text = response.text.lower()
             if "rug pull" in text or "honeypot" in text:
@@ -193,7 +205,7 @@ def is_valid_token_tokensniffer(contract_address):
 def is_valid_token_bscscan(contract_address):
     try:
         params = {'module': 'token', 'action': 'getTokenInfo', 'contractaddress': contract_address, 'apikey': BSC_SCAN_API_KEY}
-        response = requests.get(BSC_SCAN_API_URL, params=params, timeout=5)
+        response = session.get(BSC_SCAN_API_URL, params=params, timeout=10)
         data = response.json()
         if data['status'] == '1' and float(data['result']['totalSupply']) >= 1000:
             return True
@@ -207,8 +219,8 @@ def detect_new_tokens(chat_id):
     global detected_tokens
     bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur DexScreener...")
     try:
-        response = requests.get(DEXSCREENER_URL, headers=HEADERS, timeout=10)
-        response.raise_for_status()  # Vérifie les erreurs HTTP
+        response = session.get(DEXSCREENER_URL, timeout=10)
+        response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         pairs = soup.select('div.pair-row')[:10]  # Ajuste selon la structure réelle
         bot.send_message(chat_id, f"📡 {len(pairs)} nouveaux tokens trouvés sur DexScreener")
@@ -221,7 +233,7 @@ def detect_new_tokens(chat_id):
             if ca in cache or not chain:
                 continue
             
-            # Récupérer métriques (simulé, à ajuster)
+            # Métriques simulées (à ajuster avec API réelle)
             liquidity = float(pair.select_one('span.liquidity').text.replace('$', '').replace(',', '')) if pair.select_one('span.liquidity') else 0
             volume = float(pair.select_one('span.volume').text.replace('$', '').replace(',', '')) if pair.select_one('span.volume') else 0
             market_cap = float(pair.select_one('span.market-cap').text.replace('$', '').replace(',', '')) if pair.select_one('span.market-cap') else 0
@@ -262,7 +274,7 @@ def monitor_twitter_for_tokens(chat_id):
     params = {"query": "memecoin contract 0x -is:retweet", "max_results": 10}
     bot.send_message(chat_id, "🔍 Recherche de tokens sur Twitter...")
     try:
-        response = requests.get(TWITTER_TRACK_URL, headers=headers, params=params, timeout=10)
+        response = session.get(TWITTER_TRACK_URL, headers=headers, params=params, timeout=10)
         response.raise_for_status()
         tweets = response.json()
         if 'data' not in tweets:
@@ -297,6 +309,13 @@ def buy_token(chat_id, contract_address, amount, chain):
     if test_mode:
         bot.send_message(chat_id, f"🧪 [Mode Test] Achat simulé de {amount} {chain.upper()} de {contract_address}")
         detected_tokens[contract_address]["entry_price"] = 0.01
+        portfolio[contract_address] = {
+            "amount": amount,
+            "chain": chain,
+            "entry_price": 0.01,
+            "market_cap_at_buy": detected_tokens[contract_address]["market_cap"],
+            "current_market_cap": detected_tokens[contract_address]["market_cap"]
+        }
         monitor_and_sell(chat_id, contract_address, amount, chain)
         return
     try:
@@ -317,6 +336,13 @@ def buy_token(chat_id, contract_address, amount, chain):
         signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
         tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
         bot.send_message(chat_id, f"🚀 Achat de {amount} {chain.upper()} de {contract_address}, TX: {tx_hash.hex()}")
+        portfolio[contract_address] = {
+            "amount": amount,
+            "chain": chain,
+            "entry_price": 0.01,  # À remplacer par prix réel
+            "market_cap_at_buy": detected_tokens[contract_address]["market_cap"],
+            "current_market_cap": detected_tokens[contract_address]["market_cap"]
+        }
         monitor_and_sell(chat_id, contract_address, amount, chain)
     except Exception as e:
         logger.error(f"Erreur achat token: {str(e)}")
@@ -324,15 +350,14 @@ def buy_token(chat_id, contract_address, amount, chain):
 
 # Surveillance et vente
 def monitor_and_sell(chat_id, contract_address, amount, chain):
-    entry_price = detected_tokens[contract_address]["entry_price"]
-    market_cap = detected_tokens[contract_address]["market_cap"]
+    entry_price = portfolio[contract_address]["entry_price"]
+    market_cap = portfolio[contract_address]["market_cap_at_buy"]
     position_open = True
     sold_half = False
     while position_open and trade_active:
         try:
             current_price = entry_price * (1 + (market_cap / 1000000))  # Simulation
             profit_pct = ((current_price - entry_price) / entry_price) * 100
-
             if profit_pct >= take_profit_steps[0] * 100 and not sold_half:
                 sell_token(chat_id, contract_address, amount / 2, chain, current_price)
                 sold_half = True
@@ -344,7 +369,6 @@ def monitor_and_sell(chat_id, contract_address, amount, chain):
             elif profit_pct <= -stop_loss_threshold:
                 sell_token(chat_id, contract_address, amount, chain, current_price)
                 position_open = False
-
             time.sleep(10)
         except Exception as e:
             logger.error(f"Erreur surveillance: {str(e)}")
@@ -355,35 +379,57 @@ def monitor_and_sell(chat_id, contract_address, amount, chain):
 def sell_token(chat_id, contract_address, amount, chain, current_price):
     if test_mode:
         bot.send_message(chat_id, f"🧪 [Mode Test] Vente simulée de {amount} {chain.upper()} de {contract_address} à {current_price}")
-        if contract_address in detected_tokens:
-            del detected_tokens[contract_address]
+        if contract_address in portfolio:
+            portfolio[contract_address]["amount"] -= amount
+            if portfolio[contract_address]["amount"] <= 0:
+                del portfolio[contract_address]
         return
     try:
         bot.send_message(chat_id, f"💸 Vente simulée de {amount} {chain.upper()} de {contract_address} à {current_price} (à implémenter)")
-        if contract_address in detected_tokens:
-            del detected_tokens[contract_address]
+        if contract_address in portfolio:
+            del portfolio[contract_address]
     except Exception as e:
         logger.error(f"Erreur vente token: {str(e)}")
         bot.send_message(chat_id, f"❌ Échec vente {contract_address}: {str(e)}")
 
-# Configuration du webhook
-def set_webhook():
+# Afficher le portefeuille
+def show_portfolio(chat_id):
     try:
-        if WEBHOOK_URL:
-            bot.remove_webhook()
-            bot.set_webhook(url=WEBHOOK_URL)
-            logger.info("Webhook configuré avec succès")
+        # Solde BSC
+        bsc_balance = w3.eth.get_balance(WALLET_ADDRESS) / 10**18 if w3 else 0
+        # Solde Solana (simulation via Jupiter)
+        sol_balance = get_solana_balance(WALLET_ADDRESS)
+        msg = f"💼 Portefeuille:\n- BSC: {bsc_balance:.4f} BNB\n- Solana: {sol_balance:.4f} SOL\n\nTokens détenus:\n"
+        
+        if not portfolio:
+            msg += "Aucun token détenu."
+        else:
+            for ca, data in portfolio.items():
+                current_mc = get_current_market_cap(ca)  # À implémenter
+                profit = (current_mc - data["market_cap_at_buy"]) / data["market_cap_at_buy"] * 100
+                markup = InlineKeyboardMarkup()
+                markup.add(
+                    InlineKeyboardButton("Refresh", callback_data=f"refresh_{ca}"),
+                    InlineKeyboardButton("Sell All", callback_data=f"sell_{ca}")
+                )
+                msg += (f"Token: {ca} ({data['chain']})\n"
+                        f"Contrat: {ca}\n"
+                        f"MC Achat: ${data['market_cap_at_buy']:.2f}\n"
+                        f"MC Actuel: ${current_mc:.2f}\n"
+                        f"Profit: {profit:.2f}%\n"
+                        f"Take-Profit: x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}\n"
+                        f"Stop-Loss: -{stop_loss_threshold}%\n\n")
+                bot.send_message(chat_id, msg, reply_markup=markup)
+                msg = ""
+        if not msg.endswith("Aucun token détenu."):
+            bot.send_message(chat_id, msg)
     except Exception as e:
-        logger.error(f"Erreur configuration webhook: {str(e)}")
+        logger.error(f"Erreur portefeuille: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur portefeuille: {str(e)}")
 
-# Point d’entrée principal
-if __name__ == "__main__":
-    logger.info("Initialisation du bot...")
+# Solde Solana via Jupiter (simulation)
+def get_solana_balance(wallet_address):
     try:
-        logger.info("Configuration du webhook Telegram...")
-        set_webhook()
-        logger.info(f"Démarrage de Flask sur le port {PORT}...")
-        app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
-    except Exception as e:
-        logger.error(f"Erreur critique au démarrage: {str(e)}")
-        raise
+        # À implémenter avec Jupiter API réelle
+        return 0.5  # Simulation
+    except
