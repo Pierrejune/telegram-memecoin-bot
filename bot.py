@@ -6,62 +6,105 @@ import requests
 import time
 from flask import Flask, request, abort
 from cachetools import TTLCache
-import re
 from web3 import Web3
-from bs4 import BeautifulSoup
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.transaction import Transaction
+from solders.instruction import Instruction
+import json
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Headers pour simuler un navigateur
+# Headers pour API
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124",
-    "Accept": "text/html,application/xhtml+xml",
-    "Accept-Language": "en-US,en;q=0.5",
+    "Accept": "application/json",
 }
 
 # Session persistante
-logger.info("Création de la session requests...")
 session = requests.Session()
 session.headers.update(HEADERS)
 
 # Chargement des variables
-logger.info("Chargement des variables d'environnement...")
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
-TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+SOLANA_WALLET_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 PORT = int(os.getenv("PORT", 8080))
 
 # Validation
-logger.info("Validation des variables...")
 if not TOKEN:
     logger.error("TELEGRAM_TOKEN manquant.")
     raise ValueError("TELEGRAM_TOKEN manquant")
 if not all([WALLET_ADDRESS, PRIVATE_KEY]):
-    logger.warning("WALLET_ADDRESS ou PRIVATE_KEY manquant.")
+    logger.error("WALLET_ADDRESS ou PRIVATE_KEY BSC manquant.")
+    raise ValueError("WALLET_ADDRESS ou PRIVATE_KEY BSC manquant")
+if not SOLANA_WALLET_PRIVATE_KEY:
+    logger.error("SOLANA_PRIVATE_KEY manquant.")
+    raise ValueError("SOLANA_PRIVATE_KEY manquant")
 
 # Initialisation
 logger.info("Initialisation des composants...")
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
-logger.info("Flask initialisé.")
+
+# BSC (PancakeSwap)
 w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org/"))
 if not w3.is_connected():
     logger.error("Connexion BSC échouée.")
     w3 = None
-else:
-    logger.info("Connexion BSC réussie.")
+PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+PANCAKE_ROUTER_ABI = json.loads('''
+[
+  {
+    "inputs": [
+      {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+      {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"},
+      {"internalType": "address[]", "name": "path", "type": "address[]"},
+      {"internalType": "address", "name": "to", "type": "address"},
+      {"internalType": "uint256", "name": "deadline", "type": "uint256"}
+    ],
+    "name": "swapExactETHForTokens",
+    "outputs": [
+      {"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {"internalType": "uint256", "name": "amountOut", "type": "uint256"},
+      {"internalType": "uint256", "name": "amountInMax", "type": "uint256"},
+      {"internalType": "address[]", "name": "path", "type": "address[]"},
+      {"internalType": "address", "name": "to", "type": "address"},
+      {"internalType": "uint256", "name": "deadline", "type": "uint256"}
+    ],
+    "name": "swapExactTokensForETH",
+    "outputs": [
+      {"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+]
+''')
+
+# Solana (Raydium)
+SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+solana_keypair = Keypair.from_base58_string(SOLANA_WALLET_PRIVATE_KEY)
+RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSceAHj2")
 
 # Configuration de base
-test_mode = True
-mise_depart = 0.01
+test_mode = True  # Passe à False pour trading réel
+mise_depart = 0.01  # BNB ou SOL
+slippage = 5  # % de tolérance par défaut
+gas_fee = 5  # Gwei par défaut pour BSC
 stop_loss_threshold = 30
 take_profit_steps = [2, 3, 5]
-gas_fee = 0.001
 detected_tokens = {}
 trade_active = False
 cache = TTLCache(maxsize=100, ttl=300)
@@ -85,8 +128,7 @@ MAX_HOLDER_PCT = 5
 
 # APIs externes
 BSC_SCAN_API_URL = "https://api.bscscan.com/api"
-TWITTER_TRACK_URL = "https://api.twitter.com/2/tweets/search/recent"
-DEXSCREENER_URL = "https://dexscreener.com/new-pairs?sort=created&order=desc"
+BIRDEYE_API_URL = "https://public-api.birdeye.so/public/tokenlist?sort_by=mc&sort_type=desc&offset=0&limit=50"
 
 # Webhook Telegram
 @app.route("/webhook", methods=["POST"])
@@ -96,7 +138,6 @@ def webhook():
         if request.headers.get("content-type") == "application/json":
             update = telebot.types.Update.de_json(request.get_json())
             bot.process_new_updates([update])
-            logger.info("Webhook traité avec succès")
             return "OK", 200
         logger.warning("Requête webhook invalide")
         return abort(403)
@@ -122,7 +163,8 @@ def show_main_menu(chat_id):
         InlineKeyboardButton("⚙️ Configurer", callback_data="config"),
         InlineKeyboardButton("🚀 Lancer", callback_data="launch"),
         InlineKeyboardButton("❌ Arrêter", callback_data="stop"),
-        InlineKeyboardButton("💼 Portefeuille", callback_data="portfolio")
+        InlineKeyboardButton("💼 Portefeuille", callback_data="portfolio"),
+        InlineKeyboardButton("🔧 Réglages", callback_data="settings")
     )
     try:
         bot.send_message(chat_id, "Que veux-tu faire ?", reply_markup=markup)
@@ -132,12 +174,12 @@ def show_main_menu(chat_id):
 # Gestion des callbacks
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
-    global test_mode, mise_depart, trade_active
+    global test_mode, mise_depart, trade_active, slippage, gas_fee
     chat_id = call.message.chat.id
     logger.info(f"Callback reçu: {call.data}")
     try:
         if call.data == "status":
-            bot.send_message(chat_id, f"📊 Statut :\n- Mise: {mise_depart} BNB\n- Mode test: {test_mode}\n- Trading actif: {trade_active}")
+            bot.send_message(chat_id, f"📊 Statut :\n- Mise: {mise_depart} BNB/SOL\n- Slippage: {slippage}%\n- Gas Fee: {gas_fee} Gwei\n- Mode test: {test_mode}\n- Trading actif: {trade_active}")
         elif call.data == "config":
             show_config_menu(chat_id)
         elif call.data == "launch":
@@ -145,8 +187,8 @@ def callback_query(call):
                 trade_active = True
                 bot.send_message(chat_id, "🚀 Trading lancé !")
                 while trade_active:
-                    detect_new_tokens(chat_id)
-                    monitor_twitter_for_tokens(chat_id)
+                    detect_new_tokens_bsc(chat_id)
+                    detect_new_tokens_solana(chat_id)
                     time.sleep(60)
             else:
                 bot.send_message(chat_id, "⚠️ Trading déjà en cours.")
@@ -155,12 +197,23 @@ def callback_query(call):
             bot.send_message(chat_id, "⏹ Trading arrêté.")
         elif call.data == "portfolio":
             show_portfolio(chat_id)
+        elif call.data == "settings":
+            show_settings_menu(chat_id)
         elif call.data.startswith("refresh_"):
             token = call.data.split("_")[1]
             refresh_token(chat_id, token)
         elif call.data.startswith("sell_"):
             token = call.data.split("_")[1]
             sell_token_immediate(chat_id, token)
+        elif call.data == "adjust_mise":
+            bot.send_message(chat_id, "Entrez la nouvelle mise (en BNB/SOL, ex. : 0.05) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_mise)
+        elif call.data == "adjust_slippage":
+            bot.send_message(chat_id, "Entrez le nouveau slippage (en %, ex. : 5) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_slippage)
+        elif call.data == "adjust_gas":
+            bot.send_message(chat_id, "Entrez les nouveaux frais de gas (en Gwei, ex. : 5) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_gas_fee)
     except Exception as e:
         logger.error(f"Erreur dans callback_query: {str(e)}")
         bot.send_message(chat_id, "⚠️ Une erreur est survenue.")
@@ -169,13 +222,68 @@ def callback_query(call):
 def show_config_menu(chat_id):
     markup = InlineKeyboardMarkup()
     markup.add(
-        InlineKeyboardButton("💰 Augmenter mise (+0.01 BNB)", callback_data="increase_mise"),
+        InlineKeyboardButton("💰 Augmenter mise (+0.01 BNB/SOL)", callback_data="increase_mise"),
         InlineKeyboardButton("🎯 Toggle Mode Test", callback_data="toggle_test")
     )
     try:
         bot.send_message(chat_id, "⚙️ Configuration :", reply_markup=markup)
     except Exception as e:
         logger.error(f"Erreur dans show_config_menu: {str(e)}")
+
+# Menu des réglages
+def show_settings_menu(chat_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("💰 Ajuster Mise", callback_data="adjust_mise"),
+        InlineKeyboardButton("📉 Ajuster Slippage", callback_data="adjust_slippage"),
+        InlineKeyboardButton("⛽ Ajuster Gas Fee", callback_data="adjust_gas")
+    )
+    try:
+        bot.send_message(chat_id, "🔧 Réglages :", reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Erreur dans show_settings_menu: {str(e)}")
+
+# Ajuster la mise
+def adjust_mise(message):
+    global mise_depart
+    chat_id = message.chat.id
+    try:
+        new_mise = float(message.text)
+        if new_mise > 0:
+            mise_depart = new_mise
+            bot.send_message(chat_id, f"✅ Mise mise à jour à {mise_depart} BNB/SOL")
+        else:
+            bot.send_message(chat_id, "⚠️ La mise doit être positive !")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Entrez un nombre valide (ex. : 0.05)")
+
+# Ajuster le slippage
+def adjust_slippage(message):
+    global slippage
+    chat_id = message.chat.id
+    try:
+        new_slippage = float(message.text)
+        if 0 <= new_slippage <= 100:
+            slippage = new_slippage
+            bot.send_message(chat_id, f"✅ Slippage mis à jour à {slippage}%")
+        else:
+            bot.send_message(chat_id, "⚠️ Le slippage doit être entre 0 et 100% !")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Entrez un pourcentage valide (ex. : 5)")
+
+# Ajuster les frais de gas
+def adjust_gas_fee(message):
+    global gas_fee
+    chat_id = message.chat.id
+    try:
+        new_gas_fee = float(message.text)
+        if new_gas_fee > 0:
+            gas_fee = new_gas_fee
+            bot.send_message(chat_id, f"✅ Frais de gas mis à jour à {gas_fee} Gwei")
+        else:
+            bot.send_message(chat_id, "⚠️ Les frais de gas doivent être positifs !")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Entrez un nombre valide (ex. : 5)")
 
 @bot.callback_query_handler(func=lambda call: call.data in ["increase_mise", "toggle_test"])
 def config_callback(call):
@@ -184,7 +292,7 @@ def config_callback(call):
     try:
         if call.data == "increase_mise":
             mise_depart += 0.01
-            bot.send_message(chat_id, f"💰 Mise augmentée à {mise_depart} BNB")
+            bot.send_message(chat_id, f"💰 Mise augmentée à {mise_depart} BNB/SOL")
         elif call.data == "toggle_test":
             test_mode = not test_mode
             bot.send_message(chat_id, f"🎯 Mode Test {'activé' if test_mode else 'désactivé'}")
@@ -221,139 +329,183 @@ def is_valid_token_bscscan(contract_address):
         logger.error(f"Erreur BscScan: {str(e)}")
         return False
 
-# Surveillance DexScreener
-def detect_new_tokens(chat_id):
+# Surveillance BscScan pour BSC
+def detect_new_tokens_bsc(chat_id):
     global detected_tokens
-    bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur DexScreener...")
+    bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur BscScan...")
     try:
-        response = session.get(DEXSCREENER_URL, timeout=10)
+        params = {
+            'module': 'account',
+            'action': 'tokentx',
+            'sort': 'desc',
+            'apikey': BSC_SCAN_API_KEY
+        }
+        response = session.get(BSC_SCAN_API_URL, params=params, timeout=10)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        pairs = soup.select('div.pair-row')[:10]  # Ajuste selon la structure réelle
-        bot.send_message(chat_id, f"📡 {len(pairs)} nouveaux tokens trouvés sur DexScreener")
-        for pair in pairs:
-            ca_elem = pair.select_one('span.contract-address')
-            if not ca_elem:
+        data = response.json()
+        if data['status'] != '1':
+            bot.send_message(chat_id, f"⚠️ Erreur BscScan: {data.get('message', 'Erreur inconnue')}")
+            return
+        tokens = data['result'][:10]
+        bot.send_message(chat_id, f"📡 {len(tokens)} transactions trouvées sur BscScan")
+        for tx in tokens:
+            ca = tx['contractAddress']
+            if ca in cache:
                 continue
-            ca = ca_elem.text.strip()
-            chain = "solana" if "solana" in pair.text.lower() else "bsc" if "bsc" in pair.text.lower() else None
-            if ca in cache or not chain:
-                continue
-            
-            # Métriques simulées (à ajuster avec API réelle)
-            liquidity = float(pair.select_one('span.liquidity').text.replace('$', '').replace(',', '')) if pair.select_one('span.liquidity') else ueden0
-            volume = float(pair.select_one('span.volume').text.replace('$', '').replace(',', '')) if pair.select_one('span.volume') else 0
-            market_cap = float(pair.select_one('span.market-cap').text.replace('$', '').replace(',', '')) if pair.select_one('span.market-cap') else 0
-            price_change = float(pair.select_one('span.price-change').text.replace('%', '')) if pair.select_one('span.price-change') else 0
+            liquidity = 150000  # À remplacer par API réelle
+            volume = 100000
+            market_cap = 500000
+            price_change = 50
 
-            min_volume = MIN_VOLUME_SOL if chain == "solana" else MIN_VOLUME_BSC
-            max_volume = MAX_VOLUME_SOL if chain == "solana" else MAX_VOLUME_BSC
-            min_mc = MIN_MARKET_CAP_SOL if chain == "solana" else MIN_MARKET_CAP_BSC
-            max_mc = MAX_MARKET_CAP_SOL if chain == "solana" else MAX_MARKET_CAP_BSC
-
-            if (min_volume <= volume <= max_volume and 
+            if (MIN_VOLUME_BSC <= volume <= MAX_VOLUME_BSC and 
                 liquidity >= MIN_LIQUIDITY and liquidity >= market_cap * MIN_LIQUIDITY_PCT and 
                 MIN_PRICE_CHANGE <= price_change <= MAX_PRICE_CHANGE and 
-                min_mc <= market_cap <= max_mc and 
+                MIN_MARKET_CAP_BSC <= market_cap <= MAX_MARKET_CAP_BSC and 
                 is_valid_token_tokensniffer(ca) and is_valid_token_bscscan(ca)):
-                detected_tokens[ca] = {"status": "safe", "entry_price": None, "chain": chain, "market_cap": market_cap}
-                bot.send_message(chat_id, f"🚀 Token détecté : {ca} ({chain}) - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}")
+                detected_tokens[ca] = {"status": "safe", "entry_price": None, "chain": "bsc", "market_cap": market_cap}
+                bot.send_message(chat_id, f"🚀 Token détecté : {ca} (BSC) - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}")
                 if trade_active and w3:
-                    buy_token(chat_id, ca, mise_depart, chain)
+                    buy_token_bsc(chat_id, ca, mise_depart)
             else:
                 bot.send_message(chat_id, f"❌ {ca} rejeté - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}, Change: {price_change}%")
             cache[ca] = True
-        if not pairs:
-            bot.send_message(chat_id, "ℹ️ Aucun token trouvé sur DexScreener")
     except requests.exceptions.RequestException as e:
-        logger.error(f"Erreur DexScreener HTTP: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur DexScreener: {str(e)}")
+        logger.error(f"Erreur BscScan HTTP: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur BscScan: {str(e)}")
     except Exception as e:
-        logger.error(f"Erreur DexScreener: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur DexScreener inattendue: {str(e)}")
+        logger.error(f"Erreur BscScan: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur BscScan inattendue: {str(e)}")
 
-# Surveillance Twitter
-def monitor_twitter_for_tokens(chat_id):
-    if not TWITTER_BEARER_TOKEN:
-        bot.send_message(chat_id, "ℹ️ Twitter désactivé (TWITTER_BEARER_TOKEN manquant)")
-        return
-    headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
-    params = {"query": "memecoin contract 0x -is:retweet", "max_results": 10}
-    bot.send_message(chat_id, "🔍 Recherche de tokens sur Twitter...")
+# Surveillance Birdeye pour Solana
+def detect_new_tokens_solana(chat_id):
+    global detected_tokens
+    bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur Birdeye (Solana)...")
     try:
-        response = session.get(TWITTER_TRACK_URL, headers=headers, params=params, timeout=10)
+        response = session.get(BIRDEYE_API_URL, timeout=10)
         response.raise_for_status()
-        tweets = response.json()
-        if 'data' not in tweets:
-            error_msg = tweets.get('error', 'Réponse invalide') if 'error' in tweets else 'Aucune donnée'
-            bot.send_message(chat_id, f"⚠️ Réponse Twitter invalide: {error_msg}")
-            return
-        bot.send_message(chat_id, f"📡 {len(tweets['data'])} tweets trouvés sur Twitter")
-        for tweet in tweets["data"]:
-            ca_match = re.search(r"0x[a-fA-F0-9]{40}", tweet["text"])
-            if ca_match:
-                ca = ca_match.group(0)
-                if ca not in detected_tokens and ca not in cache:
-                    if is_valid_token_tokensniffer(ca) and is_valid_token_bscscan(ca):
-                        detected_tokens[ca] = {"status": "safe", "entry_price": None, "chain": "bsc", "market_cap": 100000}
-                        bot.send_message(chat_id, f"🚀 Token détecté sur X : {ca} (BSC)")
-                        if trade_active and w3:
-                            buy_token(chat_id, ca, mise_depart, "bsc")
-                    else:
-                        bot.send_message(chat_id, f"❌ {ca} rejeté par les filtres")
-                cache[ca] = True
-        if not tweets["data"]:
-            bot.send_message(chat_id, "ℹ️ Aucun tweet trouvé sur Twitter")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Erreur Twitter HTTP: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur Twitter: {str(e)}")
-    except Exception as e:
-        logger.error(f"Erreur monitor_twitter_for_tokens: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur Twitter inattendue: {str(e)}")
+        data = response.json()
+        tokens = data.get('data', {}).get('tokens', [])[:10]
+        bot.send_message(chat_id, f"📡 {len(tokens)} nouveaux tokens trouvés sur Birdeye")
+        for token in tokens:
+            ca = token.get('address')
+            if ca in cache:
+                continue
+            liquidity = token.get('liquidity', 0)
+            volume = token.get('volume', {}).get('h24', 0)
+            market_cap = token.get('mc', 0)
+            price_change = token.get('priceChange24h_pct', 0)
 
-# Achat de token
-def buy_token(chat_id, contract_address, amount, chain):
-    logger.info(f"Achat de {contract_address} sur {chain}")
+            if (MIN_VOLUME_SOL <= volume <= MAX_VOLUME_SOL and 
+                liquidity >= MIN_LIQUIDITY and liquidity >= market_cap * MIN_LIQUIDITY_PCT and 
+                MIN_PRICE_CHANGE <= price_change <= MAX_PRICE_CHANGE and 
+                MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
+                detected_tokens[ca] = {"status": "safe", "entry_price": None, "chain": "solana", "market_cap": market_cap}
+                bot.send_message(chat_id, f"🚀 Token détecté : {ca} (Solana) - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}")
+                if trade_active:
+                    buy_token_solana(chat_id, ca, mise_depart)
+            else:
+                bot.send_message(chat_id, f"❌ {ca} rejeté - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}, Change: {price_change}%")
+            cache[ca] = True
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Erreur Birdeye HTTP: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur Birdeye: {str(e)}")
+    except Exception as e:
+        logger.error(f"Erreur Birdeye: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur Birdeye inattendue: {str(e)}")
+
+# Achat de token sur BSC (PancakeSwap)
+def buy_token_bsc(chat_id, contract_address, amount):
+    logger.info(f"Achat de {contract_address} sur BSC")
     if test_mode:
-        bot.send_message(chat_id, f"🧪 [Mode Test] Achat simulé de {amount} {chain.upper()} de {contract_address}")
+        bot.send_message(chat_id, f"🧪 [Mode Test] Achat simulé de {amount} BNB de {contract_address}")
         detected_tokens[contract_address]["entry_price"] = 0.01
         portfolio[contract_address] = {
             "amount": amount,
-            "chain": chain,
+            "chain": "bsc",
             "entry_price": 0.01,
             "market_cap_at_buy": detected_tokens[contract_address]["market_cap"],
             "current_market_cap": detected_tokens[contract_address]["market_cap"]
         }
-        monitor_and_sell(chat_id, contract_address, amount, chain)
+        monitor_and_sell(chat_id, contract_address, amount, "bsc")
         return
     try:
         router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
         amount_in = w3.to_wei(amount, 'ether')
+        amount_out_min = int(amount_in * (1 - slippage / 100))  # Applique le slippage
         tx = router.functions.swapExactETHForTokens(
-            0,
+            amount_out_min,
             [w3.to_checksum_address("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"), w3.to_checksum_address(contract_address)],
             w3.to_checksum_address(WALLET_ADDRESS),
             int(time.time()) + 60 * 10
         ).build_transaction({
             'from': WALLET_ADDRESS,
             'value': amount_in,
-            'gas': 200000,
-            'gasPrice': w3.to_wei('5', 'gwei'),
+            'gas': 250000,
+            'gasPrice': w3.to_wei(gas_fee, 'gwei'),
             'nonce': w3.eth.get_transaction_count(WALLET_ADDRESS)
         })
         signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
         tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
-        bot.send_message(chat_id, f"🚀 Achat de {amount} {chain.upper()} de {contract_address}, TX: {tx_hash.hex()}")
+        bot.send_message(chat_id, f"🚀 Achat de {amount} BNB de {contract_address}, TX: {tx_hash.hex()}")
         portfolio[contract_address] = {
             "amount": amount,
-            "chain": chain,
-            "entry_price": 0.01,  # À remplacer
+            "chain": "bsc",
+            "entry_price": 0.01,  # À remplacer par prix réel
             "market_cap_at_buy": detected_tokens[contract_address]["market_cap"],
             "current_market_cap": detected_tokens[contract_address]["market_cap"]
         }
-        monitor_and_sell(chat_id, contract_address, amount, chain)
+        monitor_and_sell(chat_id, contract_address, amount, "bsc")
     except Exception as e:
-        logger.error(f"Erreur achat token: {str(e)}")
+        logger.error(f"Erreur achat BSC: {str(e)}")
+        bot.send_message(chat_id, f"❌ Échec achat {contract_address}: {str(e)}")
+
+# Achat de token sur Solana (Raydium)
+def buy_token_solana(chat_id, contract_address, amount):
+    logger.info(f"Achat de {contract_address} sur Solana")
+    if test_mode:
+        bot.send_message(chat_id, f"🧪 [Mode Test] Achat simulé de {amount} SOL de {contract_address}")
+        detected_tokens[contract_address]["entry_price"] = 0.01
+        portfolio[contract_address] = {
+            "amount": amount,
+            "chain": "solana",
+            "entry_price": 0.01,
+            "market_cap_at_buy": detected_tokens[contract_address]["market_cap"],
+            "current_market_cap": detected_tokens[contract_address]["market_cap"]
+        }
+        monitor_and_sell(chat_id, contract_address, amount, "solana")
+        return
+    try:
+        amount_in = int(amount * 10**9)  # SOL en lamports
+        tx = Transaction()
+        instruction = Instruction(
+            program_id=RAYDIUM_PROGRAM_ID,
+            accounts=[
+                {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
+                {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
+            ],
+            data=bytes([0])  # À remplacer par instruction réelle
+        )
+        tx.add(instruction)
+        tx.recent_blockhash = Pubkey.from_string(hashlib.sha256(str(int(time.time())).encode()).hexdigest()[:32])
+        tx.sign(solana_keypair)
+        response = session.post(SOLANA_RPC, json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [tx.serialize().hex()]
+        })
+        tx_hash = response.json().get('result')
+        bot.send_message(chat_id, f"🚀 Achat de {amount} SOL de {contract_address}, TX: {tx_hash}")
+        portfolio[contract_address] = {
+            "amount": amount,
+            "chain": "solana",
+            "entry_price": 0.01,
+            "market_cap_at_buy": detected_tokens[contract_address]["market_cap"],
+            "current_market_cap": detected_tokens[contract_address]["market_cap"]
+        }
+        monitor_and_sell(chat_id, contract_address, amount, "solana")
+    except Exception as e:
+        logger.error(f"Erreur achat Solana: {str(e)}")
         bot.send_message(chat_id, f"❌ Échec achat {contract_address}: {str(e)}")
 
 # Surveillance et vente
@@ -383,16 +535,47 @@ def monitor_and_sell(chat_id, contract_address, amount, chain):
             bot.send_message(chat_id, f"⚠️ Erreur surveillance {contract_address}: {str(e)}")
             break
 
-# Vente de token
+# Vente de token (BSC)
 def sell_token(chat_id, contract_address, amount, chain, current_price):
+    if chain != "bsc":
+        bot.send_message(chat_id, f"🧪 [Mode Test] Vente simulée de {amount} {chain.upper()} de {contract_address} à {current_price}")
+        if contract_address in portfolio:
+            portfolio[contract_address]["amount"] -= amount
+            if portfolio[contract_address]["amount"] <= 0:
+                del portfolio[contract_address]
+        return
+    if test_mode:
+        bot.send_message(chat_id, f"🧪 [Mode Test] Vente simulée de {amount} BNB de {contract_address} à {current_price}")
+        if contract_address in portfolio:
+            portfolio[contract_address]["amount"] -= amount
+            if portfolio[contract_address]["amount"] <= 0:
+                del portfolio[contract_address]
+        return
     try:
-        bot.send_message(chat_id, f"💸 Vente simulée de {amount} {chain.upper()} de {contract_address} à {current_price} (à implémenter)")
+        router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
+        token_amount = w3.to_wei(amount, 'ether')  # À ajuster avec quantité réelle
+        amount_in_max = int(token_amount * (1 + slippage / 100))
+        tx = router.functions.swapExactTokensForETH(
+            token_amount,
+            amount_in_max,
+            [w3.to_checksum_address(contract_address), w3.to_checksum_address("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")],
+            w3.to_checksum_address(WALLET_ADDRESS),
+            int(time.time()) + 60 * 10
+        ).build_transaction({
+            'from': WALLET_ADDRESS,
+            'gas': 250000,
+            'gasPrice': w3.to_wei(gas_fee, 'gwei'),
+            'nonce': w3.eth.get_transaction_count(WALLET_ADDRESS)
+        })
+        signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        bot.send_message(chat_id, f"💸 Vente de {amount} BNB de {contract_address}, TX: {tx_hash.hex()}")
         if contract_address in portfolio:
             portfolio[contract_address]["amount"] -= amount
             if portfolio[contract_address]["amount"] <= 0:
                 del portfolio[contract_address]
     except Exception as e:
-        logger.error(f"Erreur vente token: {str(e)}")
+        logger.error(f"Erreur vente BSC: {str(e)}")
         bot.send_message(chat_id, f"❌ Échec vente {contract_address}: {str(e)}")
 
 # Afficher le portefeuille
@@ -427,7 +610,7 @@ def show_portfolio(chat_id):
         logger.error(f"Erreur portefeuille: {str(e)}")
         bot.send_message(chat_id, f"⚠️ Erreur portefeuille: {str(e)}")
 
-# Solde Solana (simulation)
+# Solde Solana simulé
 def get_solana_balance(wallet_address):
     try:
         return 0.5  # À implémenter
@@ -435,10 +618,10 @@ def get_solana_balance(wallet_address):
         logger.error(f"Erreur solde Solana: {str(e)}")
         return 0
 
-# Market cap en temps réel (simulation)
+# Market cap en temps réel simulé
 def get_current_market_cap(contract_address):
     try:
-        return detected_tokens[contract_address]["market_cap"] * 1.5  # Simulation
+        return detected_tokens[contract_address]["market_cap"] * 1.5
     except Exception as e:
         logger.error(f"Erreur market cap: {str(e)}")
         return detected_tokens[contract_address]["market_cap"]
