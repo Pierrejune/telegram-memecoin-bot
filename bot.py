@@ -45,7 +45,7 @@ PANCAKE_ROUTER_ABI = []  # Remplace par l’ABI réel de PancakeSwap Router V2
 
 # Configuration de base
 test_mode = True
-mise_depart = 0.01  # Réduit pour tests (en BNB)
+mise_depart = 0.01
 stop_loss_threshold = 10
 take_profit_steps = [2, 3, 5]
 gas_fee = 0.001
@@ -54,7 +54,6 @@ trade_active = False
 cache = TTLCache(maxsize=100, ttl=300)
 
 # APIs externes
-GMGN_API_URL = "https://api.gmgn.ai/new_tokens"
 BSC_SCAN_API_URL = "https://api.bscscan.com/api"
 TWITTER_TRACK_URL = "https://api.twitter.com/2/tweets/search/recent"
 
@@ -172,39 +171,24 @@ def is_valid_token_bscscan(contract_address):
         logger.error(f"Erreur BscScan: {str(e)}")
         return False
 
-# Surveillance gmgn.ai
+# Surveillance gmgn.ai (désactivée temporairement)
 def detect_new_tokens(chat_id):
     global detected_tokens
-    bot.send_message(chat_id, "🔍 Recherche de tokens sur gmgn.ai...")
-    try:
-        response = requests.get(GMGN_API_URL, timeout=5)
-        tokens = response.json()
-        bot.send_message(chat_id, f"📡 {len(tokens)} tokens trouvés sur gmgn.ai")
-        for token in tokens:
-            ca = token["contract_address"]
-            if ca in cache:
-                continue
-            if is_valid_token_tokensniffer(ca) and is_valid_token_bscscan(ca):
-                detected_tokens[ca] = {"status": "safe", "entry_price": None}
-                bot.send_message(chat_id, f"✅ Nouveau token détecté : {token['name']} ({ca})")
-                if trade_active and w3:
-                    buy_token(chat_id, ca, mise_depart)
-            else:
-                bot.send_message(chat_id, f"❌ {ca} rejeté par les filtres de sécurité")
-        if not tokens:
-            bot.send_message(chat_id, "ℹ️ Aucun token trouvé sur gmgn.ai")
-    except Exception as e:
-        logger.error(f"Erreur detect_new_tokens: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur gmgn.ai: {str(e)}")
+    bot.send_message(chat_id, "ℹ️ Recherche gmgn.ai désactivée pour l’instant (API indisponible)")
 
 # Surveillance Twitter
 def monitor_twitter_for_tokens(chat_id):
     headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
-    params = {"query": "contract address memecoin $ -is:retweet", "max_results": 10}
+    params = {"query": "memecoin contract 0x -is:retweet", "max_results": 10}
     bot.send_message(chat_id, "🔍 Recherche de tokens sur Twitter...")
     try:
         response = requests.get(TWITTER_TRACK_URL, headers=headers, params=params, timeout=5)
+        response.raise_for_status()
         tweets = response.json()
+        if 'data' not in tweets:
+            error_msg = tweets.get('error', 'Réponse invalide') if 'error' in tweets else 'Aucune donnée'
+            bot.send_message(chat_id, f"⚠️ Réponse Twitter invalide: {error_msg}")
+            return
         bot.send_message(chat_id, f"📡 {len(tweets['data'])} tweets trouvés sur Twitter")
         for tweet in tweets["data"]:
             ca_match = re.search(r"0x[a-fA-F0-9]{40}", tweet["text"])
@@ -222,24 +206,27 @@ def monitor_twitter_for_tokens(chat_id):
                     bot.send_message(chat_id, f"ℹ️ {ca} déjà vu ou en cache")
         if not tweets["data"]:
             bot.send_message(chat_id, "ℹ️ Aucun tweet trouvé sur Twitter")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Erreur Twitter HTTP: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur Twitter: {str(e)}")
     except Exception as e:
         logger.error(f"Erreur monitor_twitter_for_tokens: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur Twitter: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur Twitter inattendue: {str(e)}")
 
 # Achat de token sur PancakeSwap
 def buy_token(chat_id, contract_address, amount):
     if not w3 or test_mode:
         bot.send_message(chat_id, f"🧪 [Mode Test] Achat simulé de {amount} BNB de {contract_address}")
-        detected_tokens[contract_address]["entry_price"] = 0.01  # Prix fictif
+        detected_tokens[contract_address]["entry_price"] = 0.01
         return
     try:
         router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
         amount_in = w3.to_wei(amount, 'ether')
         tx = router.functions.swapExactETHForTokens(
-            0,  # Montant minimum (slippage à ajuster)
-            [w3.to_checksum_address("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"), w3.to_checksum_address(contract_address)],  # WBNB -> Token
+            0,
+            [w3.to_checksum_address("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"), w3.to_checksum_address(contract_address)],
             w3.to_checksum_address(WALLET_ADDRESS),
-            int(time.time()) + 60 * 10  # Deadline
+            int(time.time()) + 60 * 10
         ).build_transaction({
             'from': WALLET_ADDRESS,
             'value': amount_in,
