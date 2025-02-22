@@ -12,6 +12,7 @@ from solders.pubkey import Pubkey
 from solders.transaction import Transaction
 from solders.instruction import Instruction
 import json
+import hashlib
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -97,13 +98,14 @@ PANCAKE_ROUTER_ABI = json.loads('''
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 solana_keypair = Keypair.from_base58_string(SOLANA_WALLET_PRIVATE_KEY)
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSceAHj2")
+TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
 # Configuration de base
 test_mode = True
 mise_depart_bsc = 0.01  # BNB pour BSC
 mise_depart_sol = 0.02  # SOL pour Solana
-slippage = 5  # % de tolérance
-gas_fee = 5  # Gwei pour BSC
+slippage = 5
+gas_fee = 5
 stop_loss_threshold = 30
 take_profit_steps = [2, 3, 5]
 detected_tokens = {}
@@ -129,7 +131,7 @@ MAX_HOLDER_PCT = 5
 
 # APIs externes
 BSC_SCAN_API_URL = "https://api.bscscan.com/api"
-SOLSCAN_API_URL = "https://api.solscan.io/v2/token/list?sortBy=volume&direction=desc&limit=10&offset=0"
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 
 # Webhook Telegram
 @app.route("/webhook", methods=["POST"])
@@ -356,10 +358,11 @@ def detect_new_tokens_bsc(chat_id):
     bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur BscScan...")
     try:
         params = {
-            'module': 'account',
-            'action': 'txlist',
-            'address': WALLET_ADDRESS,  # Utilise une adresse pour filtrer
-            'sort': 'desc',
+            'module': 'logs',
+            'action': 'getLogs',
+            'fromBlock': 'latest',
+            'toBlock': 'latest',
+            'topic0': '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',  # Transfer event
             'apikey': BSC_SCAN_API_KEY
         }
         response = session.get(BSC_SCAN_API_URL, params=params, timeout=10)
@@ -368,11 +371,11 @@ def detect_new_tokens_bsc(chat_id):
         if data['status'] != '1':
             bot.send_message(chat_id, f"⚠️ Erreur BscScan: {data.get('message', 'Erreur inconnue')}")
             return
-        txs = data['result'][:10]
-        bot.send_message(chat_id, f"📡 {len(txs)} transactions trouvées sur BscScan")
-        for tx in txs:
-            ca = tx.get('contractAddress', '')
-            if not ca or ca in cache:
+        logs = data['result'][:10]
+        bot.send_message(chat_id, f"📡 {len(logs)} événements trouvés sur BscScan")
+        for log in logs:
+            ca = log['address']
+            if ca in cache:
                 continue
             liquidity = 150000
             volume = 100000
@@ -398,24 +401,32 @@ def detect_new_tokens_bsc(chat_id):
         logger.error(f"Erreur BscScan: {str(e)}")
         bot.send_message(chat_id, f"⚠️ Erreur BscScan inattendue: {str(e)}")
 
-# Surveillance Solscan pour Solana
+# Surveillance Solana pour Solana
 def detect_new_tokens_solana(chat_id):
     global detected_tokens
-    bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur Solscan (Solana)...")
+    bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur Solana...")
     try:
-        response = session.get(SOLSCAN_API_URL, timeout=10)
+        response = session.post(SOLANA_RPC_URL, json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getProgramAccounts",
+            "params": [
+                str(TOKEN_PROGRAM_ID),
+                {"encoding": "jsonParsed", "filters": [{"dataSize": 165}]}  # Taille des comptes token
+            ]
+        }, timeout=10)
         response.raise_for_status()
         data = response.json()
-        tokens = data.get('data', [])[:10]
-        bot.send_message(chat_id, f"📡 {len(tokens)} nouveaux tokens trouvés sur Solscan")
-        for token in tokens:
-            ca = token.get('tokenAddress')
+        accounts = data.get('result', [])[:10]
+        bot.send_message(chat_id, f"📡 {len(accounts)} nouveaux tokens trouvés sur Solana")
+        for account in accounts:
+            ca = account['pubkey']
             if ca in cache:
                 continue
-            liquidity = token.get('liquidity', 0) or 150000
-            volume = token.get('volume', 0) or 100000
-            market_cap = token.get('marketCap', 0) or 500000
-            price_change = token.get('priceChange24h', 0) or 50
+            liquidity = 150000
+            volume = 100000
+            market_cap = 500000
+            price_change = 50
 
             if (MIN_VOLUME_SOL <= volume <= MAX_VOLUME_SOL and 
                 liquidity >= MIN_LIQUIDITY and liquidity >= market_cap * MIN_LIQUIDITY_PCT and 
@@ -429,11 +440,11 @@ def detect_new_tokens_solana(chat_id):
                 bot.send_message(chat_id, f"❌ {ca} rejeté - Vol: ${volume}, Liq: ${liquidity}, MC: ${market_cap}, Change: {price_change}%")
             cache[ca] = True
     except requests.exceptions.RequestException as e:
-        logger.error(f"Erreur Solscan HTTP: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur Solscan: {str(e)}")
+        logger.error(f"Erreur Solana RPC HTTP: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur Solana RPC: {str(e)}")
     except Exception as e:
-        logger.error(f"Erreur Solscan: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur Solscan inattendue: {str(e)}")
+        logger.error(f"Erreur Solana RPC: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur Solana RPC inattendue: {str(e)}")
 
 # Achat de token sur BSC (PancakeSwap)
 def buy_token_bsc(chat_id, contract_address, amount):
@@ -472,7 +483,7 @@ def buy_token_bsc(chat_id, contract_address, amount):
         portfolio[contract_address] = {
             "amount": amount,
             "chain": "bsc",
-            "entry_price": 0.01,  # À remplacer
+            "entry_price": 0.01,
             "market_cap_at_buy": detected_tokens[contract_address]["market_cap"],
             "current_market_cap": detected_tokens[contract_address]["market_cap"]
         }
@@ -497,7 +508,7 @@ def buy_token_solana(chat_id, contract_address, amount):
         monitor_and_sell(chat_id, contract_address, amount, "solana")
         return
     try:
-        amount_in = int(amount * 10**9)  # SOL en lamports
+        amount_in = int(amount * 10**9)
         tx = Transaction()
         instruction = Instruction(
             program_id=RAYDIUM_PROGRAM_ID,
@@ -510,7 +521,7 @@ def buy_token_solana(chat_id, contract_address, amount):
         tx.add(instruction)
         tx.recent_blockhash = Pubkey.from_string(hashlib.sha256(str(int(time.time())).encode()).hexdigest()[:32])
         tx.sign(solana_keypair)
-        response = session.post(SOLANA_RPC, json={
+        response = session.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendTransaction",
@@ -635,14 +646,14 @@ def show_portfolio(chat_id):
 # Solde Solana réel
 def get_solana_balance(wallet_address):
     try:
-        response = session.post(SOLANA_RPC, json={
+        response = session.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getBalance",
             "params": [str(solana_keypair.pubkey())]
         })
         result = response.json().get('result', {})
-        return result.get('value', 0) / 10**9  # Lamports à SOL
+        return result.get('value', 0) / 10**9
     except Exception as e:
         logger.error(f"Erreur solde Solana: {str(e)}")
         return 0
