@@ -36,7 +36,7 @@ WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
-BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")  # Corrigé pour correspondre à ton Cloud Run
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
 PORT = int(os.getenv("PORT", 8080))
 
@@ -231,16 +231,25 @@ def start_message(message):
     except Exception as e:
         logger.error(f"Erreur dans start_message: {str(e)}")
 
-# Menu principal
+# Commande /menu (ajoutée)
+@bot.message_handler(commands=['menu'])
+def menu_message(message):
+    logger.info("Commande /menu reçue")
+    try:
+        show_main_menu(message.chat.id)
+    except Exception as e:
+        logger.error(f"Erreur dans menu_message: {str(e)}")
+
+# Menu principal avec emojis
 def show_main_menu(chat_id):
     markup = InlineKeyboardMarkup()
     markup.add(
-        InlineKeyboardButton("Statut", callback_data="status"),
-        InlineKeyboardButton("Configure", callback_data="config"),
-        InlineKeyboardButton("Lancer", callback_data="launch"),
-        InlineKeyboardButton("Arrêter", callback_data="stop"),
-        InlineKeyboardButton("Portefeuille", callback_data="portfolio"),
-        InlineKeyboardButton("Réglages", callback_data="settings")
+        InlineKeyboardButton("📊 Statut", callback_data="status"),
+        InlineKeyboardButton("⚙️ Configure", callback_data="config"),
+        InlineKeyboardButton("🚀 Lancer", callback_data="launch"),
+        InlineKeyboardButton("🛑 Arrêter", callback_data="stop"),
+        InlineKeyboardButton("💼 Portefeuille", callback_data="portfolio"),
+        InlineKeyboardButton("🔧 Réglages", callback_data="settings")
     )
     try:
         bot.send_message(chat_id, "Que veux-tu faire?", reply_markup=markup)
@@ -256,7 +265,7 @@ def callback_query(call):
     try:
         if call.data == "status":
             bot.send_message(chat_id, (
-                f"Statut :\n"
+                f"📊 Statut :\n"
                 f"- Mise BSC: {mise_depart_bsc} BNB\n"
                 f"- Mise Solana: {mise_depart_sol} SOL\n"
                 f"- Slippage: {slippage} %\n"
@@ -312,11 +321,11 @@ def callback_query(call):
 def show_config_menu(chat_id):
     markup = InlineKeyboardMarkup()
     markup.add(
-        InlineKeyboardButton("Augmenter mise BSC (+0.01 BNB)", callback_data="increase_mise_bsc"),
-        InlineKeyboardButton("Augmenter mise SOL (+0.01 SOL)", callback_data="increase_mise_sol")
+        InlineKeyboardButton("📈 Augmenter mise BSC (+0.01 BNB)", callback_data="increase_mise_bsc"),
+        InlineKeyboardButton("📈 Augmenter mise SOL (+0.01 SOL)", callback_data="increase_mise_sol")
     )
     try:
-        bot.send_message(chat_id, "Configuration :", reply_markup=markup)
+        bot.send_message(chat_id, "⚙️ Configuration :", reply_markup=markup)
     except Exception as e:
         logger.error(f"Erreur dans show_config_menu: {str(e)}")
 
@@ -324,13 +333,13 @@ def show_config_menu(chat_id):
 def show_settings_menu(chat_id):
     markup = InlineKeyboardMarkup()
     markup.add(
-        InlineKeyboardButton("Ajuster Mise BSC", callback_data="adjust_mise_bsc"),
-        InlineKeyboardButton("Ajuster Mise Solana", callback_data="adjust_mise_sol"),
-        InlineKeyboardButton("Ajuster Slippage", callback_data="adjust_slippage"),
-        InlineKeyboardButton("Ajuster Gas Fee (BSC)", callback_data="adjust_gas")
+        InlineKeyboardButton("📊 Ajuster Mise BSC", callback_data="adjust_mise_bsc"),
+        InlineKeyboardButton("📊 Ajuster Mise Solana", callback_data="adjust_mise_sol"),
+        InlineKeyboardButton("📉 Ajuster Slippage", callback_data="adjust_slippage"),
+        InlineKeyboardButton("⛽ Ajuster Gas Fee (BSC)", callback_data="adjust_gas")
     )
     try:
-        bot.send_message(chat_id, "Réglages :", reply_markup=markup)
+        bot.send_message(chat_id, "🔧 Réglages :", reply_markup=markup)
     except Exception as e:
         logger.error(f"Erreur dans show_settings_menu: {str(e)}")
 
@@ -445,18 +454,21 @@ def detect_new_tokens_solana(chat_id):
     while attempts < max_attempts:
         try:
             response = session.get(
-                "https://public-api.birdeye.so/public/tokenlist?sort_by=volume&sort_type=desc&limit=10",
+                "https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=10",
                 headers=BIRDEYE_HEADERS
             )
             response.raise_for_status()
-            tokens = response.json()['data']['tokens']
+            data = response.json()
+            if not data.get('success') or 'data' not in data or 'tokens' not in data['data']:
+                raise ValueError("Réponse invalide de l'API Birdeye")
+            tokens = data['data']['tokens']
             bot.send_message(chat_id, f"📡 {len(tokens)} nouveaux tokens trouvés sur Solana")
             for token in tokens:
                 token_address = token['address']
-                volume = float(token['volume'])
-                liquidity = float(token['liquidity'])
-                market_cap = float(token['marketCap'])
-                supply = float(token['supply'])
+                volume = float(token.get('v24hUSD', 0))
+                liquidity = float(token.get('liquidity', 0))
+                market_cap = float(token.get('mc', 0))
+                supply = float(token.get('supply', 0))
                 if (MIN_VOLUME_SOL <= volume <= MAX_VOLUME_SOL and
                     liquidity >= MIN_LIQUIDITY and
                     MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL and
@@ -482,13 +494,19 @@ def detect_new_tokens_solana(chat_id):
                 bot.send_message(chat_id, f"⚠️ Trop de requêtes, attente {5 * attempts}s ({attempts}/{max_attempts})")
                 time.sleep(5 * attempts)
             else:
+                logger.error(f"Erreur HTTP Birdeye: {str(e)}")
                 bot.send_message(chat_id, f"⚠️ Erreur Birdeye: {str(e)}")
                 break
+        except ValueError as e:
+            logger.error(f"Erreur données Birdeye: {str(e)}")
+            bot.send_message(chat_id, f"⚠️ Erreur données Birdeye: {str(e)}")
+            break
         except Exception as e:
+            logger.error(f"Erreur inattendue Solana: {str(e)}")
             bot.send_message(chat_id, f"⚠️ Erreur Solana: {str(e)}")
             break
     else:
-        bot.send_message(chat_id, f"⚠️ Erreur après {max_attempts} tentatives: 429 Too Many Requests")
+        bot.send_message(chat_id, f"⚠️ Échec après {max_attempts} tentatives: Trop de requêtes ou API indisponible")
     bot.send_message(chat_id, "✅ Détection Solana terminée.")
 
 # Achat BSC
@@ -658,7 +676,7 @@ def show_portfolio(chat_id):
     try:
         bsc_balance = w3.eth.get_balance(WALLET_ADDRESS) / 10**18 if w3 else 0
         sol_balance = get_solana_balance(WALLET_ADDRESS)
-        msg = f"Portefeuille:\n- BSC: {bsc_balance:.4f} BNB\n- Solana: {sol_balance:.4f} SOL\n\nTokens détenus:\n"
+        msg = f"💼 Portefeuille:\n- BSC: {bsc_balance:.4f} BNB\n- Solana: {sol_balance:.4f} SOL\n\nTokens détenus:\n"
         if not portfolio:
             msg += "Aucun token détenu."
             bot.send_message(chat_id, msg)
@@ -668,8 +686,8 @@ def show_portfolio(chat_id):
                 profit = (current_mc - data["market_cap_at_buy"]) / data["market_cap_at_buy"] * 100
                 markup = InlineKeyboardMarkup()
                 markup.add(
-                    InlineKeyboardButton("Refresh", callback_data=f"refresh_{ca}"),
-                    InlineKeyboardButton("Sell All", callback_data=f"sell_{ca}")
+                    InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{ca}"),
+                    InlineKeyboardButton("💰 Sell All", callback_data=f"sell_{ca}")
                 )
                 msg += (
                     f"Token: {ca} ({data['chain']})\n"
@@ -730,8 +748,8 @@ def refresh_token(chat_id, token):
         profit = (current_mc - portfolio[token]["market_cap_at_buy"]) / portfolio[token]["market_cap_at_buy"] * 100
         markup = InlineKeyboardMarkup()
         markup.add(
-            InlineKeyboardButton("Refresh", callback_data=f"refresh_{token}"),
-            InlineKeyboardButton("Sell All", callback_data=f"sell_{token}")
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{token}"),
+            InlineKeyboardButton("💰 Sell All", callback_data=f"sell_{token}")
         )
         msg = (
             f"Token: {token} ({portfolio[token]['chain']})\n"
