@@ -5,4 +5,4 @@ cachetools==5.3.1
 python-dotenv==1.0.0
 web3==6.11.0
 solders==0.21.0
-base58==2.1.1  # Pour les transactions Solana
+base58==2.1.1
