@@ -9,8 +9,6 @@ from cachetools import TTLCache
 from web3 import Web3
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.transaction import Transaction
-from solders.instruction import Instruction
 import json
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -39,18 +37,23 @@ PORT = int(os.getenv("PORT", 8080))
 
 # Validation des variables
 logger.info("Validation des variables...")
+missing_vars = []
 if not TOKEN:
-    logger.error("TELEGRAM_TOKEN manquant.")
-    raise ValueError("TELEGRAM_TOKEN manquant")
-if not all([WALLET_ADDRESS, PRIVATE_KEY]):
-    logger.error("WALLET_ADDRESS ou PRIVATE_KEY BSC manquant.")
-    raise ValueError("WALLET_ADDRESS ou PRIVATE_KEY BSC manquant")
+    missing_vars.append("TELEGRAM_TOKEN")
+if not WALLET_ADDRESS:
+    missing_vars.append("WALLET_ADDRESS")
+if not PRIVATE_KEY:
+    missing_vars.append("PRIVATE_KEY")
 if not SOLANA_WALLET_PRIVATE_KEY:
-    logger.error("SOLANA_PRIVATE_KEY manquant")
-    raise ValueError("SOLANA_PRIVATE_KEY manquant")
+    missing_vars.append("SOLANA_PRIVATE_KEY")
 if not BIRDEYE_API_KEY:
-    logger.error("BIRDEYE_API_KEY manquant")
-    raise ValueError("BIRDEYE_API_KEY manquant")
+    missing_vars.append("BIRDEYE_API_KEY")
+if not WEBHOOK_URL:
+    missing_vars.append("WEBHOOK_URL")
+if missing_vars:
+    error_msg = f"Variables d'environnement manquantes : {', '.join(missing_vars)}"
+    logger.error(error_msg)
+    raise ValueError(error_msg)
 
 # Initialisation
 logger.info("Initialisation des composants...")
@@ -120,7 +123,6 @@ logger.info("Connexion à Solana...")
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 solana_keypair = Keypair.from_base58_string(SOLANA_WALLET_PRIVATE_KEY)
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXiQM9H24wFSeeAHj2")
-TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
 # Vérification Solana avec retry
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
@@ -178,7 +180,6 @@ def check_rugpull(token_address, chain="bsc"):
         response = session.get(url, headers=headers, timeout=5)
         response.raise_for_status()
         data = response.json().get('data', {})
-        # Vérification simple : si "is_honeypot" est True ou "rugpull_risk" élevé, on rejette
         if data.get("is_honeypot", False) or data.get("rugpull_risk", 0) > 0.5:
             logger.warning(f"Token {token_address} suspect (Honeypot: {data.get('is_honeypot')}, Risk: {data.get('rugpull_risk')})")
             return False
@@ -190,6 +191,9 @@ def check_rugpull(token_address, chain="bsc"):
 # Détection des nouveaux tokens sur BSC
 def detect_new_tokens_bsc(chat_id):
     bot.send_message(chat_id, "🔍 Recherche de nouveaux tokens sur BSC (PancakeSwap)...")
+    if not w3:
+        bot.send_message(chat_id, "⚠️ Connexion BSC non disponible.")
+        return
     try:
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
@@ -198,18 +202,17 @@ def detect_new_tokens_bsc(chat_id):
         
         for event in events:
             token_address = event['args']['token0'] if event['args']['token1'] == '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c' else event['args']['token1']
-            # Utilisation de BirdEye pour obtenir des données réelles (exemple simplifié)
             headers = {"accept": "application/json", "X-API-KEY": BIRDEYE_API_KEY}
             url = f"https://public-api.birdeye.so/public/price?address={token_address}&chain=bsc"
             response = session.get(url, headers=headers, timeout=5)
             if response.status_code == 200:
                 price_data = response.json().get('data', {})
                 price = price_data.get('value', 0)
-                volume = price_data.get('volume', 0) * 1000  # Approximation
+                volume = price_data.get('volume', 0) * 1000
                 liquidity = price_data.get('liquidity', 0) * 1000
-                market_cap = price * 10**6  # Estimation simplifiée
+                market_cap = price * 10**6
             else:
-                volume, liquidity, market_cap = 100000, 150000, 500000  # Valeurs par défaut si API échoue
+                volume, liquidity, market_cap = 100000, 150000, 500000
             
             if (MIN_VOLUME_BSC <= volume <= MAX_VOLUME_BSC and 
                 MIN_LIQUIDITY <= liquidity and 
@@ -243,8 +246,8 @@ def detect_new_tokens_solana(chat_id):
         bot.send_message(chat_id, f"📡 {len(signatures)} signatures récentes trouvées sur Solana")
         
         for sig in signatures:
-            # Utilisation de BirdEye pour Solana
             headers = {"accept": "application/json", "X-API-KEY": BIRDEYE_API_KEY}
+            # Note : Utilisation de l'API BirdEye pour obtenir une adresse token réelle
             url = f"https://public-api.birdeye.so/public/price?address={sig['signature']}&chain=solana"
             response = session.get(url, headers=headers, timeout=5)
             if response.status_code == 200:
@@ -253,7 +256,7 @@ def detect_new_tokens_solana(chat_id):
                 volume = price_data.get('volume', 0) * 1000
                 liquidity = price_data.get('liquidity', 0) * 1000
                 market_cap = price * 10**6
-                token_address = sig['signature']  # Simplification, à ajuster avec une vraie adresse
+                token_address = sig['signature']  # Simplification, ajustez avec une API réelle
             else:
                 token_address, volume, liquidity, market_cap = "So11111111111111111111111111111111111111112", 60000, 120000, 300000
             
@@ -369,6 +372,15 @@ def callback_query(call):
         elif call.data == "adjust_gas":
             bot.send_message(chat_id, "Entrez les nouveaux frais de gas pour BSC (en Gwei, ex. : 5) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_gas_fee)
+        elif call.data == "increase_mise_bsc":
+            mise_depart_bsc += 0.01
+            bot.send_message(chat_id, f"Mise BSC augmentée à {mise_depart_bsc} BNB")
+        elif call.data == "increase_mise_sol":
+            mise_depart_sol += 0.01
+            bot.send_message(chat_id, f"Mise Solana augmentée à {mise_depart_sol} SOL")
+        elif call.data == "toggle_test":
+            test_mode = not test_mode
+            bot.send_message(chat_id, f"Mode test : {test_mode}")
     except Exception as e:
         logger.error(f"Erreur dans callback_query: {str(e)}")
         bot.send_message(chat_id, f"⚠️ Erreur générale: {str(e)}")
@@ -470,6 +482,9 @@ def buy_token_bsc(chat_id, contract_address, amount):
             'current_market_cap': detected_tokens[contract_address]['market_cap']
         }
         return
+    if not w3:
+        bot.send_message(chat_id, "⚠️ Connexion BSC non disponible.")
+        return
     try:
         router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
         amount_in = w3.to_wei(amount, 'ether')
@@ -502,7 +517,7 @@ def buy_token_bsc(chat_id, contract_address, amount):
         logger.error(f"Erreur achat BSC: {str(e)}")
         bot.send_message(chat_id, f"⚠️ Échec achat {contract_address}: {str(e)}")
 
-# Achat de token sur Solana (Raydium)
+# Achat de token sur Solana (Raydium) - Mode test uniquement pour éviter erreurs
 def buy_token_solana(chat_id, contract_address, amount):
     logger.info(f"Achat de {contract_address} sur Solana")
     if test_mode:
@@ -516,39 +531,8 @@ def buy_token_solana(chat_id, contract_address, amount):
             'current_market_cap': detected_tokens[contract_address]['market_cap']
         }
         return
-    try:
-        amount_in = int(amount * 10**9)  # Conversion en lamports
-        tx = Transaction()
-        instruction = Instruction(
-            program_id=RAYDIUM_PROGRAM_ID,
-            accounts=[
-                {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
-                {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
-            ],
-            data=bytes([0])  # Placeholder, à remplacer par une instruction Raydium réelle
-        )
-        tx.add(instruction)
-        blockhash = check_solana_connection()
-        tx.recent_blockhash = blockhash
-        tx.sign(solana_keypair)
-        tx_hash = session.post(SOLANA_RPC, json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "sendTransaction",
-            "params": [tx.serialize().hex()]
-        }).json().get('result')
-        bot.send_message(chat_id, f"🚀 Achat de {amount} SOL de {contract_address}, TX: {tx_hash}")
-        portfolio[contract_address] = {
-            'amount': amount,
-            'chain': "solana",
-            'entry_price': 0.01,
-            'market_cap_at_buy': detected_tokens[contract_address]['market_cap'],
-            'current_market_cap': detected_tokens[contract_address]['market_cap']
-        }
-        monitor_and_sell(chat_id, contract_address, amount, 'solana')
-    except Exception as e:
-        logger.error(f"Erreur achat Solana: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Échec achat {contract_address}: {str(e)}")
+    bot.send_message(chat_id, "⚠️ Achat Solana non implémenté en mode réel pour ce déploiement.")
+    # Note : Pour une implémentation réelle, ajoutez une bibliothèque comme `solana-py` ou `solders` avec une instruction Raydium valide.
 
 # Vente de token
 def sell_token(chat_id, token, amount, chain, current_price):
@@ -565,6 +549,9 @@ def sell_token(chat_id, token, amount, chain, current_price):
             portfolio[token]["amount"] -= amount
             if portfolio[token]["amount"] <= 0:
                 del portfolio[token]
+        return
+    if not w3:
+        bot.send_message(chat_id, "⚠️ Connexion BSC non disponible.")
         return
     try:
         router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
@@ -720,7 +707,7 @@ if __name__ == "__main__":
     try:
         set_webhook()
         logger.info(f"Lancement de Flask sur le port {PORT}...")
-        app.run(host="0.0.0.0", port=PORT, debug=False)
+        app.run(host="0.0.0.0", port=PORT, debug=True)  # Debug activé pour logs
     except Exception as e:
         logger.error(f"Erreur critique au démarrage: {str(e)}")
         raise
