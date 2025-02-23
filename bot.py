@@ -30,36 +30,43 @@ HEADERS = {
 session = requests.Session()
 session.headers.update(HEADERS)
 
-# Chargement des variables depuis Cloud Run
+# Chargement des variables depuis Cloud Run avec noms exacts
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 SOLANA_WALLET_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
-BIRDEYE_API_KEY = os.getenv("BIRDEYE_KEY")
-BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY")  # Ajoute cette clé dans Cloud Run
+BIRDEYE_KEY = os.getenv("BIRDEYE_KEY")
+BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")  # Aligné avec ton nom dans Cloud Run
 PORT = int(os.getenv("PORT", 8080))
 
 # Headers spécifiques pour APIs
-BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
+BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_KEY}
 
-# Validation
+# Validation corrigée avec noms exacts
 logger.info("Validation des variables...")
+missing_vars = []
 if not TOKEN:
-    logger.error("TELEGRAM_TOKEN manquant.")
-    raise ValueError("TELEGRAM_TOKEN manquant")
-if not all([WALLET_ADDRESS, PRIVATE_KEY]):
-    logger.error("WALLET_ADDRESS ou PRIVATE_KEY BSC manquant.")
-    raise ValueError("WALLET_ADDRESS ou PRIVATE_KEY BSC manquant")
+    missing_vars.append("TELEGRAM_TOKEN")
+if not WALLET_ADDRESS:
+    missing_vars.append("WALLET_ADDRESS")
+if not PRIVATE_KEY:
+    missing_vars.append("PRIVATE_KEY")
 if not SOLANA_WALLET_PRIVATE_KEY:
-    logger.error("SOLANA_PRIVATE_KEY manquant")
-    raise ValueError("SOLANA_PRIVATE_KEY manquant")
-if not BIRDEYE_API_KEY:
-    logger.error("BIRDEYE_API_KEY manquant.")
-    raise ValueError("BIRDEYE_API_KEY manquant")
-if not BSCSCAN_API_KEY:
-    logger.error("BSCSCAN_API_KEY manquant.")
-    raise ValueError("BSCSCAN_API_KEY manquant")
+    missing_vars.append("SOLANA_PRIVATE_KEY")
+if not WEBHOOK_URL:
+    missing_vars.append("WEBHOOK_URL")
+if not BIRDEYE_KEY:
+    missing_vars.append("BIRDEYE_KEY")
+if not BSC_SCAN_API_KEY:
+    missing_vars.append("BSC_SCAN_API_KEY")
+
+if missing_vars:
+    error_msg = f"Variables d'environnement manquantes : {missing_vars}"
+    logger.error(error_msg)
+    raise ValueError(error_msg)
+else:
+    logger.info("Toutes les variables d'environnement sont présentes.")
 
 # Initialisation
 logger.info("Initialisation des composants...")
@@ -388,7 +395,7 @@ def detect_new_tokens_bsc(chat_id):
     logger.info("Recherche de nouveaux tokens sur BSC (PancakeSwap via BSCScan)...")
     try:
         response = session.get(
-            f"https://api.bscscan.com/api?module=logs&action=getLogs&fromBlock=latest&toBlock=latest&address={PANCAKE_FACTORY_ADDRESS}&topic0=0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9&apikey={BSCSCAN_API_KEY}"
+            f"https://api.bscscan.com/api?module=logs&action=getLogs&fromBlock=latest&toBlock=latest&address={PANCAKE_FACTORY_ADDRESS}&topic0=0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9&apikey={BSC_SCAN_API_KEY}"
         )
         response.raise_for_status()
         events = response.json()['result']
@@ -400,7 +407,7 @@ def detect_new_tokens_bsc(chat_id):
             token_address = token0 if token1 == "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1  # WBNB
             if token_address == "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c":
                 continue  # Ignore si pas un token
-            # Récupérer données via BSCScan ou Web3
+            # Récupérer données via Web3
             pair_contract = w3.eth.contract(address=pair_address, abi=[{"constant": True, "inputs": [], "name": "getReserves", "outputs": [{"name": "", "type": "uint112"}, {"name": "", "type": "uint112"}, {"name": "", "type": "uint32"}], "payable": False, "stateMutability": "view", "type": "function"}])
             reserves = pair_contract.functions.getReserves().call()
             liquidity = reserves[0] / 10**18 if token0 == "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else reserves[1] / 10**18  # BNB
@@ -408,7 +415,7 @@ def detect_new_tokens_bsc(chat_id):
             supply = token_contract.functions.totalSupply().call() / 10**18
             price = liquidity / supply if supply > 0 else 0
             market_cap = price * supply
-            volume_response = session.get(f"https://api.bscscan.com/api?module=account&action=tokenbalance&contractaddress={token_address}&address={pair_address}&tag=latest&apikey={BSCSCAN_API_KEY}")
+            volume_response = session.get(f"https://api.bscscan.com/api?module=account&action=tokenbalance&contractaddress={token_address}&address={pair_address}&tag=latest&apikey={BSC_SCAN_API_KEY}")
             volume = float(volume_response.json()['result']) / 10**18 * price  # Approximation
             if (MIN_VOLUME_BSC <= volume <= MAX_VOLUME_BSC and
                 liquidity >= MIN_LIQUIDITY and
@@ -532,7 +539,6 @@ def buy_token_solana(chat_id, contract_address, amount):
         })
         blockhash = response.json()['result']['value']['blockhash']
         tx = Transaction()
-        # Instruction simplifiée pour swap Raydium
         instruction = Instruction(
             program_id=RAYDIUM_PROGRAM_ID,
             accounts=[
