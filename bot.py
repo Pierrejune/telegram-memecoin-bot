@@ -36,8 +36,9 @@ retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 
-# Dernier appel Twitter (pour limiter la fréquence)
+# Dernier appel Twitter et BSC
 last_twitter_call = 0
+last_bsc_call = 0
 
 # Chargement des variables depuis Cloud Run
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -49,6 +50,8 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
+# Ajout d'un BSC_RPC personnalisé si disponible (ex. QuickNode)
+BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
 
 # Headers pour Twitter API
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
@@ -80,7 +83,7 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
 # BSC (PancakeSwap)
-w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org/"))
+w3 = Web3(Web3.HTTPProvider(BSC_RPC))
 if not w3.is_connected():
     logger.error("Connexion BSC échouée.")
     raise ConnectionError("Connexion BSC échouée")
@@ -220,20 +223,19 @@ def monitor_twitter(chat_id):
     bot.send_message(chat_id, "🔍 Début surveillance Twitter...")
     
     current_time = time.time()
-    if current_time - last_twitter_call < 3:  # Délai minimum de 3s entre appels
+    if current_time - last_twitter_call < 3:
         wait_time = 3 - (current_time - last_twitter_call)
         bot.send_message(chat_id, f"⏳ Délai minimum Twitter, attente de {wait_time:.1f}s...")
         time.sleep(wait_time)
     
     try:
-        # Tweets de Kanye West
         response = session.get(
             "https://api.twitter.com/2/tweets/search/recent?query=from:kanyewest memecoin OR token OR launch&max_results=10",
             headers=TWITTER_HEADERS,
             timeout=10
         )
         if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", 300))  # Défaut 5min
+            retry_after = int(response.headers.get("Retry-After", 300))
             logger.warning(f"Erreur 429 - Limite atteinte, attente de {retry_after} secondes")
             bot.send_message(chat_id, f"⚠ Limite Twitter atteinte, pause de {retry_after}s avant réessai...")
             time.sleep(retry_after)
@@ -251,7 +253,6 @@ def monitor_twitter(chat_id):
                             bot.send_message(chat_id, f"⚡ Nouveau token détecté via X (Kanye West): {word}")
                             check_twitter_token(chat_id, word)
 
-        # Tweets communauté
         response = session.get(
             "https://api.twitter.com/2/tweets/search/recent?query=memecoin OR token OR launch -from:kanyewest&max_results=10",
             headers=TWITTER_HEADERS,
@@ -283,15 +284,14 @@ def monitor_twitter(chat_id):
         bot.send_message(chat_id, f"⚠ Erreur surveillance Twitter: {str(e)}")
         if "429" in str(e):
             bot.send_message(chat_id, "⏳ Trop de requêtes Twitter, pause de 5min...")
-            time.sleep(300)  # Pause forcée de 5min
+            time.sleep(300)
 
 # Vérification des tokens détectés via Twitter
 def check_twitter_token(chat_id, token_address):
     try:
         if token_address.startswith("0x"):  # BSC
             if w3.eth.get_code(w3.to_checksum_address(token_address)) == b'':
-                bot.send_message(chat_id, f"⚠ Token X {token_address} rejeté - Pas un contrat valide")
-                return
+                return False
             
             token_contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=[{
                 "name": "totalSupply",
@@ -308,8 +308,7 @@ def check_twitter_token(chat_id, token_address):
             )
             volume_data = volume_response.json()
             if volume_data['status'] != '1':
-                bot.send_message(chat_id, f"⚠ Token X {token_address} rejeté - Erreur API BSCScan: {volume_data['message']}")
-                return
+                return False
             volume_24h = float(volume_data['result']) / 10**18
             liquidity = volume_24h * 0.5
             market_cap = volume_24h * supply
@@ -317,29 +316,29 @@ def check_twitter_token(chat_id, token_address):
             tx_per_min = (volume_24h / 1440) / 100
             
             if not (MIN_TX_PER_MIN_BSC <= tx_per_min <= MAX_TX_PER_MIN_BSC):
-                bot.send_message(chat_id, f"⚠ Token X {token_address} rejeté - Tx/min hors limites: {tx_per_min:.2f}")
-                return
+                return False
             if not (MIN_VOLUME_BSC <= volume_24h <= MAX_VOLUME_BSC):
-                bot.send_message(chat_id, f"⚠ Token X {token_address} rejeté - Volume hors limites: ${volume_24h:.2f}")
-            elif liquidity < MIN_LIQUIDITY:
-                bot.send_message(chat_id, f"⚠ Token X {token_address} rejeté - Liquidité insuffisante: ${liquidity:.2f}")
-            elif not (MIN_MARKET_CAP_BSC <= market_cap <= MAX_MARKET_CAP_BSC):
-                bot.send_message(chat_id, f"⚠ Token X {token_address} rejeté - Market Cap hors limites: ${market_cap:.2f}")
-            elif not is_safe_token_bsc(token_address):
-                bot.send_message(chat_id, f"⚠ Token X {token_address} rejeté - Sécurité non validée (possible rug)")
-            else:
-                bot.send_message(chat_id, 
-                    f"✅ Token X détecté : {token_address} (BSC) - Tx/min: {tx_per_min:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}"
-                )
-                detected_tokens[token_address] = {
-                    'address': token_address,
-                    'volume': volume_24h,
-                    'tx_per_min': tx_per_min,
-                    'liquidity': liquidity,
-                    'market_cap': market_cap,
-                    'supply': supply
-                }
-                buy_token_bsc(chat_id, token_address, mise_depart_bsc)
+                return False
+            if liquidity < MIN_LIQUIDITY:
+                return False
+            if not (MIN_MARKET_CAP_BSC <= market_cap <= MAX_MARKET_CAP_BSC):
+                return False
+            if not is_safe_token_bsc(token_address):
+                return False
+            
+            bot.send_message(chat_id, 
+                f"✅ Token X détecté : {token_address} (BSC) - Tx/min: {tx_per_min:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}"
+            )
+            detected_tokens[token_address] = {
+                'address': token_address,
+                'volume': volume_24h,
+                'tx_per_min': tx_per_min,
+                'liquidity': liquidity,
+                'market_cap': market_cap,
+                'supply': supply
+            }
+            buy_token_bsc(chat_id, token_address, mise_depart_bsc)
+            return True
         else:  # Solana
             response = session.get(
                 f"https://public-api.birdeye.so/public/token_overview?address={token_address}",
@@ -355,52 +354,60 @@ def check_twitter_token(chat_id, token_address):
             tx_per_min = (volume_24h / 1440) / 50
             
             if not (MIN_TX_PER_MIN_SOL <= tx_per_min <= MAX_TX_PER_MIN_SOL):
-                bot.send_message(chat_id, f"⚠ Token X {token_address} rejeté - Tx/min hors limites: {tx_per_min:.2f}")
-                return
+                return False
             if not (MIN_VOLUME_SOL <= volume_24h <= MAX_VOLUME_SOL):
-                bot.send_message(chat_id, f"⚠ Token X {token_address} rejeté - Volume hors limites: ${volume_24h:.2f}")
-            elif liquidity < MIN_LIQUIDITY:
-                bot.send_message(chat_id, f"⚠ Token X {token_address} rejeté - Liquidité insuffisante: ${liquidity:.2f}")
-            elif not (MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
-                bot.send_message(chat_id, f"⚠ Token X {token_address} rejeté - Market Cap hors limites: ${market_cap:.2f}")
-            elif not is_safe_token_solana(token_address):
-                bot.send_message(chat_id, f"⚠ Token X {token_address} rejeté - Sécurité non validée (possible rug)")
-            else:
-                bot.send_message(chat_id, 
-                    f"✅ Token X détecté : {token_address} (Solana) - Tx/min: {tx_per_min:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}"
-                )
-                detected_tokens[token_address] = {
-                    'address': token_address,
-                    'volume': volume_24h,
-                    'tx_per_min': tx_per_min,
-                    'liquidity': liquidity,
-                    'market_cap': market_cap,
-                    'supply': supply
-                }
-                buy_token_solana(chat_id, token_address, mise_depart_sol)
+                return False
+            if liquidity < MIN_LIQUIDITY:
+                return False
+            if not (MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
+                return False
+            if not is_safe_token_solana(token_address):
+                return False
+            
+            bot.send_message(chat_id, 
+                f"✅ Token X détecté : {token_address} (Solana) - Tx/min: {tx_per_min:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}"
+            )
+            detected_tokens[token_address] = {
+                'address': token_address,
+                'volume': volume_24h,
+                'tx_per_min': tx_per_min,
+                'liquidity': liquidity,
+                'market_cap': market_cap,
+                'supply': supply
+            }
+            buy_token_solana(chat_id, token_address, mise_depart_sol)
+            return True
     except Exception as e:
         logger.error(f"Erreur vérification token X {token_address} : {str(e)}")
         bot.send_message(chat_id, f"⚠ Erreur vérification token X {token_address} : {str(e)}")
+        return False
 
 # Détection des nouveaux tokens BSC
 def detect_new_tokens_bsc(chat_id):
+    global last_bsc_call
     bot.send_message(chat_id, "🔍 Début détection BSC...")
+    current_time = time.time()
+    if current_time - last_bsc_call < 10:  # Délai minimum de 10s entre appels
+        wait_time = 10 - (current_time - last_bsc_call)
+        bot.send_message(chat_id, f"⏳ Délai minimum BSC, attente de {wait_time:.1f}s...")
+        time.sleep(wait_time)
+    
     try:
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
-        events = factory.events.PairCreated.get_logs(fromBlock=latest_block-5, toBlock=latest_block)
+        events = factory.events.PairCreated.get_logs(fromBlock=latest_block-3, toBlock=latest_block)  # Réduit à 3 blocs
         bot.send_message(chat_id, f"📡 {len(events)} nouvelles paires détectées sur BSC")
+        
+        valid_token_found = False
         for event in events:
             token0 = event['args']['token0']
             token1 = event['args']['token1']
             pair = event['args']['pair']
             if "0x0000" in token0.lower() or "0x0000" in token1.lower():
-                bot.send_message(chat_id, f"⚠ Token ignoré - Adresse invalide ou suspecte: {token0} ou {token1}")
                 continue
             
             token_address = token1
             if w3.eth.get_code(w3.to_checksum_address(token_address)) == b'':
-                bot.send_message(chat_id, f"⚠ Token {token_address} rejeté - Pas un contrat valide")
                 continue
             
             token_contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=[{
@@ -418,7 +425,6 @@ def detect_new_tokens_bsc(chat_id):
             )
             volume_data = volume_response.json()
             if volume_data['status'] != '1':
-                bot.send_message(chat_id, f"⚠ Token {token_address} rejeté - Erreur API BSCScan: {volume_data['message']}")
                 continue
             volume_24h = float(volume_data['result']) / 10**18
             liquidity = volume_24h * 0.5
@@ -427,33 +433,39 @@ def detect_new_tokens_bsc(chat_id):
             tx_per_min = (volume_24h / 1440) / 100
             
             if not (MIN_TX_PER_MIN_BSC <= tx_per_min <= MAX_TX_PER_MIN_BSC):
-                bot.send_message(chat_id, f"⚠ Token {token_address} rejeté - Tx/min hors limites: {tx_per_min:.2f}")
                 continue
             if not (MIN_VOLUME_BSC <= volume_24h <= MAX_VOLUME_BSC):
-                bot.send_message(chat_id, f"⚠ Token {token_address} rejeté - Volume 24h hors limites: ${volume_24h:.2f}")
-            elif liquidity < MIN_LIQUIDITY:
-                bot.send_message(chat_id, f"⚠ Token {token_address} rejeté - Liquidité insuffisante: ${liquidity:.2f}")
-            elif not (MIN_MARKET_CAP_BSC <= market_cap <= MAX_MARKET_CAP_BSC):
-                bot.send_message(chat_id, f"⚠ Token {token_address} rejeté - Market Cap hors limites: ${market_cap:.2f}")
-            elif not is_safe_token_bsc(token_address):
-                bot.send_message(chat_id, f"⚠ Token {token_address} rejeté - Sécurité non validée (possible rug)")
-            else:
-                bot.send_message(chat_id, 
-                    f"✅ Token détecté : {token_address} (BSC) - Tx/min: {tx_per_min:.2f}, Vol 24h: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}"
-                )
-                detected_tokens[token_address] = {
-                    'address': token_address,
-                    'volume': volume_24h,
-                    'tx_per_min': tx_per_min,
-                    'liquidity': liquidity,
-                    'market_cap': market_cap,
-                    'supply': supply
-                }
-                buy_token_bsc(chat_id, token_address, mise_depart_bsc)
+                continue
+            if liquidity < MIN_LIQUIDITY:
+                continue
+            if not (MIN_MARKET_CAP_BSC <= market_cap <= MAX_MARKET_CAP_BSC):
+                continue
+            if not is_safe_token_bsc(token_address):
+                continue
+            
+            bot.send_message(chat_id, 
+                f"✅ Token détecté : {token_address} (BSC) - Tx/min: {tx_per_min:.2f}, Vol 24h: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}"
+            )
+            detected_tokens[token_address] = {
+                'address': token_address,
+                'volume': volume_24h,
+                'tx_per_min': tx_per_min,
+                'liquidity': liquidity,
+                'market_cap': market_cap,
+                'supply': supply
+            }
+            buy_token_bsc(chat_id, token_address, mise_depart_bsc)
+            valid_token_found = True
+        
+        last_bsc_call = time.time()
+        if not valid_token_found:
+            bot.send_message(chat_id, "ℹ️ Aucun token BSC ne correspond aux critères.")
         bot.send_message(chat_id, "✅ Détection BSC terminée.")
     except Exception as e:
         logger.error(f"Erreur détection BSC: {str(e)}")
         bot.send_message(chat_id, f"⚠ Erreur détection BSC: {str(e)}")
+        bot.send_message(chat_id, "⏳ Pause de 60s pour éviter limite BSC...")
+        time.sleep(60)
 
 # Détection des nouveaux tokens Solana
 def detect_new_tokens_solana(chat_id):
@@ -467,6 +479,8 @@ def detect_new_tokens_solana(chat_id):
         response.raise_for_status()
         tokens = response.json()['data']['tokens']
         bot.send_message(chat_id, f"📡 {len(tokens)} nouveaux tokens détectés sur Solana")
+        
+        valid_token_found = False
         for token in tokens:
             token_address = token['address']
             volume_24h = float(token.get('v24hUSD', 0))
@@ -477,29 +491,32 @@ def detect_new_tokens_solana(chat_id):
             tx_per_min = (volume_24h / 1440) / 50
             
             if not (MIN_TX_PER_MIN_SOL <= tx_per_min <= MAX_TX_PER_MIN_SOL):
-                bot.send_message(chat_id, f"⚠ Token {token_address} rejeté - Tx/min hors limites: {tx_per_min:.2f}")
                 continue
             if not (MIN_VOLUME_SOL <= volume_24h <= MAX_VOLUME_SOL):
-                bot.send_message(chat_id, f"⚠ Token {token_address} rejeté - Volume hors limites: ${volume_24h:.2f}")
-            elif liquidity < MIN_LIQUIDITY:
-                bot.send_message(chat_id, f"⚠ Token {token_address} rejeté - Liquidité insuffisante: ${liquidity:.2f}")
-            elif not (MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
-                bot.send_message(chat_id, f"⚠ Token {token_address} rejeté - Market Cap hors limites: ${market_cap:.2f}")
-            elif not is_safe_token_solana(token_address):
-                bot.send_message(chat_id, f"⚠ Token {token_address} rejeté - Sécurité non validée (possible rug)")
-            else:
-                bot.send_message(chat_id, 
-                    f"✅ Token détecté : {token_address} (Solana) - Tx/min: {tx_per_min:.2f}, Vol 24h: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}"
-                )
-                detected_tokens[token_address] = {
-                    'address': token_address,
-                    'volume': volume_24h,
-                    'tx_per_min': tx_per_min,
-                    'liquidity': liquidity,
-                    'market_cap': market_cap,
-                    'supply': supply
-                }
-                buy_token_solana(chat_id, token_address, mise_depart_sol)
+                continue
+            if liquidity < MIN_LIQUIDITY:
+                continue
+            if not (MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
+                continue
+            if not is_safe_token_solana(token_address):
+                continue
+            
+            bot.send_message(chat_id, 
+                f"✅ Token détecté : {token_address} (Solana) - Tx/min: {tx_per_min:.2f}, Vol 24h: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}"
+            )
+            detected_tokens[token_address] = {
+                'address': token_address,
+                'volume': volume_24h,
+                'tx_per_min': tx_per_min,
+                'liquidity': liquidity,
+                'market_cap': market_cap,
+                'supply': supply
+            }
+            buy_token_solana(chat_id, token_address, mise_depart_sol)
+            valid_token_found = True
+        
+        if not valid_token_found:
+            bot.send_message(chat_id, "ℹ️ Aucun token Solana ne correspond aux critères.")
         bot.send_message(chat_id, "✅ Détection Solana terminée.")
     except Exception as e:
         logger.error(f"Erreur détection Solana: {str(e)}")
@@ -673,7 +690,7 @@ async def trading_cycle(chat_id):
             detect_new_tokens_bsc(chat_id)
             bot.send_message(chat_id, "🔄 Passage à la détection Solana...")
             detect_new_tokens_solana(chat_id)
-            if cycle_count % 15 == 0:  # Réduit à tous les 15 cycles (~2.5min)
+            if cycle_count % 15 == 0:
                 bot.send_message(chat_id, "🔄 Lancement surveillance Twitter...")
                 monitor_twitter(chat_id)
             bot.send_message(chat_id, "⏳ Attente de 10 secondes avant le prochain cycle...")
