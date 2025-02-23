@@ -36,9 +36,8 @@ retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 
-# Dernier appel Twitter et BSC
+# Dernier appel Twitter
 last_twitter_call = 0
-last_bsc_call = 0
 
 # Chargement des variables depuis Cloud Run
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -50,8 +49,7 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
-# Ajout d'un BSC_RPC personnalisé si disponible (ex. QuickNode)
-BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
+BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")  # QuickNode URL ici
 
 # Headers pour Twitter API
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
@@ -67,7 +65,8 @@ required_vars = {
     "WEBHOOK_URL": WEBHOOK_URL,
     "BIRDEYE_API_KEY": BIRDEYE_API_KEY,
     "BSC_SCAN_API_KEY": BSC_SCAN_API_KEY,
-    "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN
+    "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN,
+    "BSC_RPC": BSC_RPC  # Vérifie que l'URL QuickNode est présente
 }
 for var_name, var_value in required_vars.items():
     if not var_value:
@@ -82,12 +81,12 @@ else:
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
-# BSC (PancakeSwap)
+# BSC (PancakeSwap) avec QuickNode
 w3 = Web3(Web3.HTTPProvider(BSC_RPC))
 if not w3.is_connected():
     logger.error("Connexion BSC échouée.")
     raise ConnectionError("Connexion BSC échouée")
-logger.info("Connexion BSC réussie.")
+logger.info("Connexion BSC réussie via QuickNode.")
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
 PANCAKE_FACTORY_ABI = json.loads('''[
@@ -384,18 +383,11 @@ def check_twitter_token(chat_id, token_address):
 
 # Détection des nouveaux tokens BSC
 def detect_new_tokens_bsc(chat_id):
-    global last_bsc_call
     bot.send_message(chat_id, "🔍 Début détection BSC...")
-    current_time = time.time()
-    if current_time - last_bsc_call < 10:  # Délai minimum de 10s entre appels
-        wait_time = 10 - (current_time - last_bsc_call)
-        bot.send_message(chat_id, f"⏳ Délai minimum BSC, attente de {wait_time:.1f}s...")
-        time.sleep(wait_time)
-    
     try:
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
-        events = factory.events.PairCreated.get_logs(fromBlock=latest_block-3, toBlock=latest_block)  # Réduit à 3 blocs
+        events = factory.events.PairCreated.get_logs(fromBlock=latest_block-3, toBlock=latest_block)
         bot.send_message(chat_id, f"📡 {len(events)} nouvelles paires détectées sur BSC")
         
         valid_token_found = False
@@ -457,15 +449,12 @@ def detect_new_tokens_bsc(chat_id):
             buy_token_bsc(chat_id, token_address, mise_depart_bsc)
             valid_token_found = True
         
-        last_bsc_call = time.time()
         if not valid_token_found:
             bot.send_message(chat_id, "ℹ️ Aucun token BSC ne correspond aux critères.")
         bot.send_message(chat_id, "✅ Détection BSC terminée.")
     except Exception as e:
         logger.error(f"Erreur détection BSC: {str(e)}")
         bot.send_message(chat_id, f"⚠ Erreur détection BSC: {str(e)}")
-        bot.send_message(chat_id, "⏳ Pause de 60s pour éviter limite BSC...")
-        time.sleep(60)
 
 # Détection des nouveaux tokens Solana
 def detect_new_tokens_solana(chat_id):
