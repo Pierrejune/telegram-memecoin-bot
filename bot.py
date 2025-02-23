@@ -31,46 +31,44 @@ session = requests.Session()
 session.headers.update(HEADERS)
 
 # Chargement des variables depuis Cloud Run avec noms exacts
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-SOLANA_WALLET_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
-BIRDEYE_KEY = os.getenv("BIRDEYE_KEY")
-BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")  # Aligné avec ton nom dans Cloud Run
+SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")  # Corrigé pour correspondre à ton Cloud Run
+BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
 PORT = int(os.getenv("PORT", 8080))
 
 # Headers spécifiques pour APIs
-BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_KEY}
+BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
 
-# Validation corrigée avec noms exacts
+# Validation des variables essentielles
 logger.info("Validation des variables...")
 missing_vars = []
-if not TOKEN:
-    missing_vars.append("TELEGRAM_TOKEN")
-if not WALLET_ADDRESS:
-    missing_vars.append("WALLET_ADDRESS")
-if not PRIVATE_KEY:
-    missing_vars.append("PRIVATE_KEY")
-if not SOLANA_WALLET_PRIVATE_KEY:
-    missing_vars.append("SOLANA_PRIVATE_KEY")
-if not WEBHOOK_URL:
-    missing_vars.append("WEBHOOK_URL")
-if not BIRDEYE_KEY:
-    missing_vars.append("BIRDEYE_KEY")
-if not BSC_SCAN_API_KEY:
-    missing_vars.append("BSC_SCAN_API_KEY")
+required_vars = {
+    "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+    "WALLET_ADDRESS": WALLET_ADDRESS,
+    "PRIVATE_KEY": PRIVATE_KEY,
+    "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY,
+    "WEBHOOK_URL": WEBHOOK_URL,
+    "BIRDEYE_API_KEY": BIRDEYE_API_KEY,
+    "BSC_SCAN_API_KEY": BSC_SCAN_API_KEY
+}
+
+for var_name, var_value in required_vars.items():
+    if not var_value:
+        missing_vars.append(var_name)
 
 if missing_vars:
-    error_msg = f"Variables d'environnement manquantes : {missing_vars}"
-    logger.error(error_msg)
-    raise ValueError(error_msg)
+    logger.error(f"Variables d'environnement manquantes : {missing_vars}. Démarrage impossible.")
+    raise ValueError(f"Variables d'environnement manquantes : {missing_vars}")
 else:
     logger.info("Toutes les variables d'environnement sont présentes.")
 
 # Initialisation
 logger.info("Initialisation des composants...")
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
 # BSC (PancakeSwap)
@@ -130,7 +128,7 @@ PANCAKE_ROUTER_ABI = json.loads('''
 # Solana (Raydium)
 logger.info("Connexion à Solana...")
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
-solana_keypair = Keypair.from_base58_string(SOLANA_WALLET_PRIVATE_KEY)
+solana_keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXiQM9H24wFSeeAHj2")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
@@ -213,11 +211,10 @@ def is_safe_token_solana(token_address):
 def webhook():
     logger.info("Webhook reçu")
     try:
-        if request.method == 'POST':
-            if request.headers.get("content-type") == "application/json":
-                update = telebot.types.Update.de_json(request.get_json())
-                bot.process_new_updates([update])
-                return "OK", 200
+        if request.method == 'POST' and request.headers.get("content-type") == "application/json":
+            update = telebot.types.Update.de_json(request.get_json())
+            bot.process_new_updates([update])
+            return "OK", 200
         logger.warning("Requête webhook invalide")
         return abort(403)
     except Exception as e:
