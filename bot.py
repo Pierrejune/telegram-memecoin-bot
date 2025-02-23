@@ -22,28 +22,31 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.
 session = requests.Session()
 session.headers.update(HEADERS)
 
-# Variables d'environnement (toutes déjà dans Cloud Run sauf BIRDEYE_API_KEY)
+# Variables d'environnement
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 SOLANA_WALLET_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY")  # Déjà configuré
-BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")  # À ajouter
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")  # Optionnel
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 PORT = int(os.getenv("PORT", 8080))
 
-# Validation
+# Validation avec tolérance pour BIRDEYE_API_KEY
 logger.info("Validation des variables...")
-if not TOKEN or not all([WALLET_ADDRESS, PRIVATE_KEY, SOLANA_WALLET_PRIVATE_KEY, BSCSCAN_API_KEY]):
-    logger.error("Une ou plusieurs variables manquantes (hors BIRDEYE_API_KEY).")
-    raise ValueError("Variables d'environnement manquantes")
+required_vars = [TOKEN, WALLET_ADDRESS, PRIVATE_KEY, SOLANA_WALLET_PRIVATE_KEY, BSCSCAN_API_KEY]
+if not all(required_vars):
+    missing = [var_name for var_name, var in zip(["TELEGRAM_TOKEN", "WALLET_ADDRESS", "PRIVATE_KEY", "SOLANA_PRIVATE_KEY", "BSCSCAN_API_KEY"], required_vars) if not var]
+    logger.error(f"Variables manquantes : {missing}")
+    raise ValueError(f"Variables d'environnement manquantes : {missing}")
 if not BIRDEYE_API_KEY:
     logger.warning("BIRDEYE_API_KEY manquant, holders Solana non vérifiés.")
 
 # Initialisation
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
+logger.info("Initialisation de Web3...")
 w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org/"))
 solana_keypair = Keypair.from_base58_string(SOLANA_WALLET_PRIVATE_KEY)
 if not w3.is_connected():
@@ -57,7 +60,7 @@ PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 
 # Configuration de base
-test_mode = True  # Passe à False pour trades réels
+test_mode = True
 mise_depart_bsc = 0.01
 mise_depart_sol = 0.02
 slippage = 5
@@ -67,7 +70,7 @@ take_profit_steps = [2, 3, 5]
 portfolio = {}
 cache = TTLCache(maxsize=100, ttl=300)
 
-# Critères personnalisés (issus du document, page 4)
+# Critères personnalisés (page 4)
 MIN_VOLUME_SOL = 50000
 MAX_VOLUME_SOL = 500000
 MIN_VOLUME_BSC = 75000
@@ -170,7 +173,7 @@ def get_dexscreener_data_bsc(token_address):
         logger.error(f"Erreur DexScreener BSC {token_address}: {str(e)}")
         return None
 
-# Fetch holders BSC via BscScan (déjà configuré)
+# Fetch holders BSC via BscScan
 def get_top_holder_percentage_bsc(token_address):
     try:
         url = f"https://api.bscscan.com/api?module=token&action=tokenholderlist&contractaddress={token_address}&page=1&offset=10&apikey={BSCSCAN_API_KEY}"
@@ -180,7 +183,7 @@ def get_top_holder_percentage_bsc(token_address):
             holders = sorted([{"address": h["TokenHolderAddress"], "value": float(h["TokenHolderQuantity"])} for h in data["result"]], key=lambda x: x["value"], reverse=True)
             top_holder_value = holders[0]["value"]
             total_supply_response = session.get(f"https://api.bscscan.com/api?module=stats&action=tokensupply&contractaddress={token_address}&apikey={BSCSCAN_API_KEY}")
-            total_supply = float(total_supply_response.json()["result"]) / 10**18  # Ajuste selon decimals réels
+            total_supply = float(total_supply_response.json()["result"]) / 10**18
             return (top_holder_value / total_supply) * 100
         return None
     except Exception as e:
@@ -254,7 +257,6 @@ def detect_new_tokens_solana(chat_id):
                     "params": [sig["signature"], {"encoding": "jsonParsed"}]
                 })
                 tx_data = tx_response.json()["result"]
-                # Extraction simplifiée du token (à affiner selon Raydium)
                 token_address = tx_data["meta"]["postTokenBalances"][0]["mint"] if tx_data["meta"]["postTokenBalances"] else None
                 if not token_address:
                     continue
@@ -276,24 +278,24 @@ def detect_new_tokens_solana(chat_id):
                 bot.send_message(chat_id, f"⚠️ Erreur Solana RPC après {retries} tentatives: {str(e)}")
             time.sleep(5)
 
-# Achat BSC (simulé ou réel)
+# Achat BSC
 def buy_token_bsc(chat_id, contract_address, amount):
     if test_mode:
         bot.send_message(chat_id, f"🧪 [Mode Test] Achat simulé de {amount} BNB de {contract_address}")
         portfolio[contract_address] = {"amount": amount, "chain": "bsc", "entry_price": 0.01, "market_cap_at_buy": 150000}
         monitor_and_sell(chat_id, contract_address, amount, "bsc")
     else:
-        # À implémenter : swap via PancakeSwap
+        # À implémenter
         pass
 
-# Achat Solana (simulé ou réel)
+# Achat Solana
 def buy_token_solana(chat_id, contract_address, amount):
     if test_mode:
         bot.send_message(chat_id, f"🧪 [Mode Test] Achat simulé de {amount} SOL de {contract_address}")
         portfolio[contract_address] = {"amount": amount, "chain": "solana", "entry_price": 0.01, "market_cap_at_buy": 300000}
         monitor_and_sell(chat_id, contract_address, amount, "solana")
     else:
-        # À implémenter : swap via Raydium
+        # À implémenter
         pass
 
 # Surveillance et vente
@@ -321,7 +323,7 @@ def monitor_and_sell(chat_id, contract_address, amount, chain):
         iteration += 1
         time.sleep(10)
 
-# Vente (simulé ou réel)
+# Vente
 def sell_token(chat_id, contract_address, amount, chain, current_price):
     if test_mode:
         bot.send_message(chat_id, f"🧪 [Mode Test] Vente simulée de {amount} {chain.upper()} de {contract_address} à {current_price}")
@@ -343,4 +345,5 @@ def set_webhook():
 if __name__ == "__main__":
     logger.info("Démarrage du bot...")
     set_webhook()
+    logger.info(f"Lancement de Flask sur 0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
