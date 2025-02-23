@@ -15,6 +15,8 @@ from solders.signature import Signature
 from solders.instruction import Instruction
 import json
 import base58
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,11 +28,16 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# Session persistante
+# Session persistante avec retries pour Solana
 session = requests.Session()
 session.headers.update(HEADERS)
+retry_strategy = Retry(
+    total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
 
-# Chargement des variables depuis Cloud Run avec noms exacts
+# Chargement des variables depuis Cloud Run
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
@@ -40,10 +47,10 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
 PORT = int(os.getenv("PORT", 8080))
 
-# Headers spécifiques pour APIs
+# Headers pour Birdeye
 BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
 
-# Validation des variables essentielles
+# Validation des variables
 logger.info("Validation des variables...")
 missing_vars = []
 required_vars = {
@@ -55,30 +62,25 @@ required_vars = {
     "BIRDEYE_API_KEY": BIRDEYE_API_KEY,
     "BSC_SCAN_API_KEY": BSC_SCAN_API_KEY
 }
-
 for var_name, var_value in required_vars.items():
     if not var_value:
         missing_vars.append(var_name)
-
 if missing_vars:
-    logger.error(f"Variables d'environnement manquantes : {missing_vars}. Démarrage impossible.")
-    raise ValueError(f"Variables d'environnement manquantes : {missing_vars}")
+    logger.error(f"Variables manquantes : {missing_vars}")
+    raise ValueError(f"Variables manquantes : {missing_vars}")
 else:
-    logger.info("Toutes les variables d'environnement sont présentes.")
+    logger.info("Toutes les variables sont présentes.")
 
 # Initialisation
-logger.info("Initialisation des composants...")
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
 # BSC (PancakeSwap)
-logger.info("Connexion à BSC...")
 w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org/"))
 if not w3.is_connected():
     logger.error("Connexion BSC échouée.")
     raise ConnectionError("Connexion BSC échouée")
-else:
-    logger.info("Connexion BSC réussie.")
+logger.info("Connexion BSC réussie.")
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
 PANCAKE_FACTORY_ABI = json.loads('''
@@ -126,13 +128,11 @@ PANCAKE_ROUTER_ABI = json.loads('''
 ''')
 
 # Solana (Raydium)
-logger.info("Connexion à Solana...")
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 solana_keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXiQM9H24wFSeeAHj2")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
-# Vérification de Solana au démarrage
 try:
     response = session.post(SOLANA_RPC, json={
         "jsonrpc": "2.0",
@@ -221,7 +221,7 @@ def webhook():
         logger.error(f"Erreur dans webhook: {str(e)}")
         return abort(500)
 
-# Commande /start
+# Commandes Telegram
 @bot.message_handler(commands=['start'])
 def start_message(message):
     logger.info("Commande /start reçue")
@@ -231,7 +231,6 @@ def start_message(message):
     except Exception as e:
         logger.error(f"Erreur dans start_message: {str(e)}")
 
-# Commande /menu (ajoutée)
 @bot.message_handler(commands=['menu'])
 def menu_message(message):
     logger.info("Commande /menu reçue")
@@ -396,37 +395,46 @@ def adjust_gas_fee(message):
     except ValueError:
         bot.send_message(chat_id, "⚠️ Entrez un nombre valide (ex. : 5)")
 
-# Détection BSC avec BSCScan
+# Détection BSC avec BSCScan (amélioration des logs)
 def detect_new_tokens_bsc(chat_id):
     logger.info("Recherche de nouveaux tokens sur BSC (PancakeSwap via BSCScan)...")
     try:
+        # Élargir la fenêtre sur les 100 derniers blocs pour plus de chances
+        latest_block = w3.eth.block_number
         response = session.get(
-            f"https://api.bscscan.com/api?module=logs&action=getLogs&fromBlock=latest&toBlock=latest&address={PANCAKE_FACTORY_ADDRESS}&topic0=0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9&apikey={BSC_SCAN_API_KEY}"
+            f"https://api.bscscan.com/api?module=logs&action=getLogs&fromBlock={latest_block - 100}&toBlock=latest&address={PANCAKE_FACTORY_ADDRESS}&topic0=0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9&apikey={BSC_SCAN_API_KEY}"
         )
         response.raise_for_status()
         events = response.json()['result']
         bot.send_message(chat_id, f"📡 {len(events)} nouvelles paires détectées sur BSC")
-        for event in events[:10]:  # Limite à 10 pour éviter surcharge
+        if not events:
+            bot.send_message(chat_id, "ℹ️ Aucune nouvelle paire trouvée dans les 100 derniers blocs BSC.")
+        for event in events[:10]:
             token0 = '0x' + event['topics'][1][-40:]
             token1 = '0x' + event['topics'][2][-40:]
             pair_address = '0x' + event['data'][-40:]
             token_address = token0 if token1 == "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1  # WBNB
             if token_address == "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c":
-                continue  # Ignore si pas un token
-            # Récupérer données via Web3
+                continue
             pair_contract = w3.eth.contract(address=pair_address, abi=[{"constant": True, "inputs": [], "name": "getReserves", "outputs": [{"name": "", "type": "uint112"}, {"name": "", "type": "uint112"}, {"name": "", "type": "uint32"}], "payable": False, "stateMutability": "view", "type": "function"}])
             reserves = pair_contract.functions.getReserves().call()
-            liquidity = reserves[0] / 10**18 if token0 == "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else reserves[1] / 10**18  # BNB
+            liquidity = reserves[0] / 10**18 if token0 == "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else reserves[1] / 10**18
             token_contract = w3.eth.contract(address=token_address, abi=[{"constant": True, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": False, "stateMutability": "view", "type": "function"}])
             supply = token_contract.functions.totalSupply().call() / 10**18
             price = liquidity / supply if supply > 0 else 0
             market_cap = price * supply
             volume_response = session.get(f"https://api.bscscan.com/api?module=account&action=tokenbalance&contractaddress={token_address}&address={pair_address}&tag=latest&apikey={BSC_SCAN_API_KEY}")
-            volume = float(volume_response.json()['result']) / 10**18 * price  # Approximation
-            if (MIN_VOLUME_BSC <= volume <= MAX_VOLUME_BSC and
-                liquidity >= MIN_LIQUIDITY and
-                MIN_MARKET_CAP_BSC <= market_cap <= MAX_MARKET_CAP_BSC and
-                is_safe_token_bsc(token_address)):
+            volume = float(volume_response.json()['result']) / 10**18 * price
+            # Vérification des filtres
+            if not (MIN_VOLUME_BSC <= volume <= MAX_VOLUME_BSC):
+                bot.send_message(chat_id, f"⚠️ Token {token_address} rejeté - Volume hors limites: ${volume:.2f}")
+            elif liquidity < MIN_LIQUIDITY:
+                bot.send_message(chat_id, f"⚠️ Token {token_address} rejeté - Liquidité insuffisante: ${liquidity:.2f}")
+            elif not (MIN_MARKET_CAP_BSC <= market_cap <= MAX_MARKET_CAP_BSC):
+                bot.send_message(chat_id, f"⚠️ Token {token_address} rejeté - Market Cap hors limites: ${market_cap:.2f}")
+            elif not is_safe_token_bsc(token_address):
+                bot.send_message(chat_id, f"⚠️ Token {token_address} rejeté - Sécurité non validée (possible rug)")
+            else:
                 bot.send_message(chat_id, (
                     f"🚀 Token détecté : {token_address} (BSC) - "
                     f"Vol: ${volume:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}"
@@ -439,23 +447,22 @@ def detect_new_tokens_bsc(chat_id):
                     'supply': supply
                 }
                 buy_token_bsc(chat_id, token_address, mise_depart_bsc)
-            else:
-                bot.send_message(chat_id, f"⚠️ Token {token_address} rejeté (critères ou sécurité non respectés)")
     except Exception as e:
         logger.error(f"Erreur détection BSC: {str(e)}")
         bot.send_message(chat_id, f"⚠️ Erreur lors de la détection BSC: {str(e)}")
     bot.send_message(chat_id, "✅ Détection BSC terminée, passage à Solana...")
 
-# Détection Solana avec Birdeye
+# Détection Solana avec Birdeye (solution radicale)
 def detect_new_tokens_solana(chat_id):
     logger.info("Recherche de nouveaux tokens sur Solana...")
     attempts = 0
-    max_attempts = 3
+    max_attempts = 5
     while attempts < max_attempts:
         try:
             response = session.get(
                 "https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=10",
-                headers=BIRDEYE_HEADERS
+                headers=BIRDEYE_HEADERS,
+                timeout=10
             )
             response.raise_for_status()
             data = response.json()
@@ -488,15 +495,12 @@ def detect_new_tokens_solana(chat_id):
                 else:
                     bot.send_message(chat_id, f"⚠️ Token {token_address} rejeté (critères ou sécurité non respectés)")
             break
-        except requests.exceptions.HTTPError as e:
+        except requests.exceptions.RequestException as e:
             attempts += 1
-            if e.response.status_code == 429:
-                bot.send_message(chat_id, f"⚠️ Trop de requêtes, attente {5 * attempts}s ({attempts}/{max_attempts})")
+            logger.error(f"Erreur réseau Solana (tentative {attempts}/{max_attempts}): {str(e)}")
+            bot.send_message(chat_id, f"⚠️ Erreur réseau Solana, tentative {attempts}/{max_attempts}: {str(e)}")
+            if attempts < max_attempts:
                 time.sleep(5 * attempts)
-            else:
-                logger.error(f"Erreur HTTP Birdeye: {str(e)}")
-                bot.send_message(chat_id, f"⚠️ Erreur Birdeye: {str(e)}")
-                break
         except ValueError as e:
             logger.error(f"Erreur données Birdeye: {str(e)}")
             bot.send_message(chat_id, f"⚠️ Erreur données Birdeye: {str(e)}")
@@ -506,7 +510,8 @@ def detect_new_tokens_solana(chat_id):
             bot.send_message(chat_id, f"⚠️ Erreur Solana: {str(e)}")
             break
     else:
-        bot.send_message(chat_id, f"⚠️ Échec après {max_attempts} tentatives: Trop de requêtes ou API indisponible")
+        logger.error("Échec détection Solana après toutes les tentatives.")
+        bot.send_message(chat_id, "⚠️ Échec détection Solana après toutes les tentatives.")
     bot.send_message(chat_id, "✅ Détection Solana terminée.")
 
 # Achat BSC
@@ -530,7 +535,7 @@ def buy_token_bsc(chat_id, contract_address, amount):
         bot.send_message(chat_id, f"🚀 Achat de {amount} BNB de {contract_address}, TX: {tx_hash.hex()}")
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
         if receipt.status == 1:
-            entry_price = amount / (int.from_bytes(receipt.logs[0].data, 'big') / 10**18)  # Simplifié
+            entry_price = amount / (int.from_bytes(receipt.logs[0].data, 'big') / 10**18)
             portfolio[contract_address] = {
                 'amount': amount, 'chain': 'bsc', 'entry_price': entry_price,
                 'market_cap_at_buy': detected_tokens[contract_address]['market_cap'],
@@ -547,7 +552,7 @@ def buy_token_bsc(chat_id, contract_address, amount):
 def buy_token_solana(chat_id, contract_address, amount):
     logger.info(f"Achat de {contract_address} sur Solana")
     try:
-        amount_in = int(amount * 10**9)  # Lamports (SOL)
+        amount_in = int(amount * 10**9)
         response = session.post(SOLANA_RPC, json={
             "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
             "params": [{"commitment": "finalized"}]
@@ -561,7 +566,7 @@ def buy_token_solana(chat_id, contract_address, amount):
                 {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
                 {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False},
             ],
-            data=bytes([2]) + amount_in.to_bytes(8, 'little')  # Instruction basique
+            data=bytes([2]) + amount_in.to_bytes(8, 'little')
         )
         tx.add(instruction)
         tx.recent_blockhash = Pubkey.from_string(blockhash)
@@ -732,10 +737,10 @@ def get_current_market_cap(contract_address):
         else:  # BSC
             token_contract = w3.eth.contract(address=contract_address, abi=[{"constant": True, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": False, "stateMutability": "view", "type": "function"}])
             supply = token_contract.functions.totalSupply().call() / 10**18
-            pair_address = detected_tokens[contract_address]['address']  # Simplifié, à ajuster avec pair réel
+            pair_address = detected_tokens[contract_address]['address']
             pair_contract = w3.eth.contract(address=pair_address, abi=[{"constant": True, "inputs": [], "name": "getReserves", "outputs": [{"name": "", "type": "uint112"}, {"name": "", "type": "uint112"}, {"name": "", "type": "uint32"}], "payable": False, "stateMutability": "view", "type": "function"}])
             reserves = pair_contract.functions.getReserves().call()
-            price = (reserves[1] / 10**18) / (reserves[0] / 10**18) if reserves[0] != 0 else 0  # WBNB/Token
+            price = (reserves[1] / 10**18) / (reserves[0] / 10**18) if reserves[0] != 0 else 0
             return price * supply
     except Exception as e:
         logger.error(f"Erreur market cap: {str(e)}")
