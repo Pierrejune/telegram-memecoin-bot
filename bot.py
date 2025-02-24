@@ -52,7 +52,7 @@ BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
-SOLANA_RPC_WS = os.getenv("SOLANA_RPC_WS", "wss://responsive-shy-wish.solana-mainnet.quiknode.pro/65cdde904eae4ea04d77052221eb618010d51ec5")
+SOLANA_RPC_WS = os.getenv("SOLANA_RPC_WS", "wss://responsive-shy-wish.solana-mainnet.quiknode.pro/65cdde904eae4ea04d77052221eb618010d51ec5")  # Remplace par ton URL QuickNode valide
 
 # Headers pour Twitter API
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
@@ -188,7 +188,7 @@ MAX_MARKET_CAP_SOL = 1000000
 MIN_MARKET_CAP_BSC = 200000
 MAX_MARKET_CAP_BSC = 2000000
 MAX_TAX = 5
-MAX_HOLDER_PCT = 20  # Ajusté à 20 % pour plus de flexibilité
+MAX_HOLDER_PCT = 20
 MIN_TX_PER_MIN_BSC = 5
 MAX_TX_PER_MIN_BSC = 75
 MIN_TX_PER_MIN_SOL = 15
@@ -235,14 +235,14 @@ def get_real_tx_per_min_bsc(token_address):
         logger.error(f"Erreur calcul tx/min BSC pour {token_address}: {str(e)}")
         return 0
 
-# Surveillance Twitter/X avec polling (en attendant Elevated Access)
+# Surveillance Twitter/X avec polling
 async def monitor_twitter(chat_id):
     global last_twitter_call
     logger.info("Surveillance Twitter/X en cours...")
     bot.send_message(chat_id, "📡 Début surveillance Twitter...")
     while trade_active:
         current_time = time.time()
-        if current_time - last_twitter_call < 30:  # Délai de 30s entre appels
+        if current_time - last_twitter_call < 30:
             await asyncio.sleep(30 - (current_time - last_twitter_call))
         try:
             query_kanye = "from:kanyewest memecoin OR token OR launch OR \"contract address\" OR CA"
@@ -270,11 +270,11 @@ async def monitor_twitter(chat_id):
                             bot.send_message(chat_id, f"✅ Token détecté via X (@kanyewest): {word}")
                             check_twitter_token(chat_id, word)
             last_twitter_call = time.time()
-            await asyncio.sleep(30)  # Attente entre cycles
+            await asyncio.sleep(30)
         except Exception as e:
             logger.error(f"Erreur surveillance Twitter: {str(e)}")
             bot.send_message(chat_id, f"⚠️ Erreur surveillance Twitter: {str(e)}")
-            await asyncio.sleep(60)  # Pause plus longue en cas d'erreur
+            await asyncio.sleep(60)
 
 # Vérification des tokens détectés via Twitter
 def check_twitter_token(chat_id, token_address):
@@ -374,8 +374,8 @@ async def get_real_tx_per_min_solana(token_address):
                 "method": "getBlock",
                 "params": ["latest", {"transactionDetails": "full", "commitment": "finalized"}]
             }
-            await websocket.send(json.dumps(block_request))
-            response = await asyncio.wait_for(websocket.recv(), timeout=10)
+            await asyncio.wait_for(websocket.send(json.dumps(block_request)), timeout=15)
+            response = await asyncio.wait_for(websocket.recv(), timeout=15)
             block_data = json.loads(response)
             if 'result' not in block_data:
                 return 0
@@ -392,7 +392,7 @@ def detect_new_tokens_bsc(chat_id):
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
         logger.info(f"Bloc actuel : {latest_block}")
-        events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 50, toBlock=latest_block)  # Fenêtre élargie à 50 blocs
+        events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 50, toBlock=latest_block)
         logger.info(f"Événements trouvés : {len(events)}")
         bot.send_message(chat_id, f"📡 {len(events)} nouvelles paires détectées sur BSC")
         if not events:
@@ -405,14 +405,24 @@ def detect_new_tokens_bsc(chat_id):
             token_address = event['args']['token0'] if event['args']['token0'] != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else event['args']['token1']
             pair = event['args']['pair']
             logger.info(f"Token : {token_address}, Pair : {pair}")
-            token_contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=[{
-                "name": "totalSupply",
-                "outputs": [{"name": "", "type": "uint256"}],
-                "payable": False,
-                "stateMutability": "view",
-                "type": "function"
-            }])
-            supply = token_contract.functions.totalSupply().call() / 10**18
+            # Vérification de l'existence du code du contrat
+            if w3.eth.get_code(w3.to_checksum_address(token_address)) == b'':
+                logger.warning(f"Token {token_address} n'a pas de code de contrat valide.")
+                rejected_count += 1
+                continue
+            try:
+                token_contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=[{
+                    "name": "totalSupply",
+                    "outputs": [{"name": "", "type": "uint256"}],
+                    "payable": False,
+                    "stateMutability": "view",
+                    "type": "function"
+                }])
+                supply = token_contract.functions.totalSupply().call() / 10**18
+            except Exception as e:
+                logger.error(f"Erreur lors de l'appel à totalSupply pour {token_address}: {str(e)}")
+                rejected_count += 1
+                continue
             volume_response = session.get(
                 f"https://api.bscscan.com/api?module=stats&action=tokenbalance&contractaddress={token_address}&address={pair}&tag=latest&apikey={BSC_SCAN_API_KEY}",
                 timeout=10
@@ -473,12 +483,12 @@ async def detect_new_tokens_solana(chat_id):
                     "method": "logsSubscribe",
                     "params": [{"mentions": [str(RAYDIUM_PROGRAM_ID)]}, {"commitment": "finalized"}]
                 }
-                await websocket.send(json.dumps(subscription))
-                response = await asyncio.wait_for(websocket.recv(), timeout=10)
+                await asyncio.wait_for(websocket.send(json.dumps(subscription)), timeout=15)
+                response = await asyncio.wait_for(websocket.recv(), timeout=15)
                 sub_id = json.loads(response).get('result')
                 logger.info(f"Abonnement WebSocket Solana actif : {sub_id}")
                 while trade_active:
-                    message = await asyncio.wait_for(websocket.recv(), timeout=10)
+                    message = await asyncio.wait_for(websocket.recv(), timeout=15)
                     data = json.loads(message)
                     if 'params' in data and 'result' in data['params']:
                         logs = data['params']['result']['value']['logs']
@@ -493,12 +503,12 @@ async def detect_new_tokens_solana(chat_id):
                         if token_address and token_address not in detected_tokens:
                             bot.send_message(chat_id, f"✅ Nouveau pool détecté sur Raydium : {token_address}")
                             await check_solana_token(chat_id, token_address)
-                break  # Sortie si la connexion réussit
+                break
         except Exception as e:
             logger.error(f"Erreur détection Solana (tentative {attempt + 1}/{max_retries}) : {str(e)}")
             bot.send_message(chat_id, f"⚠️ Erreur détection Solana (tentative {attempt + 1}/{max_retries}) : {str(e)}")
             if attempt < max_retries - 1:
-                await asyncio.sleep(5)  # Attente avant nouvelle tentative
+                await asyncio.sleep(5)
             else:
                 bot.send_message(chat_id, "❌ Échec définitif de la connexion Solana après plusieurs tentatives.")
 
