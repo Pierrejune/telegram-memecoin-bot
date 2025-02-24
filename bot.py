@@ -20,6 +20,7 @@ from solders.signature import Signature
 from solders.instruction import Instruction
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import threading
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -41,7 +42,7 @@ session.mount("https://", adapter)
 # Dernier appel Twitter
 last_twitter_call = 0
 
-# Chargement des variables depuis Cloud Run avec valeurs de secours explicites
+# Chargement des variables depuis Cloud Run avec logs explicites
 logger.info("Chargement des variables d'environnement...")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
@@ -51,7 +52,7 @@ SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
-PORT = int(os.getenv("PORT", 8080))
+PORT = int(os.getenv("PORT", 8080))  # Port par défaut 8080 pour Cloud Run
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOLANA_RPC_WS = os.getenv("SOLANA_RPC_WS")  # Pas de valeur par défaut
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
@@ -86,6 +87,7 @@ else:
     logger.info("Toutes les variables requises sont présentes.")
 
 # Initialisation
+logger.info("Initialisation du bot Telegram...")
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
@@ -164,7 +166,7 @@ try:
     logger.info(f"Connexion Solana HTTP réussie, blockhash: {blockhash}")
 except Exception as e:
     logger.error(f"Erreur initiale Solana RPC: {str(e)}")
-    raise ConnectionError("Connexion Solana HTTP échouée")
+    raise ConnectionError(f"Connexion Solana HTTP échouée: {str(e)}")
 
 # Configuration de base
 mise_depart_bsc = 0.02
@@ -247,7 +249,7 @@ async def monitor_twitter(chat_id):
     bot.send_message(chat_id, "📡 Début surveillance Twitter...")
     while trade_active:
         current_time = time.time()
-        if current_time - last_twitter_call < 120:  # Délai à 120s
+        if current_time - last_twitter_call < 120:
             await asyncio.sleep(120 - (current_time - last_twitter_call))
         try:
             query_kanye = "from:kanyewest memecoin OR token OR launch OR \"contract address\" OR CA"
@@ -257,7 +259,7 @@ async def monitor_twitter(chat_id):
                 timeout=10
             )
             if response.status_code == 429:
-                retry_after = int(response.headers.get("Retry-After", 900))  # 15 min par défaut
+                retry_after = int(response.headers.get("Retry-After", 900))
                 logger.warning(f"Erreur 429 - Limite atteinte, attente de {retry_after} secondes")
                 bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause de {retry_after} s...")
                 await asyncio.sleep(retry_after)
@@ -266,7 +268,7 @@ async def monitor_twitter(chat_id):
             remaining = int(response.headers.get("x-rate-limit-remaining", 500))
             logger.info(f"Requêtes Twitter restantes : {remaining}")
             if remaining < 10:
-                await asyncio.sleep(900)  # Pause de 15 min si proche de la limite
+                await asyncio.sleep(900)
             tweets = response.json().get('data', [])
             for tweet in tweets:
                 text = tweet['text'].lower()
@@ -390,7 +392,7 @@ async def get_real_tx_per_min_solana(token_address):
             if 'result' not in block_data:
                 return 0
             tx_count = sum(1 for tx in block_data['result']['transactions'] if token_address in str(tx))
-            return tx_count * 150  # Approximation pour 1 min (block time ~ 0.4s, 150 blocs/min)
+            return tx_count * 150  # Approximation pour 1 min (block time ~ 0.4s)
     except Exception as e:
         logger.error(f"Erreur calcul tx/min Solana pour {token_address}: {str(e)}")
         if ws_url != SOLANA_FALLBACK_WS:
@@ -1318,4 +1320,49 @@ def refresh_token(chat_id, token):
         bot.send_message(chat_id, f"🔄 Portefeuille rafraîchi pour {token}", reply_markup=markup)
     except Exception as e:
         logger.error(f"Erreur refresh: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur rafraîchissement {token}: {str(e)}
+        bot.send_message(chat_id, f"⚠️ Erreur rafraîchissement {token}: {str(e)}")
+
+# Vente immédiate
+def sell_token_immediate(chat_id, token):
+    try:
+        if token not in portfolio:
+            bot.send_message(chat_id, f"⚠️ Vente impossible : {token} n'est pas dans le portefeuille")
+            return
+        amount = portfolio[token]["amount"]
+        chain = portfolio[token]["chain"]
+        current_price = get_current_market_cap(token) / detected_tokens[token]['supply']
+        sell_token(chat_id, token, amount, chain, current_price)
+    except Exception as e:
+        logger.error(f"Erreur vente immédiate: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur vente immédiate {token}: {str(e)}")
+
+# Configuration du webhook dans un thread séparé
+def set_webhook():
+    logger.info("Configuration du webhook...")
+    try:
+        if WEBHOOK_URL:
+            bot.remove_webhook()
+            time.sleep(1)  # Délai pour éviter les conflits
+            bot.set_webhook(url=WEBHOOK_URL)
+            logger.info(f"Webhook configuré avec succès sur {WEBHOOK_URL}")
+        else:
+            logger.warning("WEBHOOK_URL non défini, exécution en mode polling")
+            bot.polling()
+    except Exception as e:
+        logger.error(f"Erreur configuration webhook: {str(e)}")
+        raise
+
+# Point d'entrée principal
+if __name__ == "__main__":
+    logger.info("Démarrage du bot...")
+    try:
+        # Lancer la configuration du webhook dans un thread séparé
+        webhook_thread = threading.Thread(target=set_webhook)
+        webhook_thread.start()
+
+        # Démarrer Flask pour Cloud Run
+        logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
+        app.run(host="0.0.0.0", port=PORT, debug=False)
+    except Exception as e:
+        logger.error(f"Erreur critique au démarrage: {str(e)}")
+        raise
