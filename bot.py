@@ -54,7 +54,6 @@ TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))  # Port par défaut 8080 pour Cloud Run
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-# SOLANA_RPC_WS intégré directement comme constante
 SOLANA_RPC_WS = "wss://responsive-shy-wish.solana-mainnet.quiknode.pro/65cdde904eae4ea04d77052221eb618010d51ec5"
 SOLANA_FALLBACK_WS = "wss://api.mainnet-beta.solana.com"
 
@@ -248,10 +247,11 @@ async def monitor_twitter(chat_id):
     bot.send_message(chat_id, "📡 Début surveillance Twitter...")
     while trade_active:
         current_time = time.time()
-        if current_time - last_twitter_call < 120:  # Délai à 120s
-            await asyncio.sleep(120 - (current_time - last_twitter_call))
+        if current_time - last_twitter_call < 300:  # Délai augmenté à 5 min
+            await asyncio.sleep(300 - (current_time - last_twitter_call))
         try:
             query_kanye = "from:kanyewest memecoin OR token OR launch OR \"contract address\" OR CA"
+            logger.info(f"Envoi requête Twitter, quota restant avant appel inconnu")
             response = session.get(
                 f"https://api.twitter.com/2/tweets/search/recent?query={query_kanye}&max_results=10",
                 headers=TWITTER_HEADERS,
@@ -265,9 +265,12 @@ async def monitor_twitter(chat_id):
                 continue
             response.raise_for_status()
             remaining = int(response.headers.get("x-rate-limit-remaining", 500))
-            logger.info(f"Requêtes Twitter restantes : {remaining}")
+            logger.info(f"Requêtes Twitter restantes après appel : {remaining}")
+            bot.send_message(chat_id, f"ℹ️ Requêtes Twitter restantes : {remaining}")
             if remaining < 10:
-                await asyncio.sleep(900)  # Pause de 15 min si proche de la limite
+                logger.info("Quota Twitter presque épuisé, pause de 15 minutes")
+                bot.send_message(chat_id, "⚠️ Quota Twitter presque épuisé, pause de 15 min...")
+                await asyncio.sleep(900)  # Pause de 15 min
             tweets = response.json().get('data', [])
             for tweet in tweets:
                 text = tweet['text'].lower()
@@ -280,11 +283,11 @@ async def monitor_twitter(chat_id):
                             bot.send_message(chat_id, f"✅ Token détecté via X (@kanyewest): {word}")
                             check_twitter_token(chat_id, word)
             last_twitter_call = time.time()
-            await asyncio.sleep(120)
+            await asyncio.sleep(300)  # Délai de 5 min entre appels
         except Exception as e:
             logger.error(f"Erreur surveillance Twitter: {str(e)}")
             bot.send_message(chat_id, f"⚠️ Erreur surveillance Twitter: {str(e)}")
-            await asyncio.sleep(900)
+            await asyncio.sleep(900)  # Pause de 15 min en cas d’erreur
 
 # Vérification des tokens détectés via Twitter
 def check_twitter_token(chat_id, token_address):
