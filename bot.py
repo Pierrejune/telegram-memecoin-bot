@@ -53,14 +53,15 @@ BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))  # Port par défaut 8080 pour Cloud Run
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
-SOLANA_RPC_WS = os.getenv("SOLANA_RPC_WS")  # Pas de valeur par défaut
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+# SOLANA_RPC_WS intégré directement comme constante
+SOLANA_RPC_WS = "wss://responsive-shy-wish.solana-mainnet.quiknode.pro/65cdde904eae4ea04d77052221eb618010d51ec5"
 SOLANA_FALLBACK_WS = "wss://api.mainnet-beta.solana.com"
 
 # Headers pour Twitter API
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
-# Validation des variables critiques
+# Validation des variables critiques (sans SOLANA_RPC_WS)
 logger.info("Validation des variables critiques...")
 missing_vars = []
 required_vars = {
@@ -72,8 +73,7 @@ required_vars = {
     "BIRDEYE_API_KEY": BIRDEYE_API_KEY,
     "BSC_SCAN_API_KEY": BSC_SCAN_API_KEY,
     "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN,
-    "BSC_RPC": BSC_RPC,
-    "SOLANA_RPC_WS": SOLANA_RPC_WS
+    "BSC_RPC": BSC_RPC
 }
 for var_name, var_value in required_vars.items():
     if not var_value:
@@ -508,7 +508,7 @@ async def test_solana_websocket(chat_id):
                 return ws_url
         except Exception as e:
             logger.error(f"Échec test WebSocket avec {ws_url}: {str(e)}")
-    bot.send_message(chat_id, "⚠️ Tous les endpoints WebSocket Solana ont échoué. Vérifiez SOLANA_RPC_WS.")
+    bot.send_message(chat_id, "⚠️ Tous les endpoints WebSocket Solana ont échoué.")
     return None
 
 # Détection des nouveaux tokens Solana avec QuickNode et retry
