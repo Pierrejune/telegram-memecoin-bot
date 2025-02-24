@@ -6,3 +6,4 @@ python-dotenv==1.0.0
 web3==6.11.0
 solders==0.21.0
 base58==2.1.1
+websockets>=10.4
