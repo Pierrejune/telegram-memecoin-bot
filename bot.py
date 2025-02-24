@@ -20,7 +20,6 @@ from solders.signature import Signature
 from solders.instruction import Instruction
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import threading
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -249,7 +248,7 @@ async def monitor_twitter(chat_id):
     bot.send_message(chat_id, "📡 Début surveillance Twitter...")
     while trade_active:
         current_time = time.time()
-        if current_time - last_twitter_call < 120:
+        if current_time - last_twitter_call < 120:  # Délai à 120s
             await asyncio.sleep(120 - (current_time - last_twitter_call))
         try:
             query_kanye = "from:kanyewest memecoin OR token OR launch OR \"contract address\" OR CA"
@@ -259,7 +258,7 @@ async def monitor_twitter(chat_id):
                 timeout=10
             )
             if response.status_code == 429:
-                retry_after = int(response.headers.get("Retry-After", 900))
+                retry_after = int(response.headers.get("Retry-After", 900))  # 15 min par défaut
                 logger.warning(f"Erreur 429 - Limite atteinte, attente de {retry_after} secondes")
                 bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause de {retry_after} s...")
                 await asyncio.sleep(retry_after)
@@ -268,7 +267,7 @@ async def monitor_twitter(chat_id):
             remaining = int(response.headers.get("x-rate-limit-remaining", 500))
             logger.info(f"Requêtes Twitter restantes : {remaining}")
             if remaining < 10:
-                await asyncio.sleep(900)
+                await asyncio.sleep(900)  # Pause de 15 min si proche de la limite
             tweets = response.json().get('data', [])
             for tweet in tweets:
                 text = tweet['text'].lower()
@@ -392,7 +391,7 @@ async def get_real_tx_per_min_solana(token_address):
             if 'result' not in block_data:
                 return 0
             tx_count = sum(1 for tx in block_data['result']['transactions'] if token_address in str(tx))
-            return tx_count * 150  # Approximation pour 1 min (block time ~ 0.4s)
+            return tx_count * 150  # Approximation pour 1 min (block time ~ 0.4s, 150 blocs/min)
     except Exception as e:
         logger.error(f"Erreur calcul tx/min Solana pour {token_address}: {str(e)}")
         if ws_url != SOLANA_FALLBACK_WS:
@@ -1336,7 +1335,7 @@ def sell_token_immediate(chat_id, token):
         logger.error(f"Erreur vente immédiate: {str(e)}")
         bot.send_message(chat_id, f"⚠️ Erreur vente immédiate {token}: {str(e)}")
 
-# Configuration du webhook dans un thread séparé
+# Configuration du webhook
 def set_webhook():
     logger.info("Configuration du webhook...")
     try:
@@ -1356,11 +1355,7 @@ def set_webhook():
 if __name__ == "__main__":
     logger.info("Démarrage du bot...")
     try:
-        # Lancer la configuration du webhook dans un thread séparé
-        webhook_thread = threading.Thread(target=set_webhook)
-        webhook_thread.start()
-
-        # Démarrer Flask pour Cloud Run
+        set_webhook()  # Configurer le webhook avant de lancer Flask
         logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
         app.run(host="0.0.0.0", port=PORT, debug=False)
     except Exception as e:
