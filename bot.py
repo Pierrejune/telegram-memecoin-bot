@@ -41,7 +41,8 @@ session.mount("https://", adapter)
 # Dernier appel Twitter
 last_twitter_call = 0
 
-# Chargement des variables depuis Cloud Run
+# Chargement des variables depuis Cloud Run avec valeurs de secours explicites
+logger.info("Chargement des variables d'environnement...")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
@@ -52,15 +53,15 @@ BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
-SOLANA_RPC_WS = os.getenv("SOLANA_RPC_WS")  # PAS DE VALEUR PAR DÉFAUT, DOIT ÊTRE FOURNI
+SOLANA_RPC_WS = os.getenv("SOLANA_RPC_WS")  # Pas de valeur par défaut
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-SOLANA_FALLBACK_WS = "wss://api.mainnet-beta.solana.com"  # Fallback public
+SOLANA_FALLBACK_WS = "wss://api.mainnet-beta.solana.com"
 
 # Headers pour Twitter API
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
-# Validation des variables
-logger.info("Validation des variables...")
+# Validation des variables critiques
+logger.info("Validation des variables critiques...")
 missing_vars = []
 required_vars = {
     "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
@@ -72,22 +73,24 @@ required_vars = {
     "BSC_SCAN_API_KEY": BSC_SCAN_API_KEY,
     "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN,
     "BSC_RPC": BSC_RPC,
-    "SOLANA_RPC_WS": SOLANA_RPC_WS  # Obligatoire
+    "SOLANA_RPC_WS": SOLANA_RPC_WS
 }
 for var_name, var_value in required_vars.items():
     if not var_value:
         missing_vars.append(var_name)
+        logger.error(f"Variable manquante : {var_name}")
 if missing_vars:
-    logger.error(f"Variables manquantes : {missing_vars}")
+    logger.critical(f"Variables manquantes détectées : {missing_vars}. Le bot ne peut pas démarrer.")
     raise ValueError(f"Variables manquantes : {missing_vars}")
 else:
-    logger.info("Toutes les variables sont présentes.")
+    logger.info("Toutes les variables requises sont présentes.")
 
 # Initialisation
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
 # BSC (PancakeSwap) avec QuickNode
+logger.info("Initialisation connexion BSC...")
 w3 = Web3(Web3.HTTPProvider(BSC_RPC))
 if not w3.is_connected():
     logger.error("Connexion BSC échouée.")
@@ -144,6 +147,7 @@ PANCAKE_ROUTER_ABI = json.loads('''
 ''')
 
 # Solana (Raydium)
+logger.info("Initialisation Solana...")
 solana_keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLxfQM9H24wFSceAHj2")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
@@ -243,8 +247,8 @@ async def monitor_twitter(chat_id):
     bot.send_message(chat_id, "📡 Début surveillance Twitter...")
     while trade_active:
         current_time = time.time()
-        if current_time - last_twitter_call < 60:
-            await asyncio.sleep(60 - (current_time - last_twitter_call))
+        if current_time - last_twitter_call < 120:  # Délai à 120s
+            await asyncio.sleep(120 - (current_time - last_twitter_call))
         try:
             query_kanye = "from:kanyewest memecoin OR token OR launch OR \"contract address\" OR CA"
             response = session.get(
@@ -253,7 +257,7 @@ async def monitor_twitter(chat_id):
                 timeout=10
             )
             if response.status_code == 429:
-                retry_after = int(response.headers.get("Retry-After", 300))
+                retry_after = int(response.headers.get("Retry-After", 900))  # 15 min par défaut
                 logger.warning(f"Erreur 429 - Limite atteinte, attente de {retry_after} secondes")
                 bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause de {retry_after} s...")
                 await asyncio.sleep(retry_after)
@@ -262,7 +266,7 @@ async def monitor_twitter(chat_id):
             remaining = int(response.headers.get("x-rate-limit-remaining", 500))
             logger.info(f"Requêtes Twitter restantes : {remaining}")
             if remaining < 10:
-                await asyncio.sleep(300)  # Pause de 5 min si proche de la limite
+                await asyncio.sleep(900)  # Pause de 15 min si proche de la limite
             tweets = response.json().get('data', [])
             for tweet in tweets:
                 text = tweet['text'].lower()
@@ -275,11 +279,11 @@ async def monitor_twitter(chat_id):
                             bot.send_message(chat_id, f"✅ Token détecté via X (@kanyewest): {word}")
                             check_twitter_token(chat_id, word)
             last_twitter_call = time.time()
-            await asyncio.sleep(60)
+            await asyncio.sleep(120)
         except Exception as e:
             logger.error(f"Erreur surveillance Twitter: {str(e)}")
             bot.send_message(chat_id, f"⚠️ Erreur surveillance Twitter: {str(e)}")
-            await asyncio.sleep(300)
+            await asyncio.sleep(900)
 
 # Vérification des tokens détectés via Twitter
 def check_twitter_token(chat_id, token_address):
@@ -380,8 +384,8 @@ async def get_real_tx_per_min_solana(token_address):
                 "method": "getBlock",
                 "params": ["latest", {"transactionDetails": "full", "commitment": "finalized"}]
             }
-            await asyncio.wait_for(websocket.send(json.dumps(block_request)), timeout=20)
-            response = await asyncio.wait_for(websocket.recv(), timeout=20)
+            await asyncio.wait_for(websocket.send(json.dumps(block_request)), timeout=30)
+            response = await asyncio.wait_for(websocket.recv(), timeout=30)
             block_data = json.loads(response)
             if 'result' not in block_data:
                 return 0
@@ -389,14 +393,13 @@ async def get_real_tx_per_min_solana(token_address):
             return tx_count * 150  # Approximation pour 1 min (block time ~ 0.4s, 150 blocs/min)
     except Exception as e:
         logger.error(f"Erreur calcul tx/min Solana pour {token_address}: {str(e)}")
-        # Fallback sur RPC public si QuickNode échoue
         if ws_url != SOLANA_FALLBACK_WS:
             logger.info(f"Tentative avec RPC public : {SOLANA_FALLBACK_WS}")
             ws_url = SOLANA_FALLBACK_WS
             try:
                 async with websockets.connect(ws_url) as websocket:
-                    await asyncio.wait_for(websocket.send(json.dumps(block_request)), timeout=20)
-                    response = await asyncio.wait_for(websocket.recv(), timeout=20)
+                    await asyncio.wait_for(websocket.send(json.dumps(block_request)), timeout=30)
+                    response = await asyncio.wait_for(websocket.recv(), timeout=30)
                     block_data = json.loads(response)
                     if 'result' not in block_data:
                         return 0
@@ -498,19 +501,18 @@ async def test_solana_websocket(chat_id):
         try:
             async with websockets.connect(ws_url) as websocket:
                 test_request = {"jsonrpc": "2.0", "id": 1, "method": "getHealth"}
-                await asyncio.wait_for(websocket.send(json.dumps(test_request)), timeout=20)
-                response = await asyncio.wait_for(websocket.recv(), timeout=20)
+                await asyncio.wait_for(websocket.send(json.dumps(test_request)), timeout=30)
+                response = await asyncio.wait_for(websocket.recv(), timeout=30)
                 logger.info(f"Test WebSocket Solana réussi avec {ws_url}: {response}")
                 return ws_url
         except Exception as e:
             logger.error(f"Échec test WebSocket avec {ws_url}: {str(e)}")
-    bot.send_message(chat_id, "⚠️ Tous les endpoints WebSocket Solana ont échoué.")
+    bot.send_message(chat_id, "⚠️ Tous les endpoints WebSocket Solana ont échoué. Vérifiez SOLANA_RPC_WS.")
     return None
 
 # Détection des nouveaux tokens Solana avec QuickNode et retry
 async def detect_new_tokens_solana(chat_id):
     bot.send_message(chat_id, "📡 Début détection Solana via QuickNode...")
-    # Test préalable de la connexion WebSocket
     active_ws_url = await test_solana_websocket(chat_id)
     if not active_ws_url:
         return
@@ -524,12 +526,12 @@ async def detect_new_tokens_solana(chat_id):
                     "method": "logsSubscribe",
                     "params": [{"mentions": [str(RAYDIUM_PROGRAM_ID)]}, {"commitment": "finalized"}]
                 }
-                await asyncio.wait_for(websocket.send(json.dumps(subscription)), timeout=20)
-                response = await asyncio.wait_for(websocket.recv(), timeout=20)
+                await asyncio.wait_for(websocket.send(json.dumps(subscription)), timeout=30)
+                response = await asyncio.wait_for(websocket.recv(), timeout=30)
                 sub_id = json.loads(response).get('result')
                 logger.info(f"Abonnement WebSocket Solana actif : {sub_id}")
                 while trade_active:
-                    message = await asyncio.wait_for(websocket.recv(), timeout=20)
+                    message = await asyncio.wait_for(websocket.recv(), timeout=30)
                     data = json.loads(message)
                     if 'params' in data and 'result' in data['params']:
                         logs = data['params']['result']['value']['logs']
@@ -1316,44 +1318,4 @@ def refresh_token(chat_id, token):
         bot.send_message(chat_id, f"🔄 Portefeuille rafraîchi pour {token}", reply_markup=markup)
     except Exception as e:
         logger.error(f"Erreur refresh: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur rafraîchissement {token}: {str(e)}")
-
-# Vente immédiate
-def sell_token_immediate(chat_id, token):
-    try:
-        if token not in portfolio:
-            bot.send_message(chat_id, f"⚠️ Vente impossible : {token} n'est pas dans le portefeuille")
-            return
-        amount = portfolio[token]["amount"]
-        chain = portfolio[token]["chain"]
-        current_price = get_current_market_cap(token) / detected_tokens[token]['supply']
-        sell_token(chat_id, token, amount, chain, current_price)
-    except Exception as e:
-        logger.error(f"Erreur vente immédiate: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur vente immédiate {token}: {str(e)}")
-
-# Configuration du webhook
-def set_webhook():
-    logger.info("Configuration du webhook...")
-    try:
-        if WEBHOOK_URL:
-            bot.remove_webhook()
-            bot.set_webhook(url=WEBHOOK_URL)
-            logger.info("Webhook configuré avec succès")
-        else:
-            logger.warning("WEBHOOK_URL non défini, exécution en mode polling")
-            bot.polling()
-    except Exception as e:
-        logger.error(f"Erreur configuration webhook: {str(e)}")
-        raise
-
-# Point d'entrée principal
-if __name__ == "__main__":
-    logger.info("Démarrage du bot...")
-    try:
-        app.run(host="0.0.0.0", port=PORT, debug=False)
-        logger.info(f"Flask lancé sur le port {PORT}...")
-        set_webhook()
-    except Exception as e:
-        logger.error(f"Erreur critique au démarrage: {str(e)}")
-        raise
+        bot.send_message(chat_id, f"⚠️ Erreur rafraîchissement {token}: {str(e)}
