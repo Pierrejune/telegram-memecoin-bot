@@ -54,13 +54,14 @@ TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))  # Port par défaut 8080 pour Cloud Run
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-SOLANA_RPC_WS = "wss://responsive-shy-wish.solana-mainnet.quiknode.pro/65cdde904eae4ea04d77052221eb618010d51ec5"
-SOLANA_FALLBACK_WS = "wss://api.mainnet-beta.solana.com"
+SOLANA_RPC_WS = "wss://responsive-shy-wish.solana-mainnet.quiknode.pro/65cdde904eae4ea04d77052221eb618010d51ec5"  # Codé en dur
+SOLANA_FALLBACK_WS = "wss://api.mainnet-beta.solana.com"  # Fallback public
 
-# Headers pour Twitter API
+# Headers pour Twitter API et Birdeye
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
+BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
 
-# Validation des variables critiques (sans SOLANA_RPC_WS)
+# Validation des variables critiques
 logger.info("Validation des variables critiques...")
 missing_vars = []
 required_vars = {
@@ -179,25 +180,25 @@ cache = TTLCache(maxsize=100, ttl=300)
 portfolio = {}
 twitter_tokens = []
 
-# Critères personnalisés
-MIN_VOLUME_SOL = 50000
-MAX_VOLUME_SOL = 500000
-MIN_VOLUME_BSC = 75000
-MAX_VOLUME_BSC = 750000
-MIN_LIQUIDITY = 100000
-MIN_LIQUIDITY_PCT = 0.02
-MIN_PRICE_CHANGE = 30
-MAX_PRICE_CHANGE = 200
-MIN_MARKET_CAP_SOL = 100000
-MAX_MARKET_CAP_SOL = 1000000
-MIN_MARKET_CAP_BSC = 200000
-MAX_MARKET_CAP_BSC = 2000000
-MAX_TAX = 5
-MAX_HOLDER_PCT = 20
-MIN_TX_PER_MIN_BSC = 5
-MAX_TX_PER_MIN_BSC = 75
-MIN_TX_PER_MIN_SOL = 15
-MAX_TX_PER_MIN_SOL = 150
+# Critères personnalisés (assouplis sauf Tx/min)
+MIN_VOLUME_SOL = 25000      # Réduit de 50000 à 25000
+MAX_VOLUME_SOL = 750000     # Augmenté de 500000 à 750000
+MIN_VOLUME_BSC = 30000      # Réduit de 75000 à 30000
+MAX_VOLUME_BSC = 1000000    # Augmenté de 750000 à 1000000
+MIN_LIQUIDITY = 50000       # Réduit de 100000 à 50000
+MIN_LIQUIDITY_PCT = 0.01    # Réduit de 0.02 à 0.01
+MIN_PRICE_CHANGE = 20       # Réduit de 30 à 20
+MAX_PRICE_CHANGE = 300      # Augmenté de 200 à 300
+MIN_MARKET_CAP_SOL = 50000  # Réduit de 100000 à 50000
+MAX_MARKET_CAP_SOL = 1500000 # Augmenté de 1000000 à 1500000
+MIN_MARKET_CAP_BSC = 75000  # Réduit de 200000 à 75000
+MAX_MARKET_CAP_BSC = 3000000 # Augmenté de 2000000 à 3000000
+MAX_TAX = 10                # Augmenté de 5 à 10
+MAX_HOLDER_PCT = 30         # Augmenté de 20 à 30
+MIN_TX_PER_MIN_BSC = 5      # Intact
+MAX_TX_PER_MIN_BSC = 75     # Intact
+MIN_TX_PER_MIN_SOL = 15     # Intact
+MAX_TX_PER_MIN_SOL = 150    # Intact
 
 # Vérification anti-rug pull BSC via Honeypot.is
 def is_safe_token_bsc(token_address):
@@ -219,7 +220,7 @@ def is_safe_token_solana(token_address):
     try:
         response = session.get(
             f"https://public-api.birdeye.so/public/token_overview?address={token_address}",
-            headers={"X-API-KEY": BIRDEYE_API_KEY},
+            headers=BIRDEYE_HEADERS,
             timeout=10
         )
         data = response.json()['data']
@@ -247,30 +248,26 @@ async def monitor_twitter(chat_id):
     bot.send_message(chat_id, "📡 Début surveillance Twitter...")
     while trade_active:
         current_time = time.time()
-        if current_time - last_twitter_call < 300:  # Délai augmenté à 5 min
-            await asyncio.sleep(300 - (current_time - last_twitter_call))
+        if current_time - last_twitter_call < 120:
+            await asyncio.sleep(120 - (current_time - last_twitter_call))
         try:
             query_kanye = "from:kanyewest memecoin OR token OR launch OR \"contract address\" OR CA"
-            logger.info(f"Envoi requête Twitter, quota restant avant appel inconnu")
             response = session.get(
                 f"https://api.twitter.com/2/tweets/search/recent?query={query_kanye}&max_results=10",
                 headers=TWITTER_HEADERS,
                 timeout=10
             )
             if response.status_code == 429:
-                retry_after = int(response.headers.get("Retry-After", 900))  # 15 min par défaut
+                retry_after = int(response.headers.get("Retry-After", 900))
                 logger.warning(f"Erreur 429 - Limite atteinte, attente de {retry_after} secondes")
                 bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause de {retry_after} s...")
                 await asyncio.sleep(retry_after)
                 continue
             response.raise_for_status()
             remaining = int(response.headers.get("x-rate-limit-remaining", 500))
-            logger.info(f"Requêtes Twitter restantes après appel : {remaining}")
-            bot.send_message(chat_id, f"ℹ️ Requêtes Twitter restantes : {remaining}")
+            logger.info(f"Requêtes Twitter restantes : {remaining}")
             if remaining < 10:
-                logger.info("Quota Twitter presque épuisé, pause de 15 minutes")
-                bot.send_message(chat_id, "⚠️ Quota Twitter presque épuisé, pause de 15 min...")
-                await asyncio.sleep(900)  # Pause de 15 min
+                await asyncio.sleep(900)
             tweets = response.json().get('data', [])
             for tweet in tweets:
                 text = tweet['text'].lower()
@@ -283,11 +280,11 @@ async def monitor_twitter(chat_id):
                             bot.send_message(chat_id, f"✅ Token détecté via X (@kanyewest): {word}")
                             check_twitter_token(chat_id, word)
             last_twitter_call = time.time()
-            await asyncio.sleep(300)  # Délai de 5 min entre appels
+            await asyncio.sleep(120)
         except Exception as e:
             logger.error(f"Erreur surveillance Twitter: {str(e)}")
             bot.send_message(chat_id, f"⚠️ Erreur surveillance Twitter: {str(e)}")
-            await asyncio.sleep(900)  # Pause de 15 min en cas d’erreur
+            await asyncio.sleep(900)
 
 # Vérification des tokens détectés via Twitter
 def check_twitter_token(chat_id, token_address):
@@ -340,7 +337,7 @@ def check_twitter_token(chat_id, token_address):
         else:  # Solana
             response = session.get(
                 f"https://public-api.birdeye.so/public/token_overview?address={token_address}",
-                headers={"X-API-KEY": BIRDEYE_API_KEY},
+                headers=BIRDEYE_HEADERS,
                 timeout=10
             )
             data = response.json()['data']
@@ -377,7 +374,7 @@ def check_twitter_token(chat_id, token_address):
         bot.send_message(chat_id, f"⚠️ Erreur vérification token X {token_address} : {str(e)}")
         return False
 
-# Calcul réel des transactions par minute (QuickNode Solana)
+# Calcul réel des transactions par minute (QuickNode Solana avec fallback Birdeye)
 async def get_real_tx_per_min_solana(token_address):
     ws_url = SOLANA_RPC_WS
     try:
@@ -396,7 +393,7 @@ async def get_real_tx_per_min_solana(token_address):
             tx_count = sum(1 for tx in block_data['result']['transactions'] if token_address in str(tx))
             return tx_count * 150  # Approximation pour 1 min (block time ~ 0.4s, 150 blocs/min)
     except Exception as e:
-        logger.error(f"Erreur calcul tx/min Solana pour {token_address}: {str(e)}")
+        logger.error(f"Erreur calcul tx/min Solana pour {token_address} avec QuickNode: {str(e)}")
         if ws_url != SOLANA_FALLBACK_WS:
             logger.info(f"Tentative avec RPC public : {SOLANA_FALLBACK_WS}")
             ws_url = SOLANA_FALLBACK_WS
@@ -411,7 +408,22 @@ async def get_real_tx_per_min_solana(token_address):
                     return tx_count * 150
             except Exception as fallback_e:
                 logger.error(f"Échec avec RPC public pour {token_address}: {str(fallback_e)}")
-                return 0
+                # Fallback vers Birdeye pour estimer tx/min
+                logger.info(f"Tentative estimation via Birdeye pour {token_address}")
+                try:
+                    response = session.get(
+                        f"https://public-api.birdeye.so/public/history_trades?address={token_address}&offset=0&limit=50",
+                        headers=BIRDEYE_HEADERS,
+                        timeout=10
+                    )
+                    trades = response.json()['data']['items']
+                    if not trades:
+                        return 0
+                    # Estimation basée sur le nombre de trades récents (approximation)
+                    return min(len(trades) * 2, MAX_TX_PER_MIN_SOL)  # x2 pour estimer par minute
+                except Exception as birdeye_e:
+                    logger.error(f"Échec estimation Birdeye pour {token_address}: {str(birdeye_e)}")
+                    return 0
         return 0
 
 # Détection des nouveaux tokens BSC
@@ -563,7 +575,7 @@ async def check_solana_token(chat_id, token_address):
     try:
         response = session.get(
             f"https://public-api.birdeye.so/public/token_overview?address={token_address}",
-            headers={"X-API-KEY": BIRDEYE_API_KEY},
+            headers=BIRDEYE_HEADERS,
             timeout=10
         )
         data = response.json()['data']
@@ -718,31 +730,31 @@ def callback_query(call):
             bot.send_message(chat_id, "Entrez les nouveaux seuils de Take-Profit (3 valeurs séparées par des virgules, ex. : 2,3,5) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_take_profit)
         elif call.data == "adjust_min_volume_bsc":
-            bot.send_message(chat_id, "Entrez le nouveau seuil min de volume BSC (en $, ex. : 75000) :")
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de volume BSC (en $, ex. : 30000) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_volume_bsc)
         elif call.data == "adjust_max_volume_bsc":
-            bot.send_message(chat_id, "Entrez le nouveau seuil max de volume BSC (en $, ex. : 750000) :")
+            bot.send_message(chat_id, "Entrez le nouveau seuil max de volume BSC (en $, ex. : 1000000) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_max_volume_bsc)
         elif call.data == "adjust_min_liquidity":
-            bot.send_message(chat_id, "Entrez le nouveau seuil min de liquidité (en $, ex. : 100000) :")
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de liquidité (en $, ex. : 50000) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_liquidity)
         elif call.data == "adjust_min_market_cap_bsc":
-            bot.send_message(chat_id, "Entrez le nouveau seuil min de market cap BSC (en $, ex. : 200000) :")
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de market cap BSC (en $, ex. : 75000) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_market_cap_bsc)
         elif call.data == "adjust_max_market_cap_bsc":
-            bot.send_message(chat_id, "Entrez le nouveau seuil max de market cap BSC (en $, ex. : 2000000) :")
+            bot.send_message(chat_id, "Entrez le nouveau seuil max de market cap BSC (en $, ex. : 3000000) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_max_market_cap_bsc)
         elif call.data == "adjust_min_volume_sol":
-            bot.send_message(chat_id, "Entrez le nouveau seuil min de volume Solana (en $, ex. : 50000) :")
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de volume Solana (en $, ex. : 25000) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_volume_sol)
         elif call.data == "adjust_max_volume_sol":
-            bot.send_message(chat_id, "Entrez le nouveau seuil max de volume Solana (en $, ex. : 500000) :")
+            bot.send_message(chat_id, "Entrez le nouveau seuil max de volume Solana (en $, ex. : 750000) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_max_volume_sol)
         elif call.data == "adjust_min_market_cap_sol":
-            bot.send_message(chat_id, "Entrez le nouveau seuil min de market cap Solana (en $, ex. : 100000) :")
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de market cap Solana (en $, ex. : 50000) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_market_cap_sol)
         elif call.data == "adjust_max_market_cap_sol":
-            bot.send_message(chat_id, "Entrez le nouveau seuil max de market cap Solana (en $, ex. : 1000000) :")
+            bot.send_message(chat_id, "Entrez le nouveau seuil max de market cap Solana (en $, ex. : 1500000) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_max_market_cap_sol)
         elif call.data.startswith("refresh_"):
             token = call.data.split("_")[1]
@@ -936,7 +948,7 @@ def adjust_min_volume_bsc(message):
         else:
             bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
     except ValueError:
-        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 75000)")
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 30000)")
 
 def adjust_max_volume_bsc(message):
     global MAX_VOLUME_BSC
@@ -949,7 +961,7 @@ def adjust_max_volume_bsc(message):
         else:
             bot.send_message(chat_id, "⚠️ La valeur doit être supérieure au minimum!")
     except ValueError:
-        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 750000)")
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 1000000)")
 
 def adjust_min_liquidity(message):
     global MIN_LIQUIDITY
@@ -962,7 +974,7 @@ def adjust_min_liquidity(message):
         else:
             bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
     except ValueError:
-        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 100000)")
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 50000)")
 
 def adjust_min_market_cap_bsc(message):
     global MIN_MARKET_CAP_BSC
@@ -975,7 +987,7 @@ def adjust_min_market_cap_bsc(message):
         else:
             bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
     except ValueError:
-        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 200000)")
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 75000)")
 
 def adjust_max_market_cap_bsc(message):
     global MAX_MARKET_CAP_BSC
@@ -988,7 +1000,7 @@ def adjust_max_market_cap_bsc(message):
         else:
             bot.send_message(chat_id, "⚠️ La valeur doit être supérieure au minimum!")
     except ValueError:
-        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 2000000)")
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 3000000)")
 
 def adjust_min_volume_sol(message):
     global MIN_VOLUME_SOL
@@ -1001,7 +1013,7 @@ def adjust_min_volume_sol(message):
         else:
             bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
     except ValueError:
-        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 50000)")
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 25000)")
 
 def adjust_max_volume_sol(message):
     global MAX_VOLUME_SOL
@@ -1014,7 +1026,7 @@ def adjust_max_volume_sol(message):
         else:
             bot.send_message(chat_id, "⚠️ La valeur doit être supérieure au minimum!")
     except ValueError:
-        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 500000)")
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 750000)")
 
 def adjust_min_market_cap_sol(message):
     global MIN_MARKET_CAP_SOL
@@ -1027,7 +1039,7 @@ def adjust_min_market_cap_sol(message):
         else:
             bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
     except ValueError:
-        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 100000)")
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 50000)")
 
 def adjust_max_market_cap_sol(message):
     global MAX_MARKET_CAP_SOL
@@ -1040,7 +1052,7 @@ def adjust_max_market_cap_sol(message):
         else:
             bot.send_message(chat_id, "⚠️ La valeur doit être supérieure au minimum!")
     except ValueError:
-        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 1000000)")
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 1500000)")
 
 # Achat BSC
 def buy_token_bsc(chat_id, contract_address, amount):
@@ -1275,7 +1287,7 @@ def get_current_market_cap(contract_address):
         if contract_address in portfolio and portfolio[contract_address]['chain'] == 'solana':
             response = session.get(
                 f"https://public-api.birdeye.so/public/price?address={contract_address}",
-                headers={"X-API-KEY": BIRDEYE_API_KEY},
+                headers=BIRDEYE_HEADERS,
                 timeout=10
             )
             price = response.json()['data']['value']
@@ -1291,7 +1303,7 @@ def get_current_market_cap(contract_address):
             }])
             supply = token_contract.functions.totalSupply().call() / 10**18
             volume_response = session.get(
-                f"https://api.bscscan.com/api?module=stats&action=tokenbalance&contractaddress={contract_address}&address={PANCAKE_ROUTER_ADDRESS}&tag=latest&apikey={BSC_SCAN_API_KEY}",
+                f"https://api.bscscan.com/api?module=stats&action=tokenbalance&contractaddress={token_address}&address={PANCAKE_ROUTER_ADDRESS}&tag=latest&apikey={BSC_SCAN_API_KEY}",
                 timeout=10
             )
             volume = float(volume_response.json()['result']) / 10**18
