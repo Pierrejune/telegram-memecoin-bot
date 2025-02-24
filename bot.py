@@ -8,6 +8,7 @@ import asyncio
 import websockets
 import json
 import base58
+import aiohttp
 from flask import Flask, request, abort
 from cachetools import TTLCache
 from web3 import Web3
@@ -37,7 +38,7 @@ retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 
-# Dernier appel Twitter
+# Dernier appel Twitter (non utilisé avec le streaming)
 last_twitter_call = 0
 
 # Chargement des variables depuis Cloud Run
@@ -51,7 +52,7 @@ BSC_SCAN_API_KEY = os.getenv("BSC_SCAN_API_KEY")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")  # HTTP pour BSC
-SOLANA_RPC_WS = "wss://responsive-shy-wish.solana-mainnet.quiknode.pro/65cdde904eae4ea04d77052221eb618010d51ec5"  # Votre endpoint WebSocket Solana
+SOLANA_RPC_WS = os.getenv("SOLANA_RPC_WS", "wss://responsive-shy-wish.solana-mainnet.quiknode.pro/65cdde904eae4ea04d77052221eb618010d51ec5")  # Endpoint WebSocket Solana
 
 # Headers pour Twitter API
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
@@ -173,9 +174,9 @@ cache = TTLCache(maxsize=100, ttl=300)
 portfolio = {}
 twitter_tokens = []
 
-# Critères personnalisés
+# Critères personnalisés (MAX_HOLDER_PCT ajusté à 20 %)
 MIN_VOLUME_SOL = 50000
-MAX_VOLUME_SOL = 500000  # Corrigé de 50000 pour cohérence avec la doc
+MAX_VOLUME_SOL = 500000
 MIN_VOLUME_BSC = 75000
 MAX_VOLUME_BSC = 750000
 MIN_LIQUIDITY = 100000
@@ -187,8 +188,8 @@ MAX_MARKET_CAP_SOL = 1000000
 MIN_MARKET_CAP_BSC = 200000
 MAX_MARKET_CAP_BSC = 2000000
 MAX_TAX = 5
-MAX_HOLDER_PCT = 5
-MIN_TX_PER_MIN_BSC = 5  # Corrigé de la doc (10) pour correspondre au code
+MAX_HOLDER_PCT = 20  # Ajusté de 5 à 20 pour plus de flexibilité
+MIN_TX_PER_MIN_BSC = 5
 MAX_TX_PER_MIN_BSC = 75
 MIN_TX_PER_MIN_SOL = 15
 MAX_TX_PER_MIN_SOL = 150
@@ -236,82 +237,48 @@ def get_real_tx_per_min_bsc(token_address):
         logger.error(f"Erreur calcul tx/min BSC pour {token_address}: {str(e)}")
         return 0
 
-# Surveillance Twitter/X (Modifié pour corriger l'erreur 400 et limiter les appels)
-def monitor_twitter(chat_id):
-    global last_twitter_call
-    logger.info("Surveillance Twitter/X en cours...")
-    bot.send_message(chat_id, "📡 Début surveillance Twitter...")
-    current_time = time.time()
-    # MODIFICATION : Délai minimum augmenté à 30s pour réduire la fréquence
-    if current_time - last_twitter_call < 30:
-        wait_time = 30 - (current_time - last_twitter_call)
-        bot.send_message(chat_id, f"⌛ Délai minimum Twitter, attente de {wait_time:.1f}s...")
-        time.sleep(wait_time)
-    try:
-        # MODIFICATION : Query corrigée pour éviter l'erreur 400 (guillemets simples remplacés par doubles)
-        query_kanye = "from:kanyewest memecoin OR token OR launch OR \"contract address\" OR CA"
-        response = session.get(
-            f"https://api.twitter.com/2/tweets/search/recent?query={query_kanye}&max_results=10",
-            headers=TWITTER_HEADERS,
-            timeout=10
-        )
-        if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", 300))
-            logger.warning(f"Erreur 429 - Limite atteinte, attente de {retry_after} secondes")
-            bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause de {retry_after} s...")
-            time.sleep(retry_after)
-            return
-        response.raise_for_status()
-        tweets = response.json().get('data', [])
-        for tweet in tweets:
-            text = tweet['text'].lower()
-            if 'contract address' in text or "ca" in text or "token" in text:
-                words = text.split()
-                for word in words:
-                    if (len(word) == 42 and word.startswith("0x")) or len(word) == 44:
-                        if word not in twitter_tokens:
-                            twitter_tokens.append(word)
-                        bot.send_message(chat_id, f"✅ Token détecté via X (@kanyewest): {word}")
-                        check_twitter_token(chat_id, word)
-        # Comptes influents (>50k followers) mentionnant CA
-        query_influencers = "\"contract address\" OR CA -from:kanyewest"
-        response = session.get(
-            f"https://api.twitter.com/2/tweets/search/recent?query={query_influencers}&max_results=50&expansions=author_id&user.fields=followers_count",
-            headers=TWITTER_HEADERS,
-            timeout=10
-        )
-        if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", 300))
-            logger.warning(f"Erreur 429 - Limite atteinte, attente de {retry_after} secondes")
-            bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause de {retry_after} s...")
-            time.sleep(retry_after)
-            return
-        response.raise_for_status()
-        data = response.json()
-        tweets = data.get('data', [])
-        users = {user['id']: user for user in data.get('includes', {}).get('users', [])}
-        for tweet in tweets:
-            author_id = tweet['author_id']
-            author = users.get(author_id, {})
-            followers_count = author.get('followers_count', 0)
-            if followers_count > 50000:
-                text = tweet['text'].lower()
-                if 'contract address' in text or "ca" in text:
-                    words = text.split()
-                    for word in words:
-                        if (len(word) == 42 and word.startswith("0x")) or len(word) == 44:
-                            if word not in twitter_tokens:
-                                twitter_tokens.append(word)
-                            bot.send_message(chat_id, f"✅ Token détecté via X (@{author.get('username', 'unknown')} avec {followers_count} abonnés): {word}")
-                            check_twitter_token(chat_id, word)
-        last_twitter_call = time.time()
-        bot.send_message(chat_id, "✔️ Surveillance Twitter terminée.")
-    except Exception as e:
-        logger.error(f"Erreur surveillance Twitter: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur surveillance Twitter: {str(e)}")
-        if "429" in str(e):
-            bot.send_message(chat_id, "⏳ Trop de requêtes Twitter, pause de 5 min...")
-            time.sleep(300)
+# Surveillance Twitter/X avec streaming en temps réel
+async def monitor_twitter(chat_id):
+    logger.info("Surveillance Twitter/X en cours (streaming)...")
+    bot.send_message(chat_id, "📡 Début surveillance Twitter (streaming)...")
+    url = "https://api.twitter.com/2/tweets/search/stream"
+    headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
+    rules = {
+        "rules": [
+            {"value": "from:kanyewest memecoin OR token OR launch OR \"contract address\" OR CA", "tag": "kanye"},
+            {"value": "\"contract address\" OR CA -from:kanyewest", "tag": "influencers"}
+        ]
+    }
+
+    async with aiohttp.ClientSession() as session:
+        # Ajouter ou mettre à jour les règles
+        async with session.post(f"{url}/rules", headers=headers, json=rules) as resp:
+            if resp.status != 201:
+                logger.error(f"Erreur ajout règles Twitter: {await resp.text()}")
+                bot.send_message(chat_id, f"⚠️ Erreur configuration Twitter: {await resp.text()}")
+                return
+
+        # Démarrer le stream
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                logger.error(f"Erreur démarrage stream Twitter: {await resp.text()}")
+                bot.send_message(chat_id, f"⚠️ Erreur stream Twitter: {await resp.text()}")
+                return
+            async for line in resp.content:
+                if line:
+                    try:
+                        tweet = json.loads(line)
+                        text = tweet['data']['text'].lower()
+                        if 'contract address' in text or "ca" in text or "token" in text:
+                            words = text.split()
+                            for word in words:
+                                if (len(word) == 42 and word.startswith("0x")) or len(word) == 44:
+                                    if word not in twitter_tokens:
+                                        twitter_tokens.append(word)
+                                    bot.send_message(chat_id, f"✅ Token détecté via X (temps réel) : {word}")
+                                    check_twitter_token(chat_id, word)
+                    except json.JSONDecodeError:
+                        continue
 
 # Vérification des tokens détectés via Twitter
 def check_twitter_token(chat_id, token_address):
@@ -422,21 +389,22 @@ async def get_real_tx_per_min_solana(token_address):
         logger.error(f"Erreur calcul tx/min Solana pour {token_address}: {str(e)}")
         return 0
 
-# Détection des nouveaux tokens BSC (Modifié pour ajouter des logs et résoudre l'erreur 'inputs')
+# Détection des nouveaux tokens BSC (Fenêtre élargie à 10 blocs)
 def detect_new_tokens_bsc(chat_id):
     bot.send_message(chat_id, "📡 Début détection BSC...")
     try:
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
-        # MODIFICATION : Ajout de logs pour déboguer
         logger.info(f"Bloc actuel : {latest_block}")
-        events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 3, toBlock=latest_block)
+        events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 10, toBlock=latest_block)
         logger.info(f"Événements trouvés : {len(events)}")
         bot.send_message(chat_id, f"📡 {len(events)} nouvelles paires détectées sur BSC")
+        if not events:
+            logger.info("Aucun événement PairCreated trouvé dans les 10 derniers blocs.")
+            bot.send_message(chat_id, "ℹ️ Aucun événement PairCreated détecté dans les 10 derniers blocs.")
         rejected_count = 0
         valid_token_found = False
         for event in events:
-            # MODIFICATION : Log détaillé de l'événement
             logger.info(f"Événement : {event}")
             token_address = event['args']['token0'] if event['args']['token0'] != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else event['args']['token1']
             pair = event['args']['pair']
@@ -496,40 +464,47 @@ def detect_new_tokens_bsc(chat_id):
         logger.error(f"Erreur détection BSC: {str(e)}")
         bot.send_message(chat_id, f"⚠️ Erreur détection BSC: {str(e)}")
 
-# Détection des nouveaux tokens Solana avec QuickNode
+# Détection des nouveaux tokens Solana avec retry sur timeout
 async def detect_new_tokens_solana(chat_id):
     bot.send_message(chat_id, "📡 Début détection Solana via QuickNode...")
-    try:
-        async with websockets.connect(SOLANA_RPC_WS) as websocket:
-            subscription = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "logsSubscribe",
-                "params": [{"mentions": [str(RAYDIUM_PROGRAM_ID)]}, {"commitment": "finalized"}]
-            }
-            await websocket.send(json.dumps(subscription))
-            response = await websocket.recv()
-            sub_id = json.loads(response).get('result')
-            logger.info(f"Abonnement WebSocket Solana actif : {sub_id}")
-            while trade_active:
-                message = await websocket.recv()
-                data = json.loads(message)
-                if 'params' in data and 'result' in data['params']:
-                    logs = data['params']['result']['value']['logs']
-                    token_address = None
-                    for log in logs:
-                        if "Mint" in log:  # Simplification : recherche d'une adresse de token
-                            words = log.split()
-                            for word in words:
-                                if len(word) == 44:  # Longueur typique d'une adresse Solana
-                                    token_address = word
-                                    break
-                    if token_address and token_address not in detected_tokens:
-                        bot.send_message(chat_id, f"✅ Nouveau pool détecté sur Raydium : {token_address}")
-                        await check_solana_token(chat_id, token_address)
-    except Exception as e:
-        logger.error(f"Erreur détection Solana: {str(e)}")
-        bot.send_message(chat_id, f"⚠️ Erreur détection Solana: {str(e)}")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with websockets.connect(SOLANA_RPC_WS, timeout=10) as websocket:
+                subscription = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "logsSubscribe",
+                    "params": [{"mentions": [str(RAYDIUM_PROGRAM_ID)]}, {"commitment": "finalized"}]
+                }
+                await websocket.send(json.dumps(subscription))
+                response = await websocket.recv()
+                sub_id = json.loads(response).get('result')
+                logger.info(f"Abonnement WebSocket Solana actif : {sub_id}")
+                while trade_active:
+                    message = await websocket.recv()
+                    data = json.loads(message)
+                    if 'params' in data and 'result' in data['params']:
+                        logs = data['params']['result']['value']['logs']
+                        token_address = None
+                        for log in logs:
+                            if "Mint" in log:
+                                words = log.split()
+                                for word in words:
+                                    if len(word) == 44:
+                                        token_address = word
+                                        break
+                        if token_address and token_address not in detected_tokens:
+                            bot.send_message(chat_id, f"✅ Nouveau pool détecté sur Raydium : {token_address}")
+                            await check_solana_token(chat_id, token_address)
+                break  # Sortie si la connexion réussit
+        except Exception as e:
+            logger.error(f"Erreur détection Solana (tentative {attempt + 1}/{max_retries}) : {str(e)}")
+            bot.send_message(chat_id, f"⚠️ Erreur détection Solana (tentative {attempt + 1}/{max_retries}) : {str(e)}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(5)  # Attente avant nouvelle tentative
+            else:
+                bot.send_message(chat_id, "❌ Échec définitif de la connexion Solana après plusieurs tentatives.")
 
 async def check_solana_token(chat_id, token_address):
     try:
@@ -726,11 +701,12 @@ def callback_query(call):
         logger.error(f"Erreur dans callback_query: {str(e)}")
         bot.send_message(chat_id, f"⚠️ Erreur générale: {str(e)}")
 
-# Cycle de trading optimisé pour la rapidité (Modifié pour réduire les appels Twitter)
+# Cycle de trading optimisé avec tâches parallèles
 async def trading_cycle(chat_id):
     global trade_active
     cycle_count = 0
     solana_task = asyncio.create_task(detect_new_tokens_solana(chat_id))
+    twitter_task = asyncio.create_task(monitor_twitter(chat_id))  # Lancement du stream Twitter
     while trade_active:
         cycle_count += 1
         bot.send_message(chat_id, f"🔍 Début du cycle de détection #{cycle_count}...")
@@ -738,10 +714,6 @@ async def trading_cycle(chat_id):
         try:
             detect_new_tokens_bsc(chat_id)
             bot.send_message(chat_id, "📡 Surveillance Solana en cours via QuickNode (WebSocket)...")
-            # MODIFICATION : Appel Twitter tous les 90 cycles (~15 min) pour éviter 429
-            if cycle_count % 90 == 0:
-                bot.send_message(chat_id, "📡 Lancement surveillance Twitter...")
-                monitor_twitter(chat_id)
             bot.send_message(chat_id, "⏳ Attente de 10 secondes avant le prochain cycle...")
             await asyncio.sleep(10)
         except Exception as e:
@@ -749,6 +721,7 @@ async def trading_cycle(chat_id):
             bot.send_message(chat_id, f"⚠️ Erreur dans le cycle: {str(e)}")
     trade_active = False
     solana_task.cancel()
+    twitter_task.cancel()
 
 # Menu de configuration
 def show_config_menu(chat_id):
