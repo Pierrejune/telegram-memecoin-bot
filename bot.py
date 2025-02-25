@@ -170,61 +170,88 @@ async def monitor_twitter(chat_id):
     global twitter_requests_remaining, twitter_last_reset, last_twitter_call
     logger.info("Surveillance Twitter/X démarrée...")
     bot.send_message(chat_id, "📡 Surveillance Twitter activée...")
-    base_delay = 1.8  # 500 req / 900s = ~1.8s par requête
+    base_delay = 1.8  # 500 req / 15 min = ~1.8s par req
 
-    while trade_active:
-        current_time = time.time()
-        if current_time - twitter_last_reset >= 900:  # Reset toutes les 15 min
-            twitter_requests_remaining = 500
-            twitter_last_reset = current_time
-            logger.info("Quota Twitter réinitialisé : 500 requêtes disponibles.")
+    # Requête principale pour mentions générales + spécifique pour Kanye
+    query_general = '("contract address" OR CA) -is:retweet'  # Filtre les retweets pour éviter le bruit
+    query_kanye = 'from:kanyewest "contract address" OR CA OR token OR memecoin OR launch'
 
-        if twitter_requests_remaining <= 0:
-            wait_time = 900 - (current_time - twitter_last_reset) + 10
-            logger.warning(f"Quota Twitter épuisé, attente de {wait_time:.1f} secondes...")
-            bot.send_message(chat_id, f"⚠️ Quota Twitter épuisé, pause de {wait_time:.1f} s...")
-            await asyncio.sleep(wait_time)
-            continue
+    async with aiohttp.ClientSession(headers=TWITTER_HEADERS) as session:
+        while trade_active:
+            current_time = time.time()
+            if current_time - twitter_last_reset >= 900:
+                twitter_requests_remaining = 500
+                twitter_last_reset = current_time
+                logger.info("Quota Twitter réinitialisé : 500 requêtes.")
 
-        delay = max(base_delay, (900 - (current_time - twitter_last_reset)) / max(1, twitter_requests_remaining))
-        if current_time - last_twitter_call < delay:
-            await asyncio.sleep(delay - (current_time - last_twitter_call))
-
-        try:
-            query_kanye = "from:kanyewest memecoin OR token OR launch OR \"contract address\" OR CA"
-            response = session.get(
-                f"https://api.twitter.com/2/tweets/search/recent?query={query_kanye}&max_results=10",
-                headers=TWITTER_HEADERS,
-                timeout=10
-            )
-            if response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 900))
-                logger.warning(f"Erreur 429 - Limite atteinte, attente de {retry_after} secondes")
-                bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause de {retry_after} s...")
-                await asyncio.sleep(retry_after)
+            if twitter_requests_remaining <= 10:
+                wait_time = 900 - (current_time - twitter_last_reset) + 10
+                logger.warning(f"Quota faible, attente de {wait_time:.1f}s...")
+                bot.send_message(chat_id, f"⚠️ Quota Twitter bas, pause de {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time)
                 continue
-            
-            response.raise_for_status()
-            twitter_requests_remaining -= 1
-            last_twitter_call = current_time
-            logger.info(f"Requêtes Twitter restantes : {twitter_requests_remaining}")
-            
-            tweets = response.json().get('data', [])
-            for tweet in tweets:
-                text = tweet['text'].lower()
-                if 'contract address' in text or "ca" in text or "token" in text:
-                    words = text.split()
-                    for word in words:
-                        if (len(word) == 42 and word.startswith("0x")) or len(word) == 44:
-                            if word not in twitter_tokens:
-                                twitter_tokens.append(word)
-                                bot.send_message(chat_id, f'🔍 Token détecté via X (@kanyewest): {word}')
-                                check_twitter_token(chat_id, word)
-            await asyncio.sleep(delay)
-        except Exception as e:
-            logger.error(f"Erreur surveillance Twitter: {str(e)}")
-            bot.send_message(chat_id, f'⚠️ Erreur surveillance Twitter: {str(e)}')
-            await asyncio.sleep(60)
+
+            delay = max(base_delay, (900 - (current_time - twitter_last_reset)) / max(1, twitter_requests_remaining))
+            await asyncio.sleep(max(0, delay - (current_time - last_twitter_call)))
+
+            try:
+                # 1. Requête générale pour comptes influents
+                async with session.get(
+                    f"https://api.twitter.com/2/tweets/search/recent?query={query_general}&max_results=20&expansions=author_id&user.fields=public_metrics",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 429:
+                        retry_after = int(response.headers.get('Retry-After', 900))
+                        logger.warning(f"429 général, attente {retry_after}s")
+                        bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause {retry_after}s...")
+                        await asyncio.sleep(retry_after)
+                        continue
+                    twitter_requests_remaining -= 1
+                    last_twitter_call = current_time
+                    data = await response.json()
+                    tweets = data.get('data', [])
+                    users = {u['id']: u for u in data.get('includes', {}).get('users', [])}
+
+                    for tweet in tweets:
+                        user = users.get(tweet['author_id'])
+                        followers = user.get('public_metrics', {}).get('followers_count', 0) if user else 0
+                        if followers >= 10000 or user['username'] == 'kanyewest':  # Influents ou Kanye
+                            text = tweet['text'].lower()
+                            words = text.split()
+                            for word in words:
+                                if (len(word) == 42 and word.startswith("0x")) or len(word) == 44:
+                                    if word not in twitter_tokens:
+                                        twitter_tokens.append(word)
+                                        bot.send_message(chat_id, f'🔍 Token détecté via X (@{user["username"]}, {followers} abonnés): {word}')
+                                        check_twitter_token(chat_id, word)
+
+                # 2. Requête spécifique pour Kanye West
+                async with session.get(
+                    f"https://api.twitter.com/2/tweets/search/recent?query={query_kanye}&max_results=10",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response_kanye:
+                    if response_kanye.status == 429:
+                        retry_after = int(response_kanye.headers.get('Retry-After', 900))
+                        logger.warning(f"429 Kanye, attente {retry_after}s")
+                        await asyncio.sleep(retry_after)
+                        continue
+                    twitter_requests_remaining -= 1
+                    last_twitter_call = current_time
+                    tweets_kanye = (await response_kanye.json()).get('data', [])
+                    for tweet in tweets_kanye:
+                        text = tweet['text'].lower()
+                        words = text.split()
+                        for word in words:
+                            if (len(word) == 42 and word.startswith("0x")) or len(word) == 44:
+                                if word not in twitter_tokens:
+                                    twitter_tokens.append(word)
+                                    bot.send_message(chat_id, f'🔍 Token détecté via X (@kanyewest): {word}')
+                                    check_twitter_token(chat_id, word)
+
+            except Exception as e:
+                logger.error(f"Erreur Twitter: {str(e)}")
+                bot.send_message(chat_id, f'⚠️ Erreur Twitter: {str(e)}')
+                await asyncio.sleep(60)
 
 def check_twitter_token(chat_id, token_address):
     try:
@@ -308,14 +335,22 @@ async def detect_new_tokens_bsc(chat_id):
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
         logger.info(f"Bloc actuel : {latest_block}")
-        events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 50, toBlock=latest_block)
+        events = factory.events.PairCreated.get_logs(fromBlock=max(latest_block - 200, 0), toBlock=latest_block)
         logger.info(f"Événements trouvés : {len(events)}")
         bot.send_message(chat_id, f"⬇️ {len(events)} nouvelles paires détectées sur BSC")
-        if not events:
-            logger.info("Aucun événement PairCreated trouvé dans les 50 derniers blocs.")
-            bot.send_message(chat_id, "ℹ️ Aucun événement PairCreated détecté dans les 50 derniers blocs.")
-            return
         
+        if not events:
+            logger.info("Aucun événement PairCreated, essai via DexScreener...")
+            response = session.get("https://api.dexscreener.com/latest/dex/pairs/bsc", timeout=10)
+            pairs = response.json().get('pairs', [])[:10]  # 10 dernières paires
+            for pair in pairs:
+                token_address = pair['baseToken']['address']
+                if token_address not in detected_tokens:
+                    await check_bsc_token(chat_id, token_address, loose_mode_bsc)
+            if not pairs:
+                bot.send_message(chat_id, "ℹ️ Aucune nouvelle paire détectée via DexScreener.")
+            return
+
         rejected_count = 0
         valid_token_found = False
         rejection_reasons = []
@@ -366,12 +401,12 @@ async def check_bsc_token(chat_id, token_address, loose_mode):
         market_cap = volume_24h * supply
         tx_per_min = get_real_tx_per_min_bsc(token_address)
 
-        min_volume = MIN_VOLUME_BSC * 0.5 if loose_mode else MIN_VOLUME_BSC
-        max_volume = MAX_VOLUME_BSC if loose_mode else MAX_VOLUME_BSC
-        min_liquidity = MIN_LIQUIDITY * 0.5 if loose_mode else MIN_LIQUIDITY
-        min_market_cap = MIN_MARKET_CAP_BSC * 0.5 if loose_mode else MIN_MARKET_CAP_BSC
-        max_market_cap = MAX_MARKET_CAP_BSC if loose_mode else MAX_MARKET_CAP_BSC
-        min_tx = MIN_TX_PER_MIN_BSC
+        min_volume = MIN_VOLUME_BSC * 0.3 if loose_mode else MIN_VOLUME_BSC
+        max_volume = MAX_VOLUME_BSC
+        min_liquidity = MIN_LIQUIDITY * 0.3 if loose_mode else MIN_LIQUIDITY
+        min_market_cap = MIN_MARKET_CAP_BSC * 0.3 if loose_mode else MIN_MARKET_CAP_BSC
+        max_market_cap = MAX_MARKET_CAP_BSC
+        min_tx = 3 if loose_mode else MIN_TX_PER_MIN_BSC  # Ajusté pour prudence
         max_tx = MAX_TX_PER_MIN_BSC
 
         if not (min_tx <= tx_per_min <= max_tx):
@@ -406,29 +441,31 @@ async def check_bsc_token(chat_id, token_address, loose_mode):
 async def detect_new_tokens_solana(chat_id):
     bot.send_message(chat_id, "🔍 Début détection Solana via Birdeye...")
     try:
-        response = session.get("https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=10", headers=BIRDEYE_HEADERS, timeout=10)
+        response = session.get("https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=20", headers=BIRDEYE_HEADERS, timeout=10)
         response.raise_for_status()
         json_response = response.json()
         logger.info(f"Réponse Birdeye : {json_response}")
         data = json_response.get('data', {})
         tokens = data.get('tokens', [])
         if not tokens:
-            logger.warning("Aucune donnée de tokens valide dans la réponse Birdeye")
-            bot.send_message(chat_id, "⚠️ Aucun token Solana détecté (réponse vide)")
+            logger.warning("Aucune donnée Birdeye, essai Raydium...")
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://api.raydium.io/v2/main/pairs") as resp:
+                    pairs = await resp.json()
+                    for pair in pairs[:10]:
+                        token_address = pair['base_token']
+                        if token_address not in detected_tokens:
+                            await check_solana_token(chat_id, token_address)
+            bot.send_message(chat_id, "ℹ️ Aucun token détecté via Birdeye, fallback Raydium utilisé.")
             return
         
-        for token in tokens:
+        for token in tokens[:5]:  # Limite à 5 pour éviter surcharge
             token_address = token.get('address')
             if token_address and token_address not in detected_tokens:
-                response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-                data = response.json().get('data', {})
-                volume_24h = float(data.get('v24hUSD', 0))
-                if volume_24h > MIN_VOLUME_SOL:
+                volume_24h = float(token.get('v24hUSD', 0))
+                if volume_24h > MIN_VOLUME_SOL * 0.5:
                     bot.send_message(chat_id, f'🆕 Token Solana détecté via Birdeye : {token_address} (Vol: ${volume_24h:.2f})')
                     await check_solana_token(chat_id, token_address)
-                    break
-                else:
-                    logger.info(f"Token {token_address} rejeté, volume insuffisant: ${volume_24h:.2f}")
     except Exception as e:
         logger.error(f"Erreur détection Solana via Birdeye: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur détection Solana: {str(e)}')
@@ -443,17 +480,19 @@ async def check_solana_token(chat_id, token_address):
         supply = float(data.get('supply', 0))
         tx_per_min = await get_real_tx_per_min_solana(token_address)
         
-        if not (MIN_TX_PER_MIN_SOL <= tx_per_min <= MAX_TX_PER_MIN_SOL):
-            logger.info(f"{token_address}: tx/min {tx_per_min} hors plage [{MIN_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]")
+        min_tx = 10 if loose_mode_bsc else MIN_TX_PER_MIN_SOL  # Ajusté pour prudence, réutilise loose_mode_bsc pour simplicité
+        max_tx = MAX_TX_PER_MIN_SOL
+        if not (min_tx <= tx_per_min <= max_tx):
+            logger.info(f"{token_address}: tx/min {tx_per_min} hors plage [{min_tx}, {max_tx}]")
             return
-        if not (MIN_VOLUME_SOL <= volume_24h <= MAX_VOLUME_SOL):
-            logger.info(f"{token_address}: volume {volume_24h} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]")
+        if not (MIN_VOLUME_SOL * 0.5 <= volume_24h <= MAX_VOLUME_SOL):
+            logger.info(f"{token_address}: volume {volume_24h} hors plage [{MIN_VOLUME_SOL * 0.5}, {MAX_VOLUME_SOL}]")
             return
-        if liquidity < MIN_LIQUIDITY:
-            logger.info(f"{token_address}: liquidité {liquidity} < {MIN_LIQUIDITY}")
+        if liquidity < MIN_LIQUIDITY * 0.5:
+            logger.info(f"{token_address}: liquidité {liquidity} < {MIN_LIQUIDITY * 0.5}")
             return
-        if not (MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
-            logger.info(f"{token_address}: market cap {market_cap} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]")
+        if not (MIN_MARKET_CAP_SOL * 0.5 <= market_cap <= MAX_MARKET_CAP_SOL):
+            logger.info(f"{token_address}: market cap {market_cap} hors plage [{MIN_MARKET_CAP_SOL * 0.5}, {MAX_MARKET_CAP_SOL}]")
             return
         if not is_safe_token_solana(token_address):
             logger.info(f"{token_address}: non sécurisé")
