@@ -186,6 +186,21 @@ MAX_TX_PER_MIN_BSC = 75
 MIN_TX_PER_MIN_SOL = 15
 MAX_TX_PER_MIN_SOL = 150
 
+# ABI ERC-20 standard pour totalSupply (plus robuste)
+ERC20_ABI = json.loads('''
+[
+    {
+        "constant": true,
+        "inputs": [],
+        "name": "totalSupply",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "payable": false,
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
+''')
+
 # Vérification anti-rug pull BSC via Honeypot.is
 def is_safe_token_bsc(token_address):
     try:
@@ -226,17 +241,35 @@ def get_real_tx_per_min_bsc(token_address):
     except Exception as e:
         logger.error(f"Erreur calcul tx/min BSC pour {token_address}: {str(e)}")
         return 0
-        # Surveillance Twitter/X avec polling ajusté
+
+# Nouvelle fonction pour vérifier si un contrat est un token valide (Ajoutée)
+def is_valid_token_bsc(token_address):
+    try:
+        checksum_address = w3.to_checksum_address(token_address)
+        code = w3.eth.get_code(checksum_address)
+        if len(code) <= 2:  # Code vide ou minimal (0x ou 0x00)
+            logger.warning(f"Token {token_address} n'a pas de code de contrat valide.")
+            return False
+        # Tentative d'appel à totalSupply avec un ABI standard
+        token_contract = w3.eth.contract(address=checksum_address, abi=ERC20_ABI)
+        token_contract.functions.totalSupply().call()
+        return True
+    except Exception as e:
+        logger.error(f"Erreur validation token BSC {token_address}: {str(e)}")
+        return False
+        # Surveillance Twitter/X avec polling ajusté (Corrigée pour gérer le quota)
 async def monitor_twitter(chat_id):
     global last_twitter_call
     logger.info("Surveillance Twitter/X en cours...")
     bot.send_message(chat_id, "📡 Début surveillance Twitter...")
     rate_limit_remaining = 500  # Valeur initiale par défaut
-    reset_time = time.time() + 900  # Estimation par défaut
-    base_delay = 240  # 4 minutes pour respecter 15 req/15 min
+    reset_time = time.time() + 900  # Estimation par défaut (15 min)
+    base_delay = 900 / 500  # 500 requêtes par 15 min = 1.8s par requête
 
     # Vérification initiale du quota avec gestion robuste
-    while True:
+    max_initial_retries = 5
+    retry_count = 0
+    while retry_count < max_initial_retries:
         try:
             response = session.get(
                 "https://api.twitter.com/2/tweets/search/recent?query=from:kanyewest&max_results=10",
@@ -245,25 +278,34 @@ async def monitor_twitter(chat_id):
             )
             if response.status_code == 429:
                 retry_after = int(response.headers.get('Retry-After', 900))
-                logger.warning(f"Quota Twitter épuisé au démarrage, attente de {retry_after} secondes")
-                bot.send_message(chat_id, f"⚠️ Quota Twitter épuisé au démarrage, pause de {retry_after} s...")
+                logger.warning(f"Quota Twitter épuisé au démarrage (tentative {retry_count + 1}/{max_initial_retries}), attente de {retry_after} secondes")
+                bot.send_message(chat_id, f"⚠️ Quota Twitter épuisé au démarrage (tentative {retry_count + 1}/{max_initial_retries}), pause de {retry_after} s...")
                 await asyncio.sleep(retry_after)
-                continue  # Réessayer après l'attente
+                retry_count += 1
+                continue
             response.raise_for_status()
             rate_limit_remaining = int(response.headers.get("x-rate-limit-remaining", 500))
             reset_time = int(response.headers.get("x-rate-limit-reset", time.time() + 900))
             logger.info(f"Quota initial Twitter : {rate_limit_remaining} requêtes restantes, reset à {time.ctime(reset_time)}")
-            break  # Sortir si succès
+            break
         except Exception as e:
-            logger.error(f"Erreur vérification initiale Twitter: {str(e)}")
-            bot.send_message(chat_id, f'⚠️ Échec vérification quota Twitter: {str(e)}')
-            retry_after = 900  # Attente par défaut en cas d'erreur inattendue
-            await asyncio.sleep(retry_after)
-            continue
+            logger.error(f"Erreur vérification initiale Twitter (tentative {retry_count + 1}/{max_initial_retries}): {str(e)}")
+            bot.send_message(chat_id, f'⚠️ Échec vérification quota Twitter (tentative {retry_count + 1}/{max_initial_retries}): {str(e)}')
+            retry_count += 1
+            if retry_count < max_initial_retries:
+                await asyncio.sleep(60)  # Attente courte avant réessai
+            else:
+                logger.error("Échec définitif de la vérification initiale Twitter.")
+                bot.send_message(chat_id, "❌ Surveillance Twitter abandonnée après échecs répétés.")
+                return
 
     while trade_active:
         current_time = time.time()
-        delay = max(base_delay, (reset_time - current_time + 10) / max(1, rate_limit_remaining))  # Délai dynamique
+        time_to_reset = reset_time - current_time
+        if time_to_reset <= 0:
+            rate_limit_remaining = 500  # Réinitialisation supposée après 15 min
+            reset_time = current_time + 900
+        delay = max(base_delay, time_to_reset / max(1, rate_limit_remaining))  # Ajustement dynamique
         if current_time - last_twitter_call < delay:
             await asyncio.sleep(delay - (current_time - last_twitter_call))
         
@@ -308,21 +350,15 @@ async def monitor_twitter(chat_id):
         except Exception as e:
             logger.error(f"Erreur surveillance Twitter: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur surveillance Twitter: {str(e)}')
-            await asyncio.sleep(min(900, delay * 2))  # Backoff exponentiel limité à 15 min
+            await asyncio.sleep(min(900, delay * 2))  # Backoff exponentiel limité
 
-# Vérification des tokens détectés via Twitter
+# Vérification des tokens détectés via Twitter (Corrigée pour totalSupply)
 def check_twitter_token(chat_id, token_address):
     try:
         if token_address.startswith("0x"):  # BSC
-            if w3.eth.get_code(w3.to_checksum_address(token_address)) == b'':
+            if not is_valid_token_bsc(token_address):
                 return False
-            token_contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=[{
-                "name": "totalSupply",
-                "outputs": [{"name": "", "type": "uint256"}],
-                "payable": False,
-                "stateMutability": "view",
-                "type": "function"
-            }])
+            token_contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=ERC20_ABI)
             supply = token_contract.functions.totalSupply().call() / 10**18
             volume_response = session.get(
                 f"https://api.bscscan.com/api?module=stats&action=tokenbalance&contractaddress={token_address}&address={PANCAKE_ROUTER_ADDRESS}&tag=latest&apikey={BSC_SCAN_API_KEY}",
@@ -330,6 +366,7 @@ def check_twitter_token(chat_id, token_address):
             )
             volume_data = volume_response.json()
             if volume_data['status'] != '1':
+                logger.warning(f"Erreur BSCScan pour {token_address}: {volume_data.get('message', 'Unknown')}")
                 return False
             volume_24h = float(volume_data['result']) / 10**18
             liquidity = volume_24h * 0.5
@@ -412,6 +449,7 @@ async def get_real_tx_per_min_solana(token_address):
             response = await asyncio.wait_for(websocket.recv(), timeout=60)
             block_data = json.loads(response)
             if 'result' not in block_data:
+                logger.warning(f"Aucun résultat dans getBlock pour {token_address}")
                 return 0
             tx_count = sum(1 for tx in block_data['result']['transactions'] if token_address in str(tx))
             return tx_count * 150  # Approximation pour 1 min (block time ~ 0.4s, 150 blocs/min)
@@ -426,6 +464,7 @@ async def get_real_tx_per_min_solana(token_address):
                     response = await asyncio.wait_for(websocket.recv(), timeout=60)
                     block_data = json.loads(response)
                     if 'result' not in block_data:
+                        logger.warning(f"Aucun résultat dans getBlock (fallback) pour {token_address}")
                         return 0
                     tx_count = sum(1 for tx in block_data['result']['transactions'] if token_address in str(tx))
                     return tx_count * 150
@@ -440,6 +479,7 @@ async def get_real_tx_per_min_solana(token_address):
                     )
                     trades = response.json()['data']['items']
                     if not trades:
+                        logger.warning(f"Aucune transaction récente via Birdeye pour {token_address}")
                         return 0
                     return min(len(trades) * 2, MAX_TX_PER_MIN_SOL)  # x2 pour estimer par minute
                 except Exception as birdeye_e:
@@ -447,7 +487,7 @@ async def get_real_tx_per_min_solana(token_address):
                     return 0
         return 0
 
-# Détection des nouveaux tokens BSC
+# Détection des nouveaux tokens BSC (Corrigée pour totalSupply)
 def detect_new_tokens_bsc(chat_id):
     global loose_mode_bsc, last_valid_token_time
     bot.send_message(chat_id, "🔍 Début détection BSC...")
@@ -466,7 +506,6 @@ def detect_new_tokens_bsc(chat_id):
         valid_token_found = False
         rejection_reasons = []
 
-        # Vérifier si aucun token valide depuis 1 heure (3600s)
         if time.time() - last_valid_token_time > 3600 and not loose_mode_bsc:
             loose_mode_bsc = True
             bot.send_message(chat_id, "⚠️ Aucun token valide depuis 1h, passage en mode détection souple.")
@@ -477,20 +516,13 @@ def detect_new_tokens_bsc(chat_id):
             pair = event['args']['pair']
             logger.info(f"Token : {token_address}, Pair : {pair}")
             
-            if w3.eth.get_code(w3.to_checksum_address(token_address)) == b'':
-                logger.warning(f"Token {token_address} n'a pas de code de contrat valide.")
-                rejection_reasons.append(f"{token_address}: pas de code valide")
+            if not is_valid_token_bsc(token_address):
+                rejection_reasons.append(f"{token_address}: pas de code valide ou totalSupply inaccessible")
                 rejected_count += 1
                 continue
             
             try:
-                token_contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=[{
-                    "name": "totalSupply",
-                    "outputs": [{"name": "", "type": "uint256"}],
-                    "payable": False,
-                    "stateMutability": "view",
-                    "type": "function"
-                }])
+                token_contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=ERC20_ABI)
                 supply = token_contract.functions.totalSupply().call() / 10**18
             except Exception as e:
                 logger.error(f"Erreur lors de l'appel à totalSupply pour {token_address}: {str(e)}")
@@ -504,7 +536,7 @@ def detect_new_tokens_bsc(chat_id):
             )
             volume_data = volume_response.json()
             if volume_data['status'] != '1':
-                rejection_reasons.append(f"{token_address}: erreur BSCScan")
+                rejection_reasons.append(f"{token_address}: erreur BSCScan - {volume_data.get('message', 'Unknown')}")
                 rejected_count += 1
                 continue
             
@@ -513,7 +545,6 @@ def detect_new_tokens_bsc(chat_id):
             market_cap = volume_24h * supply
             tx_per_min = get_real_tx_per_min_bsc(token_address)
             
-            # Critères en mode souple (50% des seuils stricts)
             min_volume = MIN_VOLUME_BSC * 0.5 if loose_mode_bsc else MIN_VOLUME_BSC
             max_volume = MAX_VOLUME_BSC if loose_mode_bsc else MAX_VOLUME_BSC
             min_liquidity = MIN_LIQUIDITY * 0.5 if loose_mode_bsc else MIN_LIQUIDITY
@@ -557,25 +588,26 @@ def detect_new_tokens_bsc(chat_id):
             buy_token_bsc(chat_id, token_address, mise_depart_bsc)
             valid_token_found = True
             last_valid_token_time = time.time()
-            loose_mode_bsc = False  # Réinitialiser après un succès
+            loose_mode_bsc = False
         
         if not valid_token_found:
             bot.send_message(chat_id, f'⚠️ Aucun token BSC ne correspond aux critères ({rejected_count} rejetés).')
             if rejection_reasons:
-                bot.send_message(chat_id, "Raisons de rejet :\n" + "\n".join(rejection_reasons[:5]))  # Limiter à 5 pour éviter spam
+                bot.send_message(chat_id, "Raisons de rejet :\n" + "\n".join(rejection_reasons[:5]))
         bot.send_message(chat_id, "✅ Détection BSC terminée.")
     except Exception as e:
         logger.error(f"Erreur détection BSC: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur détection BSC: {str(e)}')
 
-# Test préalable de la connexion WebSocket Solana
+# Test préalable de la connexion WebSocket Solana (Ajout de logs)
 async def test_solana_websocket(chat_id):
     ws_urls = [SOLANA_RPC_WS, SOLANA_FALLBACK_WS]
     max_attempts = 3
     for ws_url in ws_urls:
         for attempt in range(max_attempts):
             try:
-                async with websockets.connect(ws_url, timeout=60) as websocket:  # Timeout augmenté à 60s
+                logger.info(f"Tentative connexion WebSocket Solana {ws_url} (tentative {attempt + 1}/{max_attempts})")
+                async with websockets.connect(ws_url, timeout=60) as websocket:
                     test_request = {"jsonrpc": "2.0", "id": 1, "method": "getHealth"}
                     await asyncio.wait_for(websocket.send(json.dumps(test_request)), timeout=60)
                     response = await asyncio.wait_for(websocket.recv(), timeout=60)
@@ -583,12 +615,12 @@ async def test_solana_websocket(chat_id):
                     return ws_url
             except Exception as e:
                 logger.error(f"Échec test WebSocket avec {ws_url} (tentative {attempt + 1}/{max_attempts}): {str(e)}")
-                await asyncio.sleep(5)  # Attente avant retry
+                await asyncio.sleep(5)
     bot.send_message(chat_id, "⚠️ Tous les endpoints WebSocket Solana ont échoué. Passage en mode HTTP.")
     logger.warning("Échec de tous les endpoints WebSocket Solana. Vérifiez SOLANA_RPC_WS et la connectivité.")
     return None
 
-# Détection des nouveaux tokens Solana avec QuickNode et retry
+# Détection des nouveaux tokens Solana avec QuickNode et retry (Corrigée)
 async def detect_new_tokens_solana(chat_id):
     bot.send_message(chat_id, "🔍 Début détection Solana via QuickNode...")
     active_ws_url = await test_solana_websocket(chat_id)
@@ -632,7 +664,7 @@ async def detect_new_tokens_solana(chat_id):
                 else:
                     bot.send_message(chat_id, "⚠️ Échec WebSocket Solana, tentative via HTTP...")
     
-    # Fallback HTTP via Birdeye si WebSocket échoue
+    # Fallback HTTP via Birdeye si WebSocket échoue (Corrigé pour filtrer les nouveaux tokens)
     if not active_ws_url or not trade_active:
         try:
             response = session.get(
@@ -640,18 +672,26 @@ async def detect_new_tokens_solana(chat_id):
                 headers=BIRDEYE_HEADERS,
                 timeout=10
             )
-            response.raise_for_status()  # Vérifie les erreurs HTTP (ex. 429, 401)
+            response.raise_for_status()
             json_response = response.json()
-            logger.info(f"Réponse Birdeye : {json_response}")  # Log pour diagnostic
+            logger.info(f"Réponse Birdeye : {json_response}")
             if 'data' not in json_response or 'tokens' not in json_response['data']:
                 raise ValueError(f"Réponse Birdeye invalide : {json_response}")
             tokens = json_response['data']['tokens']
             for token in tokens:
                 token_address = token['address']
                 if token_address not in detected_tokens:
-                    bot.send_message(chat_id, f'🆕 Token Solana détecté via Birdeye : {token_address}')
-                    await check_solana_token(chat_id, token_address)
-                    break
+                    # Vérifier si le token est récent (par exemple, volume ou liquidité significative)
+                    response = session.get(
+                        f"https://public-api.birdeye.so/public/token_overview?address={token_address}",
+                        headers=BIRDEYE_HEADERS,
+                        timeout=10
+                    )
+                    data = response.json()['data']
+                    if data.get('v24hUSD', 0) > MIN_VOLUME_SOL:
+                        bot.send_message(chat_id, f'🆕 Token Solana détecté via Birdeye : {token_address}')
+                        await check_solana_token(chat_id, token_address)
+                        break
         except Exception as e:
             logger.error(f"Erreur détection HTTP Solana via Birdeye: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur détection HTTP Solana: {str(e)}')
@@ -751,7 +791,7 @@ def show_main_menu(chat_id):
         logger.error(f"Erreur dans show_main_menu: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur affichage menu: {str(e)}')
 
-# Gestion des callbacks
+# Gestion des callbacks (Corrigée pour lancer trading_cycle avec asyncio.run dans un thread séparé)
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
     global mise_depart_bsc, mise_depart_sol, trade_active, slippage, gas_fee, stop_loss_threshold, take_profit_steps
@@ -776,7 +816,9 @@ def callback_query(call):
                 trade_active = True
                 bot.send_message(chat_id, "▶️ Trading lancé avec succès!")
                 logger.info("Lancement du trading cycle...")
-                asyncio.run(trading_cycle(chat_id))
+                # Lancer trading_cycle dans un thread séparé pour éviter de bloquer Flask
+                import threading
+                threading.Thread(target=lambda: asyncio.run(trading_cycle(chat_id)), daemon=True).start()
             else:
                 bot.send_message(chat_id, "⚠️ Trading déjà en cours.")
         elif call.data == "stop":
@@ -869,7 +911,7 @@ async def trading_cycle(chat_id):
         except Exception as e:
             logger.error(f"Erreur dans trading_cycle: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}')
-            trade_active = False  # Arrêt temporaire pour éviter boucle infinie
+            trade_active = False
             bot.send_message(chat_id, "⏹️ Trading arrêté suite à une erreur. Relancez avec /start ou 'Lancer'.")
     if not trade_active:
         logger.info("Trading_cycle arrêté volontairement ou par erreur.")
@@ -1374,7 +1416,7 @@ def get_solana_balance(wallet_address):
         logger.error(f"Erreur solde Solana: {str(e)}")
         return 0
 
-# Market cap en temps réel
+# Market cap en temps réel (Corrigée avec ERC20_ABI)
 def get_current_market_cap(contract_address):
     try:
         if contract_address in portfolio and portfolio[contract_address]['chain'] == 'solana':
@@ -1387,13 +1429,7 @@ def get_current_market_cap(contract_address):
             supply = detected_tokens[contract_address]['supply']
             return price * supply
         else:
-            token_contract = w3.eth.contract(address=w3.to_checksum_address(contract_address), abi=[{
-                "name": "totalSupply",
-                "outputs": [{"name": "", "type": "uint256"}],
-                "payable": False,
-                "stateMutability": "view",
-                "type": "function"
-            }])
+            token_contract = w3.eth.contract(address=w3.to_checksum_address(contract_address), abi=ERC20_ABI)
             supply = token_contract.functions.totalSupply().call() / 10**18
             volume_response = session.get(
                 f"https://api.bscscan.com/api?module=stats&action=tokenbalance&contractaddress={contract_address}&address={PANCAKE_ROUTER_ADDRESS}&tag=latest&apikey={BSC_SCAN_API_KEY}",
@@ -1443,7 +1479,7 @@ def sell_token_immediate(chat_id, token):
         logger.error(f"Erreur vente immédiate: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vente immédiate {token}: {str(e)}')
 
-# Configuration du webhook
+# Configuration du webhook (Corrigée pour Cloud Run : suppression du polling)
 def set_webhook():
     logger.info("Configuration du webhook...")
     try:
@@ -1453,8 +1489,8 @@ def set_webhook():
             bot.set_webhook(url=WEBHOOK_URL)
             logger.info(f"Webhook configuré avec succès sur {WEBHOOK_URL}")
         else:
-            logger.warning("WEBHOOK_URL non défini, exécution en mode polling")
-            bot.polling()
+            logger.error("WEBHOOK_URL non défini, requis pour Cloud Run")
+            raise ValueError("WEBHOOK_URL doit être défini pour fonctionner sur Cloud Run")
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
         raise
