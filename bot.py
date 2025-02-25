@@ -94,7 +94,7 @@ MAX_TX_PER_MIN_SOL = 150
 # Nouvelles variables ajoutées pour les améliorations
 momentum_threshold = 100  # Seuil de tx/min pour détecter un gros pump
 simulation_mode = False   # Mode simulation désactivé par défaut
-BSC_WS_URI = "wss://bsc-ws-node.nariox.org:443"  # WebSocket public gratuit (ou remplace par Infura/Ankr si besoin)
+BSC_WS_URI = "wss://bsc-ws-node.nariox.org:443"  # WebSocket public gratuit
 
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
@@ -1177,7 +1177,6 @@ def sell_token_immediate(chat_id, token):
         logger.error(f"Erreur vente immédiate: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vente immédiate {token}: {str(e)}')
 
-# Nouvelles fonctions ajoutées
 async def monitor_twitter_free(chat_id):
     global last_twitter_call
     bot.send_message(chat_id, "📡 Surveillance Twitter réactivée (mode gratuit) : détection des mentions de CA par comptes influents...")
@@ -1189,10 +1188,10 @@ async def monitor_twitter_free(chat_id):
                 await asyncio.sleep(15 - (current_time - last_twitter_call))
             url = "https://api.twitter.com/2/tweets/search/recent"
             params = {
-                "query": "(0x OR So OR CA) -is:retweet has:mentions",  # Recherche adresses ou "CA" par des comptes mentionnés, pas de retweets
+                "query": "(0x OR So OR CA) -is:retweet has:mentions",  # Recherche adresses ou "CA", pas de retweets
                 "max_results": 10,
                 "tweet.fields": "created_at,author_id",
-                "user.fields": "public_metrics",  # Récupérer les métriques des utilisateurs pour filtrer les influents
+                "user.fields": "public_metrics",
                 "expansions": "author_id"
             }
             response = session.get(url, headers=TWITTER_HEADERS, params=params, timeout=10)
@@ -1211,8 +1210,7 @@ async def monitor_twitter_free(chat_id):
                 author = users.get(author_id, {})
                 followers = author.get("public_metrics", {}).get("followers_count", 0)
                 
-                # Filtrer les comptes influents (>10k followers)
-                if followers > 10000:
+                if followers > 10000:  # Filtrer les comptes influents (>10k followers)
                     text = tweet["text"]
                     potential_addresses = [word for word in text.split() if word.startswith("0x") or word.startswith("So") or (len(word) > 20 and "CA" in text.upper())]
                     for addr in potential_addresses:
@@ -1279,7 +1277,7 @@ async def monitor_trending_free(chat_id):
                 for addr in potential_addresses:
                     if await check_twitter_token(chat_id, addr):
                         logger.info(f"Token trending détecté : {addr}")
-            await asyncio.sleep(600)
+            await asyncio.sleep(600)  # Pause de 10min
         except Exception as e:
             logger.error(f"Erreur trending X : {str(e)}")
             bot.send_message(chat_id, f"⚠️ Erreur trending X : {str(e)}")
@@ -1297,12 +1295,13 @@ def set_webhook():
         raise
 
 def run_bot():
-    logger.info("Démarrage du bot dans un thread séparé...")
+    logger.info("Démarrage du bot...")
     initialize_bot()
     set_webhook()
+    logger.info("Bot initialisé et webhook configuré.")
 
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
-    threading.Thread(target=run_bot, daemon=True).start()
+    run_bot()  # Initialisation du bot et configuration du webhook
     logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=PORT, debug=False)  # Lancement de Flask sur le port spécifié
