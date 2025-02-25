@@ -257,14 +257,14 @@ def is_valid_token_bsc(token_address):
     except Exception as e:
         logger.error(f"Erreur validation token BSC {token_address}: {str(e)}")
         return False
-        # Surveillance Twitter/X avec polling ajusté (Corrigée pour gérer le quota)
+        # Surveillance Twitter/X avec polling ajusté (Corrigée pour gérer le quota plus strictement)
 async def monitor_twitter(chat_id):
     global last_twitter_call
     logger.info("Surveillance Twitter/X en cours...")
     bot.send_message(chat_id, "📡 Début surveillance Twitter...")
     rate_limit_remaining = 500  # Valeur initiale par défaut
     reset_time = time.time() + 900  # Estimation par défaut (15 min)
-    base_delay = 900 / 500  # 500 requêtes par 15 min = 1.8s par requête
+    base_delay = 2.5  # Augmenté à 2.5s pour réduire la fréquence (360 requêtes max/15 min)
 
     # Vérification initiale du quota avec gestion robuste
     max_initial_retries = 5
@@ -293,7 +293,7 @@ async def monitor_twitter(chat_id):
             bot.send_message(chat_id, f'⚠️ Échec vérification quota Twitter (tentative {retry_count + 1}/{max_initial_retries}): {str(e)}')
             retry_count += 1
             if retry_count < max_initial_retries:
-                await asyncio.sleep(60)  # Attente courte avant réessai
+                await asyncio.sleep(60)
             else:
                 logger.error("Échec définitif de la vérification initiale Twitter.")
                 bot.send_message(chat_id, "❌ Surveillance Twitter abandonnée après échecs répétés.")
@@ -303,13 +303,21 @@ async def monitor_twitter(chat_id):
         current_time = time.time()
         time_to_reset = reset_time - current_time
         if time_to_reset <= 0:
-            rate_limit_remaining = 500  # Réinitialisation supposée après 15 min
+            rate_limit_remaining = 500
             reset_time = current_time + 900
-        delay = max(base_delay, time_to_reset / max(1, rate_limit_remaining))  # Ajustement dynamique
+        delay = max(base_delay, time_to_reset / max(1, rate_limit_remaining))
         if current_time - last_twitter_call < delay:
             await asyncio.sleep(delay - (current_time - last_twitter_call))
         
         try:
+            # Vérification explicite du quota avant l'appel principal
+            if rate_limit_remaining <= 0:
+                wait_time = reset_time - time.time() + 10
+                logger.warning(f"Quota Twitter épuisé, attente de {wait_time} secondes")
+                bot.send_message(chat_id, f"⚠️ Quota Twitter épuisé, pause de {wait_time} s...")
+                await asyncio.sleep(wait_time)
+                continue
+
             query_kanye = "from:kanyewest memecoin OR token OR launch OR \"contract address\" OR CA"
             response = session.get(
                 f"https://api.twitter.com/2/tweets/search/recent?query={query_kanye}&max_results=10",
@@ -350,9 +358,9 @@ async def monitor_twitter(chat_id):
         except Exception as e:
             logger.error(f"Erreur surveillance Twitter: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur surveillance Twitter: {str(e)}')
-            await asyncio.sleep(min(900, delay * 2))  # Backoff exponentiel limité
+            await asyncio.sleep(min(900, delay * 2))
 
-# Vérification des tokens détectés via Twitter (Corrigée pour totalSupply)
+# Vérification des tokens détectés via Twitter
 def check_twitter_token(chat_id, token_address):
     try:
         if token_address.startswith("0x"):  # BSC
@@ -487,8 +495,8 @@ async def get_real_tx_per_min_solana(token_address):
                     return 0
         return 0
 
-# Détection des nouveaux tokens BSC (Corrigée pour totalSupply)
-def detect_new_tokens_bsc(chat_id):
+# Détection des nouveaux tokens BSC (Corrigée pour gérer les erreurs BSCScan)
+async def detect_new_tokens_bsc(chat_id):
     global loose_mode_bsc, last_valid_token_time
     bot.send_message(chat_id, "🔍 Début détection BSC...")
     try:
@@ -530,17 +538,21 @@ def detect_new_tokens_bsc(chat_id):
                 rejected_count += 1
                 continue
             
+            # Remplacement de tokenbalance par tokentx pour vérifier l'activité récente
             volume_response = session.get(
-                f"https://api.bscscan.com/api?module=stats&action=tokenbalance&contractaddress={token_address}&address={pair}&tag=latest&apikey={BSC_SCAN_API_KEY}",
+                f"https://api.bscscan.com/api?module=account&action=tokentx&contractaddress={token_address}&page=1&offset=10&sort=desc&apikey={BSC_SCAN_API_KEY}",
                 timeout=10
             )
             volume_data = volume_response.json()
             if volume_data['status'] != '1':
                 rejection_reasons.append(f"{token_address}: erreur BSCScan - {volume_data.get('message', 'Unknown')}")
                 rejected_count += 1
+                await asyncio.sleep(0.2)  # Délai pour respecter le taux de 5 req/s
                 continue
             
-            volume_24h = float(volume_data['result']) / 10**18
+            # Calcul approximatif du volume basé sur les 10 dernières transactions
+            txs = volume_data['result']
+            volume_24h = sum(int(tx['value']) / 10**18 for tx in txs if int(tx['timeStamp']) > time.time() - 86400) if txs else 0
             liquidity = volume_24h * 0.5
             market_cap = volume_24h * supply
             tx_per_min = get_real_tx_per_min_bsc(token_address)
@@ -589,6 +601,8 @@ def detect_new_tokens_bsc(chat_id):
             valid_token_found = True
             last_valid_token_time = time.time()
             loose_mode_bsc = False
+            
+            await asyncio.sleep(0.2)  # Délai pour éviter de dépasser le quota BSCScan
         
         if not valid_token_found:
             bot.send_message(chat_id, f'⚠️ Aucun token BSC ne correspond aux critères ({rejected_count} rejetés).')
@@ -620,7 +634,7 @@ async def test_solana_websocket(chat_id):
     logger.warning("Échec de tous les endpoints WebSocket Solana. Vérifiez SOLANA_RPC_WS et la connectivité.")
     return None
 
-# Détection des nouveaux tokens Solana avec QuickNode et retry (Corrigée)
+# Détection des nouveaux tokens Solana avec QuickNode et retry (Corrigée avec logs supplémentaires)
 async def detect_new_tokens_solana(chat_id):
     bot.send_message(chat_id, "🔍 Début détection Solana via QuickNode...")
     active_ws_url = await test_solana_websocket(chat_id)
@@ -642,6 +656,7 @@ async def detect_new_tokens_solana(chat_id):
                     while trade_active:
                         message = await asyncio.wait_for(websocket.recv(), timeout=60)
                         data = json.loads(message)
+                        logger.debug(f"Message WebSocket reçu : {data}")
                         if 'params' in data and 'result' in data['params']:
                             logs = data['params']['result']['value']['logs']
                             token_address = None
@@ -656,6 +671,8 @@ async def detect_new_tokens_solana(chat_id):
                                 bot.send_message(chat_id, f'🆕 Nouveau pool détecté sur Raydium : {token_address}')
                                 await check_solana_token(chat_id, token_address)
                                 break
+                            else:
+                                logger.info("Aucun nouveau token détecté dans ce message WebSocket")
             except Exception as e:
                 logger.error(f"Erreur détection Solana (tentative {attempt + 1}/{max_retries}): {str(e)}")
                 bot.send_message(chat_id, f'⚠️ Erreur détection Solana (tentative {attempt + 1}/{max_retries}): {str(e)}')
@@ -664,7 +681,7 @@ async def detect_new_tokens_solana(chat_id):
                 else:
                     bot.send_message(chat_id, "⚠️ Échec WebSocket Solana, tentative via HTTP...")
     
-    # Fallback HTTP via Birdeye si WebSocket échoue (Corrigé pour filtrer les nouveaux tokens)
+    # Fallback HTTP via Birdeye (Assoupli pour tester la détection)
     if not active_ws_url or not trade_active:
         try:
             response = session.get(
@@ -681,17 +698,20 @@ async def detect_new_tokens_solana(chat_id):
             for token in tokens:
                 token_address = token['address']
                 if token_address not in detected_tokens:
-                    # Vérifier si le token est récent (par exemple, volume ou liquidité significative)
                     response = session.get(
                         f"https://public-api.birdeye.so/public/token_overview?address={token_address}",
                         headers=BIRDEYE_HEADERS,
                         timeout=10
                     )
                     data = response.json()['data']
-                    if data.get('v24hUSD', 0) > MIN_VOLUME_SOL:
-                        bot.send_message(chat_id, f'🆕 Token Solana détecté via Birdeye : {token_address}')
+                    volume_24h = float(data.get('v24hUSD', 0))
+                    # Assouplir temporairement pour tester (seuil réduit)
+                    if volume_24h > MIN_VOLUME_SOL / 2:  # Réduit de 25000 à 12500
+                        bot.send_message(chat_id, f'🆕 Token Solana détecté via Birdeye : {token_address} (Vol: ${volume_24h:.2f})')
                         await check_solana_token(chat_id, token_address)
                         break
+                    else:
+                        logger.info(f"Token {token_address} rejeté via Birdeye, volume insuffisant: ${volume_24h:.2f}")
         except Exception as e:
             logger.error(f"Erreur détection HTTP Solana via Birdeye: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur détection HTTP Solana: {str(e)}')
@@ -791,7 +811,7 @@ def show_main_menu(chat_id):
         logger.error(f"Erreur dans show_main_menu: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur affichage menu: {str(e)}')
 
-# Gestion des callbacks (Corrigée pour lancer trading_cycle avec asyncio.run dans un thread séparé)
+# Gestion des callbacks
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
     global mise_depart_bsc, mise_depart_sol, trade_active, slippage, gas_fee, stop_loss_threshold, take_profit_steps
@@ -816,7 +836,6 @@ def callback_query(call):
                 trade_active = True
                 bot.send_message(chat_id, "▶️ Trading lancé avec succès!")
                 logger.info("Lancement du trading cycle...")
-                # Lancer trading_cycle dans un thread séparé pour éviter de bloquer Flask
                 import threading
                 threading.Thread(target=lambda: asyncio.run(trading_cycle(chat_id)), daemon=True).start()
             else:
@@ -904,7 +923,7 @@ async def trading_cycle(chat_id):
         bot.send_message(chat_id, f'🔍 Début du cycle de détection #{cycle_count}...')
         logger.info(f"Cycle {cycle_count} démarré")
         try:
-            detect_new_tokens_bsc(chat_id)
+            await detect_new_tokens_bsc(chat_id)  # Changé en await pour compatibilité asyncio
             bot.send_message(chat_id, "📡 Surveillance Solana en cours via QuickNode (WebSocket)...")
             bot.send_message(chat_id, "⏳ Attente de 10 secondes avant le prochain cycle...")
             await asyncio.sleep(10)
@@ -1416,7 +1435,7 @@ def get_solana_balance(wallet_address):
         logger.error(f"Erreur solde Solana: {str(e)}")
         return 0
 
-# Market cap en temps réel (Corrigée avec ERC20_ABI)
+# Market cap en temps réel
 def get_current_market_cap(contract_address):
     try:
         if contract_address in portfolio and portfolio[contract_address]['chain'] == 'solana':
@@ -1479,13 +1498,13 @@ def sell_token_immediate(chat_id, token):
         logger.error(f"Erreur vente immédiate: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vente immédiate {token}: {str(e)}')
 
-# Configuration du webhook (Corrigée pour Cloud Run : suppression du polling)
+# Configuration du webhook
 def set_webhook():
     logger.info("Configuration du webhook...")
     try:
         if WEBHOOK_URL:
             bot.remove_webhook()
-            time.sleep(1)  # Délai pour éviter les conflits
+            time.sleep(1)
             bot.set_webhook(url=WEBHOOK_URL)
             logger.info(f"Webhook configuré avec succès sur {WEBHOOK_URL}")
         else:
@@ -1499,7 +1518,7 @@ def set_webhook():
 if __name__ == "__main__":
     logger.info("Démarrage du bot...")
     try:
-        set_webhook()  # Configurer le webhook avant de lancer Flask
+        set_webhook()
         logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
         app.run(host="0.0.0.0", port=PORT, debug=False)
     except Exception as e:
