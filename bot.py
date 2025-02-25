@@ -151,10 +151,10 @@ def get_real_tx_per_min_bsc(token_address):
     try:
         latest_block = w3.eth.block_number
         tx_count = 0
-        for block_num in range(latest_block - 50, latest_block + 1):  # Analyse 50 blocs (~2.5 min)
+        for block_num in range(max(latest_block - 10, 0), latest_block + 1):  # Réduit à 10 blocs (~30s)
             block = w3.eth.get_block(block_num, full_transactions=True)
             tx_count += sum(1 for tx in block['transactions'] if tx['to'] == token_address or tx['from'] == token_address)
-        return tx_count / 2.5  # Normalisation pour 1 min (50 blocs ~ 2.5 min)
+        return tx_count * 2  # Normalisation pour 1 min (10 blocs ~ 30s, x2 pour 60s)
     except Exception as e:
         logger.error(f"Erreur calcul tx/min BSC pour {token_address}: {str(e)}")
         return 0
@@ -313,8 +313,8 @@ async def check_bsc_token(chat_id, token_address, loose_mode):
         min_liquidity = MIN_LIQUIDITY * 0.5 if loose_mode else MIN_LIQUIDITY
         min_market_cap = MIN_MARKET_CAP_BSC * 0.5 if loose_mode else MIN_MARKET_CAP_BSC
         max_market_cap = MAX_MARKET_CAP_BSC if loose_mode else MAX_MARKET_CAP_BSC
-        min_tx = MIN_TX_PER_MIN_BSC  # Non assoupli
-        max_tx = MAX_TX_PER_MIN_BSC  # Non assoupli
+        min_tx = MIN_TX_PER_MIN_BSC
+        max_tx = MAX_TX_PER_MIN_BSC
 
         if not (min_tx <= tx_per_min <= max_tx):
             logger.info(f"{token_address}: tx/min {tx_per_min} hors plage [{min_tx}, {max_tx}]")
@@ -493,8 +493,7 @@ def callback_query(call):
                 trade_active = True
                 bot.send_message(chat_id, "▶️ Trading lancé avec succès!")
                 logger.info("Lancement du trading cycle...")
-                import threading
-                threading.Thread(target=lambda: asyncio.run(trading_cycle(chat_id)), daemon=True).start()
+                asyncio.ensure_future(trading_cycle(chat_id))  # Exécuté sans bloquer Flask
             else:
                 bot.send_message(chat_id, "⚠️ Trading déjà en cours.")
         elif call.data == "stop":
@@ -1134,3 +1133,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Erreur critique au démarrage: {str(e)}")
         raise
+        
