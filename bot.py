@@ -13,13 +13,11 @@ from web3 import Web3
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import Transaction
-from solders.system_program import TransferParams, transfer
-from solders.signature import Signature
 from solders.instruction import Instruction
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import websockets
 import asyncio
+import threading
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -45,7 +43,6 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-SOLANA_RPC_WS = "wss://responsive-shy-wish.solana-mainnet.quiknode.pro/65cdde904eae4ea04d77052221eb618010d51ec5"
 
 BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
 TWITTER_HEADERS = {"Authorization": f"Bearer {os.getenv('TWITTER_BEARER_TOKEN')}"}
@@ -99,7 +96,6 @@ MAX_MARKET_CAP_SOL = 1500000
 MIN_MARKET_CAP_BSC = 75000
 MAX_MARKET_CAP_BSC = 3000000
 MAX_TAX = 10
-MAX_HOLDER_PCT = 30
 MIN_TX_PER_MIN_BSC = 5
 MAX_TX_PER_MIN_BSC = 75
 MIN_TX_PER_MIN_SOL = 15
@@ -111,22 +107,14 @@ def is_safe_token_bsc(token_address):
     try:
         response = session.get(f"https://api.honeypot.is/v2/IsHoneypot?address={token_address}", timeout=10)
         data = response.json()
-        return (
-            not data.get("isHoneypot", True) and
-            data.get("buyTax", 0) <= MAX_TAX and
-            data.get("sellTax", 0) <= MAX_TAX
-        )
+        return not data.get("isHoneypot", True) and data.get("buyTax", 0) <= MAX_TAX and data.get("sellTax", 0) <= MAX_TAX
     except Exception as e:
         logger.error(f"Erreur vérification Honeypot: {str(e)}")
         return False
 
 def is_safe_token_solana(token_address):
     try:
-        response = session.get(
-            f"https://public-api.birdeye.so/public/token_overview?address={token_address}",
-            headers=BIRDEYE_HEADERS,
-            timeout=10
-        )
+        response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
         data = response.json()['data']
         return data.get('liquidity', 0) >= MIN_LIQUIDITY
     except Exception as e:
@@ -151,10 +139,10 @@ def get_real_tx_per_min_bsc(token_address):
     try:
         latest_block = w3.eth.block_number
         tx_count = 0
-        for block_num in range(max(latest_block - 10, 0), latest_block + 1):  # Réduit à 10 blocs (~30s)
+        for block_num in range(max(latest_block - 10, 0), latest_block + 1):
             block = w3.eth.get_block(block_num, full_transactions=True)
             tx_count += sum(1 for tx in block['transactions'] if tx['to'] == token_address or tx['from'] == token_address)
-        return tx_count * 2  # Normalisation pour 1 min (10 blocs ~ 30s, x2 pour 60s)
+        return tx_count * 2  # Normalisation pour 1 min (10 blocs ~ 30s)
     except Exception as e:
         logger.error(f"Erreur calcul tx/min BSC pour {token_address}: {str(e)}")
         return 0
@@ -195,10 +183,7 @@ def check_twitter_token(chat_id, token_address):
             buy_token_bsc(chat_id, token_address, mise_depart_bsc)
             return True
         else:
-            response = session.get(
-                f"https://public-api.birdeye.so/public/token_overview?address={token_address}",
-                headers=BIRDEYE_HEADERS, timeout=10
-            )
+            response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
             data = response.json()['data']
             volume_24h = float(data.get('v24hUSD', 0))
             liquidity = float(data.get('liquidity', 0))
@@ -230,10 +215,7 @@ def check_twitter_token(chat_id, token_address):
 
 async def get_real_tx_per_min_solana(token_address):
     try:
-        response = session.get(
-            f"https://public-api.birdeye.so/public/history_trades?address={token_address}&offset=0&limit=50",
-            headers=BIRDEYE_HEADERS, timeout=10
-        )
+        response = session.get(f"https://public-api.birdeye.so/public/history_trades?address={token_address}&offset=0&limit=50", headers=BIRDEYE_HEADERS, timeout=10)
         trades = response.json()['data']['items']
         if not trades:
             logger.warning(f"Aucune transaction récente via Birdeye pour {token_address}")
@@ -348,10 +330,7 @@ async def check_bsc_token(chat_id, token_address, loose_mode):
 async def detect_new_tokens_solana(chat_id):
     bot.send_message(chat_id, "🔍 Début détection Solana via Birdeye...")
     try:
-        response = session.get(
-            "https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=10",
-            headers=BIRDEYE_HEADERS, timeout=10
-        )
+        response = session.get("https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=10", headers=BIRDEYE_HEADERS, timeout=10)
         response.raise_for_status()
         json_response = response.json()
         logger.info(f"Réponse Birdeye : {json_response}")
@@ -361,10 +340,7 @@ async def detect_new_tokens_solana(chat_id):
         for token in tokens:
             token_address = token['address']
             if token_address not in detected_tokens:
-                response = session.get(
-                    f"https://public-api.birdeye.so/public/token_overview?address={token_address}",
-                    headers=BIRDEYE_HEADERS, timeout=10
-                )
+                response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
                 data = response.json()['data']
                 volume_24h = float(data.get('v24hUSD', 0))
                 if volume_24h > MIN_VOLUME_SOL:
@@ -379,10 +355,7 @@ async def detect_new_tokens_solana(chat_id):
 
 async def check_solana_token(chat_id, token_address):
     try:
-        response = session.get(
-            f"https://public-api.birdeye.so/public/token_overview?address={token_address}",
-            headers=BIRDEYE_HEADERS, timeout=10
-        )
+        response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
         data = response.json()['data']
         volume_24h = float(data.get('v24hUSD', 0))
         liquidity = float(data.get('liquidity', 0))
@@ -479,12 +452,9 @@ def callback_query(call):
     try:
         if call.data == "status":
             bot.send_message(chat_id, (
-                f"ℹ️ Statut actuel :\n"
-                f"Trading actif: {'Oui' if trade_active else 'Non'}\n"
-                f"Mise BSC: {mise_depart_bsc} BNB\n"
-                f"Mise Solana: {mise_depart_sol} SOL\n"
-                f"Slippage: {slippage} %\n"
-                f"Gas Fee: {gas_fee} Gwei"
+                f"ℹ️ Statut actuel :\nTrading actif: {'Oui' if trade_active else 'Non'}\n"
+                f"Mise BSC: {mise_depart_bsc} BNB\nMise Solana: {mise_depart_sol} SOL\n"
+                f"Slippage: {slippage} %\nGas Fee: {gas_fee} Gwei"
             ))
         elif call.data == "config":
             show_config_menu(chat_id)
@@ -493,7 +463,7 @@ def callback_query(call):
                 trade_active = True
                 bot.send_message(chat_id, "▶️ Trading lancé avec succès!")
                 logger.info("Lancement du trading cycle...")
-                asyncio.ensure_future(trading_cycle(chat_id))  # Exécuté sans bloquer Flask
+                threading.Thread(target=lambda: asyncio.run(trading_cycle(chat_id)), daemon=True).start()
             else:
                 bot.send_message(chat_id, "⚠️ Trading déjà en cours.")
         elif call.data == "stop":
@@ -578,10 +548,7 @@ async def trading_cycle(chat_id):
         bot.send_message(chat_id, f'🔍 Début du cycle de détection #{cycle_count}...')
         logger.info(f"Cycle {cycle_count} démarré")
         try:
-            await asyncio.gather(
-                detect_new_tokens_bsc(chat_id),
-                detect_new_tokens_solana(chat_id)
-            )
+            await asyncio.gather(detect_new_tokens_bsc(chat_id), detect_new_tokens_solana(chat_id))
             await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"Erreur dans trading_cycle: {str(e)}")
@@ -651,12 +618,10 @@ def show_threshold_menu(chat_id):
     )
     try:
         bot.send_message(chat_id, (
-            f'📊 Seuils de détection :\n'
-            f'- BSC Volume: {MIN_VOLUME_BSC} $ - {MAX_VOLUME_BSC} $\n'
+            f'📊 Seuils de détection :\n- BSC Volume: {MIN_VOLUME_BSC} $ - {MAX_VOLUME_BSC} $\n'
             f'- BSC Tx/min : {MIN_TX_PER_MIN_BSC} - {MAX_TX_PER_MIN_BSC}\n'
             f'- BSC Market Cap : {MIN_MARKET_CAP_BSC} $ - {MAX_MARKET_CAP_BSC} $\n'
-            f'- Min Liquidité : {MIN_LIQUIDITY} $\n'
-            f'- Solana Volume: {MIN_VOLUME_SOL} $ - {MAX_VOLUME_SOL} $\n'
+            f'- Min Liquidité : {MIN_LIQUIDITY} $\n- Solana Volume: {MIN_VOLUME_SOL} $ - {MAX_VOLUME_SOL} $\n'
             f'- Solana Tx/min : {MIN_TX_PER_MIN_SOL} - {MAX_TX_PER_MIN_SOL}\n'
             f'- Solana Market Cap : {MIN_MARKET_CAP_SOL} $ - {MAX_MARKET_CAP_SOL} $'
         ), reply_markup=markup)
@@ -1058,10 +1023,7 @@ def get_solana_balance(wallet_address):
 def get_current_market_cap(contract_address):
     try:
         if contract_address in portfolio and portfolio[contract_address]['chain'] == 'solana':
-            response = session.get(
-                f"https://public-api.birdeye.so/public/price?address={contract_address}",
-                headers=BIRDEYE_HEADERS, timeout=10
-            )
+            response = session.get(f"https://public-api.birdeye.so/public/price?address={contract_address}", headers=BIRDEYE_HEADERS, timeout=10)
             price = response.json()['data']['value']
             supply = detected_tokens[contract_address]['supply']
             return price * supply
