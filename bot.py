@@ -103,7 +103,7 @@ logger.info("Connexion BSC réussie via QuickNode.")
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
 
-PANCAKE_FACTORY_ABI = json.loads('''
+PANCAKE_FACTORY_ABI = [json.loads('''
 {
     "anonymous": false,
     "inputs": [
@@ -115,7 +115,7 @@ PANCAKE_FACTORY_ABI = json.loads('''
     "name": "PairCreated",
     "type": "event"
 }
-''')
+''')]
 
 PANCAKE_ROUTER_ABI = json.loads('''
 [
@@ -232,11 +232,38 @@ async def monitor_twitter(chat_id):
     logger.info("Surveillance Twitter/X en cours...")
     bot.send_message(chat_id, "📡 Début surveillance Twitter...")
     rate_limit_remaining = 500  # Valeur initiale par défaut
+    reset_time = time.time() + 900  # Estimation par défaut
+    base_delay = 240  # Augmenté à 4 minutes (15 req / 15 min = 1 req toutes les 60s, mais plus prudent)
+
+    # Vérification initiale du quota
+    try:
+        response = session.get(
+            "https://api.twitter.com/2/tweets/search/recent?query=from:kanyewest&max_results=10",
+            headers=TWITTER_HEADERS,
+            timeout=10
+        )
+        if response.status_code == 429:
+            retry_after = int(response.headers.get('Retry-After', 900))
+            logger.warning(f"Quota Twitter épuisé au démarrage, attente de {retry_after} secondes")
+            bot.send_message(chat_id, f"⚠️ Quota Twitter épuisé au démarrage, pause de {retry_after} s...")
+            await asyncio.sleep(retry_after)
+            return
+        response.raise_for_status()
+        rate_limit_remaining = int(response.headers.get("x-rate-limit-remaining", 500))
+        reset_time = int(response.headers.get("x-rate-limit-reset", time.time() + 900))
+        logger.info(f"Quota initial Twitter : {rate_limit_remaining} requêtes restantes, reset à {time.ctime(reset_time)}")
+    except Exception as e:
+        logger.error(f"Erreur vérification initiale Twitter: {str(e)}")
+        bot.send_message(chat_id, f'⚠️ Échec vérification quota Twitter: {str(e)}')
+        await asyncio.sleep(900)
+        return
+
     while trade_active:
         current_time = time.time()
-        delay = max(120, (15 * 60) / 15)  # Minimum 120s ou ajusté pour 15 req/15min
+        delay = max(base_delay, (reset_time - current_time + 10) / max(1, rate_limit_remaining))  # Délai dynamique
         if current_time - last_twitter_call < delay:
             await asyncio.sleep(delay - (current_time - last_twitter_call))
+        
         try:
             query_kanye = "from:kanyewest memecoin OR token OR launch OR \"contract address\" OR CA"
             response = session.get(
@@ -258,7 +285,7 @@ async def monitor_twitter(chat_id):
             logger.info(f"Requêtes Twitter restantes : {rate_limit_remaining}, reset à {time.ctime(reset_time)}")
             
             if rate_limit_remaining < 5:
-                wait_time = max(120, reset_time - time.time() + 10)  # +10s pour sécurité
+                wait_time = max(base_delay, reset_time - time.time() + 10)
                 bot.send_message(chat_id, f"⚠️ Peu de requêtes restantes ({rate_limit_remaining}), pause de {wait_time}s...")
                 await asyncio.sleep(wait_time)
             
@@ -278,7 +305,7 @@ async def monitor_twitter(chat_id):
         except Exception as e:
             logger.error(f"Erreur surveillance Twitter: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur surveillance Twitter: {str(e)}')
-            await asyncio.sleep(900)  # Attente longue en cas d’erreur inattendue
+            await asyncio.sleep(min(900, delay * 2))  # Backoff exponentiel limité à 15 min
 
 # Vérification des tokens détectés via Twitter
 def check_twitter_token(chat_id, token_address):
