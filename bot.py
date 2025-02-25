@@ -91,10 +91,10 @@ MAX_TX_PER_MIN_BSC = 75
 MIN_TX_PER_MIN_SOL = 15
 MAX_TX_PER_MIN_SOL = 150
 
-# Nouvelles variables ajoutées pour les améliorations
-momentum_threshold = 100  # Seuil de tx/min pour détecter un gros pump
-simulation_mode = False   # Mode simulation désactivé par défaut
-BSC_WS_URI = "wss://bsc-ws-node.nariox.org:443"  # WebSocket public gratuit
+# Nouvelles variables pour les améliorations
+momentum_threshold = 100
+simulation_mode = False
+BSC_WS_URI = "wss://bsc-ws-node.nariox.org:443"
 
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
@@ -116,7 +116,6 @@ def initialize_bot():
         if not w3.is_connected():
             raise ConnectionError("Connexion BSC échouée")
         logger.info("Connexion BSC réussie.")
-
         solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
         logger.info("Clé Solana initialisée.")
     except Exception as e:
@@ -162,7 +161,7 @@ def get_real_tx_per_min_bsc(token_address):
         for block_num in range(max(latest_block - 10, 0), latest_block + 1):
             block = w3.eth.get_block(block_num, full_transactions=True)
             tx_count += sum(1 for tx in block['transactions'] if tx['to'] == token_address or tx['from'] == token_address)
-        return tx_count * 2  # Normalisation pour 1 min (10 blocs ~ 30s)
+        return tx_count * 2
     except Exception as e:
         logger.error(f"Erreur calcul tx/min BSC pour {token_address}: {str(e)}")
         return 0
@@ -1184,11 +1183,11 @@ async def monitor_twitter_free(chat_id):
     while trade_active:
         try:
             current_time = time.time()
-            if current_time - last_twitter_call < 15:  # Respecter limite de 100 req/24h (~1 req toutes les 15min)
+            if current_time - last_twitter_call < 15:
                 await asyncio.sleep(15 - (current_time - last_twitter_call))
             url = "https://api.twitter.com/2/tweets/search/recent"
             params = {
-                "query": "(0x OR So OR CA) -is:retweet has:mentions",  # Recherche adresses ou "CA", pas de retweets
+                "query": "(0x OR So OR CA) -is:retweet has:mentions",
                 "max_results": 10,
                 "tweet.fields": "created_at,author_id",
                 "user.fields": "public_metrics",
@@ -1210,14 +1209,14 @@ async def monitor_twitter_free(chat_id):
                 author = users.get(author_id, {})
                 followers = author.get("public_metrics", {}).get("followers_count", 0)
                 
-                if followers > 10000:  # Filtrer les comptes influents (>10k followers)
+                if followers > 10000:
                     text = tweet["text"]
                     potential_addresses = [word for word in text.split() if word.startswith("0x") or word.startswith("So") or (len(word) > 20 and "CA" in text.upper())]
                     for addr in potential_addresses:
                         if await check_twitter_token(chat_id, addr):
                             logger.info(f"Token détecté via Twitter par @{author.get('username', 'inconnu')} ({followers} followers) : {addr}")
                             bot.send_message(chat_id, f"📢 @{author.get('username', 'inconnu')} ({followers} followers) a mentionné {addr}")
-            await asyncio.sleep(300)  # Pause de 5min entre requêtes
+            await asyncio.sleep(300)
         except Exception as e:
             logger.error(f"Erreur Twitter gratuit : {str(e)}")
             bot.send_message(chat_id, f"⚠️ Erreur Twitter : {str(e)}")
@@ -1277,7 +1276,7 @@ async def monitor_trending_free(chat_id):
                 for addr in potential_addresses:
                     if await check_twitter_token(chat_id, addr):
                         logger.info(f"Token trending détecté : {addr}")
-            await asyncio.sleep(600)  # Pause de 10min
+            await asyncio.sleep(600)
         except Exception as e:
             logger.error(f"Erreur trending X : {str(e)}")
             bot.send_message(chat_id, f"⚠️ Erreur trending X : {str(e)}")
@@ -1285,23 +1284,14 @@ async def monitor_trending_free(chat_id):
 
 def set_webhook():
     logger.info("Configuration du webhook...")
-    try:
-        bot.remove_webhook()
-        time.sleep(1)
-        bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
-    except Exception as e:
-        logger.error(f"Erreur configuration webhook: {str(e)}")
-        raise
-
-def run_bot():
-    logger.info("Démarrage du bot...")
-    initialize_bot()
-    set_webhook()
-    logger.info("Bot initialisé et webhook configuré.")
+    bot.remove_webhook()
+    time.sleep(1)
+    bot.set_webhook(url=WEBHOOK_URL)
+    logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
 
 if __name__ == "__main__":
-    logger.info("Démarrage principal...")
-    run_bot()  # Initialisation du bot et configuration du webhook
+    logger.info("Démarrage de l'application...")
+    initialize_bot()  # Initialisation synchrone avant tout
+    set_webhook()     # Configuration du webhook avant le lancement de Flask
     logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
-    app.run(host="0.0.0.0", port=PORT, debug=False)  # Lancement de Flask sur le port spécifié
+    app.run(host="0.0.0.0", port=PORT, debug=False)  # Lancement direct de Flask
