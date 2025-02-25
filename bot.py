@@ -148,8 +148,8 @@ PANCAKE_ROUTER_ABI = json.loads('''
 ]
 ''')
 
-# Solana Keypair
-solana_keypair = Keypair.from_base58(SOLANA_PRIVATE_KEY)
+# Solana Keypair (corrigé pour solders 0.21.0)
+solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
@@ -1433,3 +1433,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Erreur critique au démarrage: {str(e)}")
         raise
+        
