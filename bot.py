@@ -19,9 +19,11 @@ from urllib3.util.retry import Retry
 import asyncio
 import threading
 
+# Configuration des logs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Variables globales
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124", "Accept": "application/json"}
 session = requests.Session()
 session.headers.update(HEADERS)
@@ -33,6 +35,7 @@ last_twitter_call = 0
 loose_mode_bsc = False
 last_valid_token_time = time.time()
 
+# Variables d’environnement
 logger.info("Chargement des variables d’environnement...")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
@@ -56,24 +59,11 @@ if missing_vars:
     raise ValueError(f"Variables manquantes: {missing_vars}")
 logger.info("Variables chargées.")
 
+# Initialisation de Flask et Telegram
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
-logger.info("Initialisation connexion BSC...")
-w3 = Web3(Web3.HTTPProvider(BSC_RPC))
-if not w3.is_connected():
-    raise ConnectionError("Connexion BSC échouée")
-logger.info("Connexion BSC réussie.")
-PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
-PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
-
-PANCAKE_FACTORY_ABI = [json.loads('{"anonymous": false, "inputs": [{"indexed": true, "internalType": "address", "name": "token0", "type": "address"}, {"indexed": true, "internalType": "address", "name": "token1", "type": "address"}, {"indexed": false, "internalType": "address", "name": "pair", "type": "address"}, {"indexed": false, "internalType": "uint256", "name": "type", "type": "uint256"}], "name": "PairCreated", "type": "event"}')]
-PANCAKE_ROUTER_ABI = json.loads('[{"inputs": [{"internalType": "uint256", "name": "amountIn", "type": "uint256"}, {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactETHForTokens", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "payable", "type": "function"}, {"inputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}, {"internalType": "uint256", "name": "amountInMax", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactTokensForETH", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "nonpayable", "type": "function"}]')
-
-solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
-RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
-TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-
+# Variables globales pour le trading
 mise_depart_bsc = 0.02
 mise_depart_sol = 0.37
 slippage = 5
@@ -102,6 +92,31 @@ MIN_TX_PER_MIN_SOL = 15
 MAX_TX_PER_MIN_SOL = 150
 
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
+PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
+PANCAKE_FACTORY_ABI = [json.loads('{"anonymous": false, "inputs": [{"indexed": true, "internalType": "address", "name": "token0", "type": "address"}, {"indexed": true, "internalType": "address", "name": "token1", "type": "address"}, {"indexed": false, "internalType": "address", "name": "pair", "type": "address"}, {"indexed": false, "internalType": "uint256", "name": "type", "type": "uint256"}], "name": "PairCreated", "type": "event"}')]
+PANCAKE_ROUTER_ABI = json.loads('[{"inputs": [{"internalType": "uint256", "name": "amountIn", "type": "uint256"}, {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactETHForTokens", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "payable", "type": "function"}, {"inputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}, {"internalType": "uint256", "name": "amountInMax", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactTokensForETH", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "nonpayable", "type": "function"}]')
+
+# Initialisations différées
+w3 = None
+solana_keypair = None
+RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
+TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+
+def initialize_bot():
+    global w3, solana_keypair
+    logger.info("Initialisation différée du bot...")
+    try:
+        w3 = Web3(Web3.HTTPProvider(BSC_RPC))
+        if not w3.is_connected():
+            raise ConnectionError("Connexion BSC échouée")
+        logger.info("Connexion BSC réussie.")
+
+        solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
+        logger.info("Clé Solana initialisée.")
+    except Exception as e:
+        logger.error(f"Erreur dans l'initialisation différée: {str(e)}")
+        raise
 
 def is_safe_token_bsc(token_address):
     try:
@@ -146,7 +161,8 @@ def get_real_tx_per_min_bsc(token_address):
     except Exception as e:
         logger.error(f"Erreur calcul tx/min BSC pour {token_address}: {str(e)}")
         return 0
-        async def monitor_twitter(chat_id):
+
+async def monitor_twitter(chat_id):
     bot.send_message(chat_id, "⚠️ Surveillance Twitter désactivée (quota API gratuit dépassé).")
     logger.info("Surveillance Twitter désactivée.")
 
@@ -396,7 +412,7 @@ def webhook():
         if request.method == "POST" and request.headers.get("content-type") == "application/json":
             update = telebot.types.Update.de_json(request.get_json())
             bot.process_new_updates([update])
-            logger.info('Update traité avec succès')
+            logger.info("Update traité avec succès")
             return 'OK', 200
         logger.warning("Requête webhook invalide")
         return abort(403)
@@ -1074,25 +1090,22 @@ def sell_token_immediate(chat_id, token):
 def set_webhook():
     logger.info("Configuration du webhook...")
     try:
-        if WEBHOOK_URL:
-            bot.remove_webhook()
-            time.sleep(1)
-            bot.set_webhook(url=WEBHOOK_URL)
-            logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
-        else:
-            logger.error("WEBHOOK_URL non défini")
-            raise ValueError("WEBHOOK_URL requis pour Cloud Run")
+        bot.remove_webhook()
+        time.sleep(1)
+        bot.set_webhook(url=WEBHOOK_URL)
+        logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
         raise
 
+def run_bot():
+    logger.info("Démarrage du bot dans un thread séparé...")
+    initialize_bot()
+    set_webhook()
+
 if __name__ == "__main__":
-    logger.info("Démarrage du bot...")
-    try:
-        set_webhook()
-        logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
-        app.run(host="0.0.0.0", port=PORT, debug=False)
-    except Exception as e:
-        logger.error(f"Erreur critique au démarrage: {str(e)}")
-        raise
-        
+    logger.info("Démarrage principal...")
+    # Lancer Flask immédiatement dans le thread principal
+    threading.Thread(target=run_bot, daemon=True).start()
+    logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
