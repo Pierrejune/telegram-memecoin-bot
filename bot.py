@@ -43,16 +43,18 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
+TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 
 BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
-TWITTER_HEADERS = {"Authorization": f"Bearer {os.getenv('TWITTER_BEARER_TOKEN')}"}
+TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
 missing_vars = [var for var, val in {
     "TELEGRAM_TOKEN": TELEGRAM_TOKEN, "WALLET_ADDRESS": WALLET_ADDRESS, "PRIVATE_KEY": PRIVATE_KEY,
-    "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "WEBHOOK_URL": WEBHOOK_URL, "BIRDEYE_API_KEY": BIRDEYE_API_KEY
+    "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "WEBHOOK_URL": WEBHOOK_URL, "BIRDEYE_API_KEY": BIRDEYE_API_KEY,
+    "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN
 }.items() if not val]
 if missing_vars:
     logger.critical(f"Variables manquantes: {missing_vars}")
@@ -163,8 +165,47 @@ def get_real_tx_per_min_bsc(token_address):
         return 0
 
 async def monitor_twitter(chat_id):
-    bot.send_message(chat_id, "⚠️ Surveillance Twitter désactivée (quota API gratuit dépassé).")
-    logger.info("Surveillance Twitter désactivée.")
+    global last_twitter_call
+    logger.info("Surveillance Twitter/X activée...")
+    base_delay = 1.8  # 500 req / 15 min = 1 req toutes les 1.8s
+    retry_delay = 60  # Délai initial en cas de 429
+
+    while trade_active:
+        current_time = time.time()
+        if current_time - last_twitter_call < base_delay:
+            await asyncio.sleep(base_delay - (current_time - last_twitter_call))
+        
+        try:
+            query_kanye = "from:kanyewest memecoin OR token OR launch OR \"contract address\" OR CA"
+            response = session.get(
+                f"https://api.twitter.com/2/tweets/search/recent?query={query_kanye}&max_results=10",
+                headers=TWITTER_HEADERS, timeout=10
+            )
+            if response.status_code == 429:
+                logger.warning(f"Quota Twitter atteint, attente de {retry_delay} secondes...")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 900)  # Backoff exponentiel, max 15 min
+                continue
+            
+            response.raise_for_status()
+            retry_delay = 60  # Réinitialiser le délai après succès
+            tweets = response.json().get('data', [])
+            for tweet in tweets:
+                text = tweet['text'].lower()
+                if 'contract address' in text or "ca" in text or "token" in text:
+                    words = text.split()
+                    for word in words:
+                        if (len(word) == 42 and word.startswith("0x")) or len(word) == 44:
+                            if word not in twitter_tokens:
+                                twitter_tokens.append(word)
+                                bot.send_message(chat_id, f'🔍 Token détecté via X (@kanyewest): {word}')
+                                check_twitter_token(chat_id, word)
+            last_twitter_call = time.time()
+            await asyncio.sleep(base_delay)
+        except Exception as e:
+            logger.error(f"Erreur surveillance Twitter: {str(e)}")
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 900)
 
 def check_twitter_token(chat_id, token_address):
     try:
@@ -275,8 +316,8 @@ async def detect_new_tokens_bsc(chat_id):
             if isinstance(result, Exception):
                 rejection_reasons.append(f"{token_addr}: erreur - {str(result)}")
                 rejected_count += 1
-            elif result is False:
-                rejection_reasons.append(f"{token_addr}: critères non remplis")
+            elif isinstance(result, str):
+                rejection_reasons.append(f"{token_addr}: {result}")
                 rejected_count += 1
             elif result:
                 valid_token_found = True
@@ -295,8 +336,7 @@ async def detect_new_tokens_bsc(chat_id):
 async def check_bsc_token(chat_id, token_address, loose_mode):
     try:
         if not is_valid_token_bsc(token_address):
-            logger.info(f"{token_address}: pas de code valide ou totalSupply inaccessible")
-            return False
+            return "pas de code valide ou totalSupply inaccessible"
         token_contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=ERC20_ABI)
         supply = token_contract.functions.totalSupply().call() / 10**18
         response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=10)
@@ -315,20 +355,15 @@ async def check_bsc_token(chat_id, token_address, loose_mode):
         max_tx = MAX_TX_PER_MIN_BSC
 
         if not (min_tx <= tx_per_min <= max_tx):
-            logger.info(f"{token_address}: tx/min {tx_per_min} hors plage [{min_tx}, {max_tx}]")
-            return False
+            return f"tx/min {tx_per_min} hors plage [{min_tx}, {max_tx}]"
         if not (min_volume <= volume_24h <= max_volume):
-            logger.info(f"{token_address}: volume {volume_24h} hors plage [{min_volume}, {max_volume}]")
-            return False
+            return f"volume {volume_24h} hors plage [{min_volume}, {max_volume}]"
         if liquidity < min_liquidity:
-            logger.info(f"{token_address}: liquidité {liquidity} < {min_liquidity}")
-            return False
+            return f"liquidité {liquidity} < {min_liquidity}"
         if not (min_market_cap <= market_cap <= max_market_cap):
-            logger.info(f"{token_address}: market cap {market_cap} hors plage [{min_market_cap}, {max_market_cap}]")
-            return False
+            return f"market cap {market_cap} hors plage [{min_market_cap}, {max_market_cap}]"
         if not is_safe_token_bsc(token_address):
-            logger.info(f"{token_address}: non sécurisé (Honeypot)")
-            return False
+            return "non sécurisé (Honeypot ou taxes élevées)"
         
         bot.send_message(chat_id,
             f'🔍 Token détecté : {token_address} (BSC) - Tx/min: {tx_per_min}, Vol 24h: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}'
@@ -350,21 +385,26 @@ async def detect_new_tokens_solana(chat_id):
         response.raise_for_status()
         json_response = response.json()
         logger.info(f"Réponse Birdeye : {json_response}")
-        if 'data' not in json_response or 'tokens' not in json_response['data']:
-            raise ValueError(f"Réponse Birdeye invalide : {json_response}")
+        if not isinstance(json_response, dict) or 'data' not in json_response or 'tokens' not in json_response['data']:
+            logger.error(f"Réponse Birdeye invalide : {json_response}")
+            raise ValueError(f"Structure de réponse invalide : {json_response}")
         tokens = json_response['data']['tokens']
         for token in tokens:
-            token_address = token['address']
-            if token_address not in detected_tokens:
-                response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-                data = response.json()['data']
-                volume_24h = float(data.get('v24hUSD', 0))
-                if volume_24h > MIN_VOLUME_SOL:
-                    bot.send_message(chat_id, f'🆕 Token Solana détecté via Birdeye : {token_address} (Vol: ${volume_24h:.2f})')
-                    await check_solana_token(chat_id, token_address)
-                    break
-                else:
-                    logger.info(f"Token {token_address} rejeté, volume insuffisant: ${volume_24h:.2f}")
+            token_address = token.get('address')
+            if not token_address or token_address in detected_tokens:
+                continue
+            response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
+            data = response.json().get('data', {})
+            if not data:
+                logger.warning(f"Aucune donnée pour {token_address}")
+                continue
+            volume_24h = float(data.get('v24hUSD', 0))
+            if volume_24h > MIN_VOLUME_SOL:
+                bot.send_message(chat_id, f'🆕 Token Solana détecté via Birdeye : {token_address} (Vol: ${volume_24h:.2f})')
+                await check_solana_token(chat_id, token_address)
+                break
+            else:
+                logger.info(f"Token {token_address} rejeté, volume insuffisant: ${volume_24h:.2f}")
     except Exception as e:
         logger.error(f"Erreur détection Solana via Birdeye: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur détection Solana: {str(e)}')
@@ -372,7 +412,10 @@ async def detect_new_tokens_solana(chat_id):
 async def check_solana_token(chat_id, token_address):
     try:
         response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-        data = response.json()['data']
+        data = response.json().get('data', {})
+        if not data:
+            logger.warning(f"Aucune donnée pour {token_address}")
+            return
         volume_24h = float(data.get('v24hUSD', 0))
         liquidity = float(data.get('liquidity', 0))
         market_cap = float(data.get('mc', 0))
@@ -1105,7 +1148,6 @@ def run_bot():
 
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
-    # Lancer Flask immédiatement dans le thread principal
     threading.Thread(target=run_bot, daemon=True).start()
     logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
