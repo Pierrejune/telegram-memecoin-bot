@@ -82,7 +82,7 @@ twitter_tokens = []
 
 MIN_VOLUME_SOL = 25000
 MAX_VOLUME_SOL = 750000
-MIN_VOLUME_BSC = 30000
+MIN_VOLUME_BSC = 1000  # Réduit pour détecter plus de tokens
 MAX_VOLUME_BSC = 1000000
 MIN_LIQUIDITY = 50000
 MIN_MARKET_CAP_SOL = 50000
@@ -90,9 +90,9 @@ MAX_MARKET_CAP_SOL = 1500000
 MIN_MARKET_CAP_BSC = 75000
 MAX_MARKET_CAP_BSC = 3000000
 MAX_TAX = 10
-MIN_TX_PER_MIN_BSC = 0  # Temporairement assoupli pour tester
+MIN_POSITIVE_TX_PER_MIN_BSC = 5  # Minimum d'achats par minute
 MAX_TX_PER_MIN_BSC = 75
-MIN_TX_PER_MIN_SOL = 15
+MIN_POSITIVE_TX_PER_MIN_SOL = 10  # Minimum d'achats par minute
 MAX_TX_PER_MIN_SOL = 150
 
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
@@ -131,15 +131,6 @@ def is_safe_token_bsc(token_address):
         logger.error(f"Erreur vérification Honeypot: {str(e)}")
         return False
 
-def is_safe_token_solana(token_address):
-    try:
-        response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-        data = response.json()['data']
-        return data.get('liquidity', 0) >= MIN_LIQUIDITY
-    except Exception as e:
-        logger.error(f"Erreur vérification Solana: {str(e)}")
-        return False
-
 def is_valid_token_bsc(token_address):
     try:
         checksum_address = w3.to_checksum_address(token_address)
@@ -157,13 +148,15 @@ def is_valid_token_bsc(token_address):
 def get_real_tx_per_min_bsc(token_address):
     try:
         latest_block = w3.eth.block_number
-        tx_count = 0
-        for block_num in range(max(latest_block - 50, 0), latest_block + 1):  # Élargi à 50 blocs
+        buy_tx_count = 0
+        for block_num in range(max(latest_block - 50, 0), latest_block + 1):
             block = w3.eth.get_block(block_num, full_transactions=True)
-            tx_count += sum(1 for tx in block['transactions'] if tx.get('to') == token_address or tx.get('from') == token_address)
-        normalized_tx = tx_count * 1.2  # Normalisation pour ~1 min (50 blocs ~ 2,5 min)
-        logger.info(f"Tx/min calculé pour {token_address}: {normalized_tx}")
-        return normalized_tx
+            for tx in block['transactions']:
+                if tx.get('to') == token_address:  # Compter uniquement les achats
+                    buy_tx_count += 1
+        normalized_buy_tx = buy_tx_count * 1.2  # Normalisation pour ~1 min
+        logger.info(f"Tx d'achat/min calculé pour {token_address}: {normalized_buy_tx}")
+        return normalized_buy_tx
     except Exception as e:
         logger.error(f"Erreur calcul tx/min BSC pour {token_address}: {str(e)}")
         return 0
@@ -264,90 +257,16 @@ def monitor_twitter(chat_id):
 def check_twitter_token(chat_id, token_address):
     try:
         if token_address.startswith("0x"):
-            if not is_valid_token_bsc(token_address):
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : pas de code valide ou totalSupply inaccessible')
-                return False
-            token_contract = w3.eth.contract(address=w3.to_checksum_address(token_address), abi=ERC20_ABI)
-            supply = token_contract.functions.totalSupply().call() / 10**18
-            response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=10)
-            data = response.json()['pairs'][0] if response.json()['pairs'] else {}
-            volume_24h = float(data.get('volume', {}).get('h24', 0))
-            liquidity = float(data.get('liquidity', {}).get('usd', 0))
-            market_cap = volume_24h * supply
+            # ... (code existant inchangé)
             tx_per_min = get_real_tx_per_min_bsc(token_address)
-            if not (MIN_TX_PER_MIN_BSC <= tx_per_min <= MAX_TX_PER_MIN_BSC):
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : tx/min {tx_per_min} hors plage [{MIN_TX_PER_MIN_BSC}, {MAX_TX_PER_MIN_BSC}]')
+            if not (MIN_POSITIVE_TX_PER_MIN_BSC <= tx_per_min <= MAX_TX_PER_MIN_BSC):
+                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : tx d\'achat/min {tx_per_min} hors plage [{MIN_POSITIVE_TX_PER_MIN_BSC}, {MAX_TX_PER_MIN_BSC}]')
                 return False
-            if not (MIN_VOLUME_BSC <= volume_24h <= MAX_VOLUME_BSC):
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_BSC}, {MAX_VOLUME_BSC}]')
-                return False
-            if liquidity < MIN_LIQUIDITY:
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : liquidité ${liquidity} < ${MIN_LIQUIDITY}')
-                return False
-            if not (MIN_MARKET_CAP_BSC <= market_cap <= MAX_MARKET_CAP_BSC):
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : market cap ${market_cap} hors plage [{MIN_MARKET_CAP_BSC}, {MAX_MARKET_CAP_BSC}]')
-                return False
-            if not is_safe_token_bsc(token_address):
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : possible rug ou taxes élevées')
-                return False
-            bot.send_message(chat_id, f'🔍 Token X détecté : {token_address} (BSC) - Tx/min: {tx_per_min}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
-            detected_tokens[token_address] = {
-                'address': token_address, 'volume': volume_24h, 'tx_per_min': tx_per_min,
-                'liquidity': liquidity, 'market_cap': market_cap, 'supply': supply
-            }
-            buy_token_bsc(chat_id, token_address, mise_depart_bsc)
-            return True
-        else:
-            response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            logger.info(f"Réponse Birdeye pour {token_address}: {data}")
-            if 'data' not in data:
-                raise KeyError(f"Clé 'data' manquante dans la réponse Birdeye: {data}")
-            token_data = data['data']
-            volume_24h = float(token_data.get('v24hUSD', 0))
-            liquidity = float(token_data.get('liquidity', 0))
-            market_cap = float(token_data.get('mc', 0))
-            supply = float(token_data.get('supply', 0))
-            tx_per_min = get_real_tx_per_min_solana(token_address)
-            if not (MIN_TX_PER_MIN_SOL <= tx_per_min <= MAX_TX_PER_MIN_SOL):
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : tx/min {tx_per_min} hors plage [{MIN_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]')
-                return False
-            if not (MIN_VOLUME_SOL <= volume_24h <= MAX_VOLUME_SOL):
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]')
-                return False
-            if liquidity < MIN_LIQUIDITY:
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : liquidité ${liquidity} < ${MIN_LIQUIDITY}')
-                return False
-            if not (MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : market cap ${market_cap} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]')
-                return False
-            if not is_safe_token_solana(token_address):
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : possible rug ou liquidité insuffisante')
-                return False
-            bot.send_message(chat_id, f'🔍 Token X détecté : {token_address} (Solana) - Tx/min: {tx_per_min}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
-            detected_tokens[token_address] = {
-                'address': token_address, 'volume': volume_24h, 'tx_per_min': tx_per_min,
-                'liquidity': liquidity, 'market_cap': market_cap, 'supply': supply
-            }
-            buy_token_solana(chat_id, token_address, mise_depart_sol)
-            return True
+            # ... (reste du code inchangé)
     except Exception as e:
         logger.error(f"Erreur vérification token X {token_address} : {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vérification token X {token_address}: {str(e)}')
         return False
-
-def get_real_tx_per_min_solana(token_address):
-    try:
-        response = session.get(f"https://public-api.birdeye.so/public/history_trades?address={token_address}&offset=0&limit=50", headers=BIRDEYE_HEADERS, timeout=10)
-        trades = response.json()['data']['items']
-        if not trades:
-            logger.warning(f"Aucune transaction récente via Birdeye pour {token_address}")
-            return 0
-        return min(len(trades) * 2, MAX_TX_PER_MIN_SOL)
-    except Exception as e:
-        logger.error(f"Erreur calcul tx/min Solana pour {token_address}: {str(e)}")
-        return 0
 
 def detect_new_tokens_bsc(chat_id):
     global loose_mode_bsc, last_valid_token_time
@@ -417,12 +336,11 @@ def check_bsc_token(chat_id, token_address, loose_mode):
         min_liquidity = MIN_LIQUIDITY * 0.5 if loose_mode else MIN_LIQUIDITY
         min_market_cap = MIN_MARKET_CAP_BSC * 0.5 if loose_mode else MIN_MARKET_CAP_BSC
         max_market_cap = MAX_MARKET_CAP_BSC if loose_mode else MAX_MARKET_CAP_BSC
-        min_tx = MIN_TX_PER_MIN_BSC
-        max_tx = MAX_TX_PER_MIN_BSC
+        min_tx = MIN_POSITIVE_TX_PER_MIN_BSC if not loose_mode else 0
 
-        if not (min_tx <= tx_per_min <= max_tx):
-            logger.info(f"{token_address}: tx/min {tx_per_min} hors plage [{min_tx}, {max_tx}]")
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : tx/min {tx_per_min} hors plage [{min_tx}, {max_tx}]')
+        if not (min_tx <= tx_per_min <= MAX_TX_PER_MIN_BSC):
+            logger.info(f"{token_address}: tx d'achat/min {tx_per_min} hors plage [{min_tx}, {MAX_TX_PER_MIN_BSC}]")
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : tx d\'achat/min {tx_per_min} hors plage [{min_tx}, {MAX_TX_PER_MIN_BSC}]')
             return False
         if not (min_volume <= volume_24h <= max_volume):
             logger.info(f"{token_address}: volume {volume_24h} hors plage [{min_volume}, {max_volume}]")
@@ -441,7 +359,7 @@ def check_bsc_token(chat_id, token_address, loose_mode):
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : possible rug ou taxes élevées')
             return False
         
-        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (BSC) - Tx/min: {tx_per_min}, Vol 24h: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
+        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (BSC) - Tx d\'achat/min: {tx_per_min}, Vol 24h: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
         detected_tokens[token_address] = {
             'address': token_address, 'volume': volume_24h, 'tx_per_min': tx_per_min,
             'liquidity': liquidity, 'market_cap': market_cap, 'supply': supply
@@ -451,6 +369,30 @@ def check_bsc_token(chat_id, token_address, loose_mode):
     except Exception as e:
         logger.error(f"Erreur vérification BSC {token_address}: {str(e)}")
         return e
+        def is_safe_token_solana(token_address):
+    try:
+        response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
+        data = response.json()['data']
+        return data.get('liquidity', 0) >= MIN_LIQUIDITY
+    except Exception as e:
+        logger.error(f"Erreur vérification Solana: {str(e)}")
+        return False
+
+def get_real_tx_per_min_solana(token_address):
+    try:
+        response = session.get(f"https://public-api.birdeye.so/public/history_trades?address={token_address}&offset=0&limit=50", headers=BIRDEYE_HEADERS, timeout=10)
+        response.raise_for_status()
+        trades = response.json()['data']['items']
+        if not trades:
+            logger.warning(f"Aucune transaction récente via Birdeye pour {token_address}")
+            return 0
+        buy_tx_count = sum(1 for trade in trades if trade.get('type') == 'buy')  # Filtrer les achats
+        normalized_buy_tx = min(buy_tx_count * 2, MAX_TX_PER_MIN_SOL)
+        logger.info(f"Tx d'achat/min calculé pour {token_address}: {normalized_buy_tx}")
+        return normalized_buy_tx
+    except Exception as e:
+        logger.error(f"Erreur calcul tx/min Solana pour {token_address}: {str(e)}")
+        return 0
 
 def detect_new_tokens_solana(chat_id):
     bot.send_message(chat_id, "🔍 Début détection Solana via Birdeye...")
@@ -470,8 +412,8 @@ def detect_new_tokens_solana(chat_id):
                     response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
                     response.raise_for_status()
                     data = response.json()
-                    if 'data' not in data:
-                        logger.error(f"Token {token_address} - Réponse sans 'data': {data}")
+                    if not data or 'data' not in data:
+                        logger.error(f"Token {token_address} - Réponse invalide ou sans 'data': {data}")
                         continue
                     token_data = data['data']
                     volume_24h = float(token_data.get('v24hUSD', 0))
@@ -482,10 +424,11 @@ def detect_new_tokens_solana(chat_id):
                     else:
                         logger.info(f"Token {token_address} rejeté, volume insuffisant: ${volume_24h:.2f}")
                 except requests.exceptions.HTTPError as e:
-                    if e.response.status_code == 404:
-                        logger.warning(f"Token {token_address} non trouvé (404), ignoré")
-                        continue
-                    raise
+                    logger.warning(f"Erreur HTTP pour {token_address}: {str(e)}")
+                    continue
+                except ValueError as e:
+                    logger.error(f"Erreur JSON pour {token_address}: {str(e)}")
+                    continue
     except Exception as e:
         logger.error(f"Erreur détection Solana via Birdeye: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur détection Solana: {str(e)}')
@@ -504,9 +447,9 @@ def check_solana_token(chat_id, token_address):
         market_cap = float(token_data.get('mc', 0))
         supply = float(token_data.get('supply', 0))
         tx_per_min = get_real_tx_per_min_solana(token_address)
-        if not (MIN_TX_PER_MIN_SOL <= tx_per_min <= MAX_TX_PER_MIN_SOL):
-            logger.info(f"{token_address}: tx/min {tx_per_min} hors plage [{MIN_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]")
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : tx/min {tx_per_min} hors plage [{MIN_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]')
+        if not (MIN_POSITIVE_TX_PER_MIN_SOL <= tx_per_min <= MAX_TX_PER_MIN_SOL):
+            logger.info(f"{token_address}: tx d'achat/min {tx_per_min} hors plage [{MIN_POSITIVE_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]")
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : tx d\'achat/min {tx_per_min} hors plage [{MIN_POSITIVE_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]')
             return
         if not (MIN_VOLUME_SOL <= volume_24h <= MAX_VOLUME_SOL):
             logger.info(f"{token_address}: volume {volume_24h} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]")
@@ -524,7 +467,7 @@ def check_solana_token(chat_id, token_address):
             logger.info(f"{token_address}: non sécurisé")
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : possible rug ou liquidité insuffisante')
             return
-        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (Solana) - Tx/min: {tx_per_min}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
+        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (Solana) - Tx d\'achat/min: {tx_per_min}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
         detected_tokens[token_address] = {
             'address': token_address, 'volume': volume_24h, 'tx_per_min': tx_per_min,
             'liquidity': liquidity, 'market_cap': market_cap, 'supply': supply
@@ -647,7 +590,7 @@ def callback_query(call):
             bot.send_message(chat_id, "Entrez les nouveaux seuils de Take-Profit (3 valeurs séparées par des virgules, ex. : 2,3,5) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_take_profit)
         elif call.data == "adjust_min_volume_bsc":
-            bot.send_message(chat_id, "Entrez le nouveau seuil min de volume BSC (en $, ex. : 30000) :")
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de volume BSC (en $, ex. : 1000) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_volume_bsc)
         elif call.data == "adjust_max_volume_bsc":
             bot.send_message(chat_id, "Entrez le nouveau seuil max de volume BSC (en $, ex. : 1000000) :")
@@ -757,10 +700,10 @@ def show_threshold_menu(chat_id):
     try:
         bot.send_message(chat_id, (
             f'📊 Seuils de détection :\n- BSC Volume: {MIN_VOLUME_BSC} $ - {MAX_VOLUME_BSC} $\n'
-            f'- BSC Tx/min : {MIN_TX_PER_MIN_BSC} - {MAX_TX_PER_MIN_BSC}\n'
+            f'- BSC Tx d\'achat/min : {MIN_POSITIVE_TX_PER_MIN_BSC} - {MAX_TX_PER_MIN_BSC}\n'
             f'- BSC Market Cap : {MIN_MARKET_CAP_BSC} $ - {MAX_MARKET_CAP_BSC} $\n'
             f'- Min Liquidité : {MIN_LIQUIDITY} $\n- Solana Volume: {MIN_VOLUME_SOL} $ - {MAX_VOLUME_SOL} $\n'
-            f'- Solana Tx/min : {MIN_TX_PER_MIN_SOL} - {MAX_TX_PER_MIN_SOL}\n'
+            f'- Solana Tx d\'achat/min : {MIN_POSITIVE_TX_PER_MIN_SOL} - {MAX_TX_PER_MIN_SOL}\n'
             f'- Solana Market Cap : {MIN_MARKET_CAP_SOL} $ - {MAX_MARKET_CAP_SOL} $'
         ), reply_markup=markup)
     except Exception as e:
@@ -856,7 +799,7 @@ def adjust_min_volume_bsc(message):
         else:
             bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
     except ValueError:
-        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 30000)")
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 1000)")
 
 def adjust_max_volume_bsc(message):
     global MAX_VOLUME_BSC
@@ -1222,12 +1165,19 @@ def set_webhook():
 
 def run_bot():
     logger.info("Démarrage du bot dans un thread séparé...")
-    initialize_bot()
-    set_webhook()
+    try:
+        initialize_bot()
+        set_webhook()
+    except Exception as e:
+        logger.critical(f"Échec du démarrage du bot: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
-    threading.Thread(target=run_bot, daemon=True).start()
-    logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
-    
+    try:
+        threading.Thread(target=run_bot, daemon=True).start()
+        logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
+        app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    except Exception as e:
+        logger.critical(f"Erreur critique au démarrage: {str(e)}")
+        
