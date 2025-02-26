@@ -90,9 +90,9 @@ MAX_MARKET_CAP_SOL = 1500000
 MIN_MARKET_CAP_BSC = 75000
 MAX_MARKET_CAP_BSC = 3000000
 MAX_TAX = 10
-MIN_POSITIVE_TX_PER_MIN_BSC = 5  # Minimum d'achats par minute
+MIN_POSITIVE_TX_PER_MIN_BSC = 2  # Réduit pour BSC (ajustable via menu)
 MAX_TX_PER_MIN_BSC = 75
-MIN_POSITIVE_TX_PER_MIN_SOL = 10  # Minimum d'achats par minute
+MIN_POSITIVE_TX_PER_MIN_SOL = 5  # Réduit pour Solana (ajustable)
 MAX_TX_PER_MIN_SOL = 150
 
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
@@ -158,12 +158,12 @@ def get_real_tx_per_min_bsc(token_address):
     try:
         latest_block = w3.eth.block_number
         buy_tx_count = 0
-        for block_num in range(max(latest_block - 50, 0), latest_block + 1):
+        for block_num in range(max(latest_block - 100, 0), latest_block + 1):  # Élargi à 100 blocs (~5 min)
             block = w3.eth.get_block(block_num, full_transactions=True)
             for tx in block['transactions']:
                 if tx.get('to') == token_address:  # Compter uniquement les achats
                     buy_tx_count += 1
-        normalized_buy_tx = buy_tx_count * 1.2  # Normalisation pour ~1 min
+        normalized_buy_tx = buy_tx_count * 0.6  # Normalisation pour ~1 min (100 blocs ~ 5 min)
         logger.info(f"Tx d'achat/min calculé pour {token_address}: {normalized_buy_tx}")
         return normalized_buy_tx
     except Exception as e:
@@ -361,7 +361,10 @@ def detect_new_tokens_bsc(chat_id):
     bot.send_message(chat_id, "🔍 Début détection BSC...")
     try:
         if not w3.is_connected():
-            raise ConnectionError("Connexion au nœud BSC perdue")
+            logger.error("Connexion au nœud BSC perdue")
+            bot.send_message(chat_id, "⚠️ Connexion au nœud BSC perdue, tentative de reconnexion dans 10s...")
+            time.sleep(10)
+            return
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
         logger.info(f"Bloc actuel : {latest_block}")
@@ -599,6 +602,7 @@ def callback_query(call):
     global mise_depart_bsc, mise_depart_sol, trade_active, slippage, gas_fee, stop_loss_threshold, take_profit_steps
     global MIN_VOLUME_BSC, MAX_VOLUME_BSC, MIN_LIQUIDITY, MIN_MARKET_CAP_BSC, MAX_MARKET_CAP_BSC
     global MIN_VOLUME_SOL, MAX_VOLUME_SOL, MIN_MARKET_CAP_SOL, MAX_MARKET_CAP_SOL
+    global MIN_POSITIVE_TX_PER_MIN_BSC, MIN_POSITIVE_TX_PER_MIN_SOL
     chat_id = call.message.chat.id
     logger.info(f"Callback reçu: {call.data}")
     try:
@@ -680,6 +684,12 @@ def callback_query(call):
         elif call.data == "adjust_max_market_cap_sol":
             bot.send_message(chat_id, "Entrez le nouveau seuil max de market cap Solana (en $, ex. : 1500000) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_max_market_cap_sol)
+        elif call.data == "adjust_min_positive_tx_bsc":
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de tx d'achat/min BSC (ex. : 2) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_positive_tx_bsc)
+        elif call.data == "adjust_min_positive_tx_sol":
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de tx d'achat/min Solana (ex. : 5) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_positive_tx_sol)
         elif call.data.startswith("refresh_"):
             token = call.data.split("_")[1]
             refresh_token(chat_id, token)
@@ -694,8 +704,7 @@ def trading_cycle(chat_id):
     global trade_active
     cycle_count = 0
     threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
-    twitter_thread = threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True)
-    twitter_thread.start()
+    threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True).start()
     while trade_active:
         try:
             cycle_count += 1
@@ -703,11 +712,11 @@ def trading_cycle(chat_id):
             logger.info(f"Cycle {cycle_count} démarré")
             detect_new_tokens_bsc(chat_id)
             detect_new_tokens_solana(chat_id)
-            time.sleep(10)
+            time.sleep(60)  # Augmenté pour réduire la charge
         except Exception as e:
             logger.error(f"Erreur dans trading_cycle: {str(e)}")
-            bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}. Reprise dans 10s...')
-            time.sleep(10)
+            bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}. Reprise dans 60s...')
+            time.sleep(60)
     logger.info("Trading_cycle arrêté.")
     bot.send_message(chat_id, "ℹ️ Cycle de trading terminé.")
 
@@ -760,7 +769,9 @@ def show_threshold_menu(chat_id):
         InlineKeyboardButton("📊 Min Volume Solana", callback_data="adjust_min_volume_sol"),
         InlineKeyboardButton("📊 Max Volume Solana", callback_data="adjust_max_volume_sol"),
         InlineKeyboardButton("📊 Min Market Cap Solana", callback_data="adjust_min_market_cap_sol"),
-        InlineKeyboardButton("📊 Max Market Cap Solana", callback_data="adjust_max_market_cap_sol")
+        InlineKeyboardButton("📊 Max Market Cap Solana", callback_data="adjust_max_market_cap_sol"),
+        InlineKeyboardButton("📊 Min Tx Achat BSC", callback_data="adjust_min_positive_tx_bsc"),
+        InlineKeyboardButton("📊 Min Tx Achat Solana", callback_data="adjust_min_positive_tx_sol")
     )
     try:
         bot.send_message(chat_id, (
@@ -970,6 +981,32 @@ def adjust_max_market_cap_sol(message):
     except ValueError:
         bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 1500000)")
 
+def adjust_min_positive_tx_bsc(message):
+    global MIN_POSITIVE_TX_PER_MIN_BSC
+    chat_id = message.chat.id
+    try:
+        new_value = float(message.text)
+        if new_value >= 0:
+            MIN_POSITIVE_TX_PER_MIN_BSC = new_value
+            bot.send_message(chat_id, f'✅ Min Tx d\'achat/min BSC mis à jour à {MIN_POSITIVE_TX_PER_MIN_BSC}')
+        else:
+            bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 2)")
+
+def adjust_min_positive_tx_sol(message):
+    global MIN_POSITIVE_TX_PER_MIN_SOL
+    chat_id = message.chat.id
+    try:
+        new_value = float(message.text)
+        if new_value >= 0:
+            MIN_POSITIVE_TX_PER_MIN_SOL = new_value
+            bot.send_message(chat_id, f'✅ Min Tx d\'achat/min Solana mis à jour à {MIN_POSITIVE_TX_PER_MIN_SOL}')
+        else:
+            bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 5)")
+
 def buy_token_bsc(chat_id, contract_address, amount):
     try:
         router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
@@ -1177,7 +1214,8 @@ def get_current_market_cap(contract_address):
             token_contract = w3.eth.contract(address=w3.to_checksum_address(contract_address), abi=ERC20_ABI)
             supply = token_contract.functions.totalSupply().call() / 10**18
             response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{contract_address}", timeout=10)
-            data = response.json()['pairs'][0] if response.json()['pairs'] else {}
+            data = response.json
+                        data = response.json()['pairs'][0] if response.json()['pairs'] else {}
             volume_24h = float(data.get('volume', {}).get('h24', 0))
             return volume_24h * supply
     except Exception as e:
