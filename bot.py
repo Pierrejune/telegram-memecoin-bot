@@ -90,7 +90,7 @@ MAX_MARKET_CAP_SOL = 1500000
 MIN_MARKET_CAP_BSC = 75000
 MAX_MARKET_CAP_BSC = 3000000
 MAX_TAX = 10
-MIN_TX_PER_MIN_BSC = 5
+MIN_TX_PER_MIN_BSC = 0  # Temporairement assoupli pour tester
 MAX_TX_PER_MIN_BSC = 75
 MIN_TX_PER_MIN_SOL = 15
 MAX_TX_PER_MIN_SOL = 150
@@ -133,7 +133,7 @@ def is_safe_token_bsc(token_address):
 
 def is_safe_token_solana(token_address):
     try:
-        response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
+        response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
         data = response.json()['data']
         return data.get('liquidity', 0) >= MIN_LIQUIDITY
     except Exception as e:
@@ -158,10 +158,12 @@ def get_real_tx_per_min_bsc(token_address):
     try:
         latest_block = w3.eth.block_number
         tx_count = 0
-        for block_num in range(max(latest_block - 10, 0), latest_block + 1):
+        for block_num in range(max(latest_block - 50, 0), latest_block + 1):  # Élargi à 50 blocs
             block = w3.eth.get_block(block_num, full_transactions=True)
-            tx_count += sum(1 for tx in block['transactions'] if tx['to'] == token_address or tx['from'] == token_address)
-        return tx_count * 2  # Normalisation pour 1 min (10 blocs ~ 30s)
+            tx_count += sum(1 for tx in block['transactions'] if tx.get('to') == token_address or tx.get('from') == token_address)
+        normalized_tx = tx_count * 1.2  # Normalisation pour ~1 min (50 blocs ~ 2,5 min)
+        logger.info(f"Tx/min calculé pour {token_address}: {normalized_tx}")
+        return normalized_tx
     except Exception as e:
         logger.error(f"Erreur calcul tx/min BSC pour {token_address}: {str(e)}")
         return 0
@@ -170,18 +172,21 @@ def monitor_twitter(chat_id):
     global twitter_requests_remaining, twitter_last_reset, last_twitter_call
     logger.info("Surveillance Twitter démarrée...")
     bot.send_message(chat_id, "📡 Surveillance Twitter activée...")
-    base_delay = 1.8  # 500 requêtes / 15 min = ~1.8s par requête
+    base_delay = 1.8
+    error_count = 0
+    max_errors = 5
 
     query_general = '("contract address" OR CA) -is:retweet'
     query_kanye = 'from:kanyewest "contract address" OR CA OR token OR memecoin OR launch'
 
-    while trade_active:
+    while trade_active and error_count < max_errors:
         try:
             current_time = time.time()
             if current_time - twitter_last_reset >= 900:
                 twitter_requests_remaining = 500
                 twitter_last_reset = current_time
                 logger.info("Quota Twitter réinitialisé : 500 requêtes.")
+                error_count = 0
 
             if twitter_requests_remaining <= 10:
                 wait_time = 900 - (current_time - twitter_last_reset) + 10
@@ -200,6 +205,7 @@ def monitor_twitter(chat_id):
             response.raise_for_status()
             twitter_requests_remaining -= 1
             last_twitter_call = current_time
+            error_count = 0
             data = response.json()
             tweets = data.get('data', [])
             users = {u['id']: u for u in data.get('includes', {}).get('users', [])}
@@ -240,16 +246,20 @@ def monitor_twitter(chat_id):
                 logger.warning(f"429 détecté, attente de {wait_time}s")
                 bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause de {wait_time}s...")
                 time.sleep(wait_time)
+                error_count += 1
+                if error_count >= max_errors:
+                    bot.send_message(chat_id, "⚠️ Trop d'erreurs Twitter consécutives, surveillance désactivée temporairement.")
+                    break
             else:
                 logger.error(f"Erreur Twitter: {str(e)}")
                 bot.send_message(chat_id, f'⚠️ Erreur Twitter: {str(e)}. Reprise dans 60s...')
                 time.sleep(60)
-            continue
+                error_count += 1
         except Exception as e:
             logger.error(f"Erreur Twitter inattendue: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur Twitter: {str(e)}. Reprise dans 60s...')
             time.sleep(60)
-            continue
+            error_count += 1
 
 def check_twitter_token(chat_id, token_address):
     try:
@@ -288,7 +298,7 @@ def check_twitter_token(chat_id, token_address):
             buy_token_bsc(chat_id, token_address, mise_depart_bsc)
             return True
         else:
-            response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
+            response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
             response.raise_for_status()
             data = response.json()
             logger.info(f"Réponse Birdeye pour {token_address}: {data}")
@@ -348,7 +358,7 @@ def detect_new_tokens_bsc(chat_id):
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
         logger.info(f"Bloc actuel : {latest_block}")
-        events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 200, toBlock=latest_block)  # Élargi à 200 blocs
+        events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 200, toBlock=latest_block)
         logger.info(f"Événements trouvés : {len(events)}")
         bot.send_message(chat_id, f"⬇️ {len(events)} nouvelles paires détectées sur BSC")
         if not events:
@@ -456,27 +466,33 @@ def detect_new_tokens_solana(chat_id):
         for token in tokens:
             token_address = token['address']
             if token_address not in detected_tokens:
-                response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-                response.raise_for_status()
-                data = response.json()
-                if 'data' not in data:
-                    logger.error(f"Token {token_address} - Réponse sans 'data': {data}")
-                    continue
-                token_data = data['data']
-                volume_24h = float(token_data.get('v24hUSD', 0))
-                if volume_24h > MIN_VOLUME_SOL:
-                    bot.send_message(chat_id, f'🆕 Token Solana détecté via Birdeye : {token_address} (Vol: ${volume_24h:.2f})')
-                    check_solana_token(chat_id, token_address)
-                    break
-                else:
-                    logger.info(f"Token {token_address} rejeté, volume insuffisant: ${volume_24h:.2f}")
+                try:
+                    response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
+                    response.raise_for_status()
+                    data = response.json()
+                    if 'data' not in data:
+                        logger.error(f"Token {token_address} - Réponse sans 'data': {data}")
+                        continue
+                    token_data = data['data']
+                    volume_24h = float(token_data.get('v24hUSD', 0))
+                    if volume_24h > MIN_VOLUME_SOL:
+                        bot.send_message(chat_id, f'🆕 Token Solana détecté via Birdeye : {token_address} (Vol: ${volume_24h:.2f})')
+                        check_solana_token(chat_id, token_address)
+                        break
+                    else:
+                        logger.info(f"Token {token_address} rejeté, volume insuffisant: ${volume_24h:.2f}")
+                except requests.exceptions.HTTPError as e:
+                    if e.response.status_code == 404:
+                        logger.warning(f"Token {token_address} non trouvé (404), ignoré")
+                        continue
+                    raise
     except Exception as e:
         logger.error(f"Erreur détection Solana via Birdeye: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur détection Solana: {str(e)}')
 
 def check_solana_token(chat_id, token_address):
     try:
-        response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
+        response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
         response.raise_for_status()
         data = response.json()
         logger.info(f"Réponse Birdeye pour {token_address}: {data}")
@@ -671,6 +687,8 @@ def trading_cycle(chat_id):
     global trade_active
     cycle_count = 0
     threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
+    twitter_thread = threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True)
+    twitter_thread.start()
     while trade_active:
         cycle_count += 1
         bot.send_message(chat_id, f'🔍 Début du cycle de détection #{cycle_count}...')
@@ -678,7 +696,6 @@ def trading_cycle(chat_id):
         try:
             detect_new_tokens_bsc(chat_id)
             detect_new_tokens_solana(chat_id)
-            monitor_twitter(chat_id)
         except Exception as e:
             logger.error(f"Erreur dans trading_cycle: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}. Reprise dans 10s...')
@@ -1213,3 +1230,4 @@ if __name__ == "__main__":
     threading.Thread(target=run_bot, daemon=True).start()
     logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    
