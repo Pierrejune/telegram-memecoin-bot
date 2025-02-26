@@ -16,6 +16,7 @@ from solders.instruction import Instruction
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import threading
+from dotenv import load_dotenv  # Ajout pour charger .env
 
 # Configuration des logs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -35,7 +36,8 @@ last_valid_token_time = time.time()
 twitter_last_reset = time.time()
 twitter_requests_remaining = 500  # Quota initial gratuit Twitter
 
-# Variables d’environnement
+# Chargement des variables d’environnement
+load_dotenv()  # Chargement du fichier .env
 logger.info("Chargement des variables d’environnement...")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
@@ -111,8 +113,9 @@ def initialize_bot():
     try:
         w3 = Web3(Web3.HTTPProvider(BSC_RPC))
         if not w3.is_connected():
+            logger.error(f"Connexion BSC échouée sur {BSC_RPC}")
             raise ConnectionError("Connexion BSC échouée")
-        logger.info("Connexion BSC réussie.")
+        logger.info(f"Connexion BSC réussie sur {BSC_RPC}. Bloc actuel : {w3.eth.block_number}")
         solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
         logger.info("Clé Solana initialisée.")
     except Exception as e:
@@ -173,26 +176,26 @@ def monitor_twitter(chat_id):
     query_kanye = 'from:kanyewest "contract address" OR CA OR token OR memecoin OR launch'
 
     while trade_active:
-        current_time = time.time()
-        if current_time - twitter_last_reset >= 900:
-            twitter_requests_remaining = 500
-            twitter_last_reset = current_time
-            logger.info("Quota Twitter réinitialisé : 500 requêtes.")
-
-        if twitter_requests_remaining <= 10:
-            wait_time = 900 - (current_time - twitter_last_reset) + 10
-            logger.warning(f"Quota faible, attente de {wait_time:.1f}s...")
-            bot.send_message(chat_id, f"⚠️ Quota Twitter bas, pause de {wait_time:.1f}s...")
-            time.sleep(wait_time)
-            continue
-
-        delay = max(base_delay, (900 - (current_time - twitter_last_reset)) / max(1, twitter_requests_remaining))
-        time.sleep(max(0, delay - (current_time - last_twitter_call)))
-
         try:
+            current_time = time.time()
+            if current_time - twitter_last_reset >= 900:
+                twitter_requests_remaining = 500
+                twitter_last_reset = current_time
+                logger.info("Quota Twitter réinitialisé : 500 requêtes.")
+
+            if twitter_requests_remaining <= 10:
+                wait_time = 900 - (current_time - twitter_last_reset) + 10
+                logger.warning(f"Quota faible, attente de {wait_time:.1f}s...")
+                bot.send_message(chat_id, f"⚠️ Quota Twitter bas, pause de {wait_time:.1f}s...")
+                time.sleep(wait_time)
+                continue
+
+            delay = max(base_delay, (900 - (current_time - twitter_last_reset)) / max(1, twitter_requests_remaining))
+            time.sleep(max(0, delay - (current_time - last_twitter_call)))
+
             response = session.get(
                 f"https://api.twitter.com/2/tweets/search/recent?query={query_general}&max_results=20&expansions=author_id&user.fields=public_metrics",
-                timeout=10
+                headers=TWITTER_HEADERS, timeout=10
             )
             if response.status_code == 429:
                 retry_after = int(response.headers.get('Retry-After', 900))
@@ -200,6 +203,7 @@ def monitor_twitter(chat_id):
                 bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause {retry_after}s...")
                 time.sleep(retry_after)
                 continue
+            response.raise_for_status()  # Vérifie les erreurs HTTP
             twitter_requests_remaining -= 1
             last_twitter_call = current_time
             data = response.json()
@@ -221,13 +225,14 @@ def monitor_twitter(chat_id):
 
             response_kanye = session.get(
                 f"https://api.twitter.com/2/tweets/search/recent?query={query_kanye}&max_results=10",
-                timeout=10
+                headers=TWITTER_HEADERS, timeout=10
             )
             if response_kanye.status_code == 429:
                 retry_after = int(response_kanye.headers.get('Retry-After', 900))
                 logger.warning(f"429 Kanye, attente {retry_after}s")
                 time.sleep(retry_after)
                 continue
+            response_kanye.raise_for_status()
             twitter_requests_remaining -= 1
             last_twitter_call = current_time
             tweets_kanye = response_kanye.json().get('data', [])
@@ -240,11 +245,11 @@ def monitor_twitter(chat_id):
                             twitter_tokens.append(word)
                             bot.send_message(chat_id, f'🔍 Token détecté via X (@kanyewest): {word}')
                             check_twitter_token(chat_id, word)
-
         except Exception as e:
             logger.error(f"Erreur Twitter: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur Twitter: {str(e)}. Reprise dans 60s...')
             time.sleep(60)
+            continue  # Continue même après une erreur
 
 def check_twitter_token(chat_id, token_address):
     try:
@@ -284,11 +289,16 @@ def check_twitter_token(chat_id, token_address):
             return True
         else:
             response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-            data = response.json()['data']
-            volume_24h = float(data.get('v24hUSD', 0))
-            liquidity = float(data.get('liquidity', 0))
-            market_cap = float(data.get('mc', 0))
-            supply = float(data.get('supply', 0))
+            response.raise_for_status()
+            data = response.json()
+            logger.info(f"Réponse Birdeye pour {token_address}: {data}")
+            if 'data' not in data:
+                raise KeyError(f"Clé 'data' manquante dans la réponse Birdeye: {data}")
+            token_data = data['data']
+            volume_24h = float(token_data.get('v24hUSD', 0))
+            liquidity = float(token_data.get('liquidity', 0))
+            market_cap = float(token_data.get('mc', 0))
+            supply = float(token_data.get('supply', 0))
             tx_per_min = get_real_tx_per_min_solana(token_address)
             if not (MIN_TX_PER_MIN_SOL <= tx_per_min <= MAX_TX_PER_MIN_SOL):
                 bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : tx/min {tx_per_min} hors plage [{MIN_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]')
@@ -333,6 +343,8 @@ def detect_new_tokens_bsc(chat_id):
     global loose_mode_bsc, last_valid_token_time
     bot.send_message(chat_id, "🔍 Début détection BSC...")
     try:
+        if not w3.is_connected():
+            raise ConnectionError("Connexion au nœud BSC perdue")
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
         logger.info(f"Bloc actuel : {latest_block}")
@@ -440,6 +452,7 @@ def detect_new_tokens_solana(chat_id):
         if 'data' not in json_response or 'tokens' not in json_response['data']:
             raise ValueError(f"Réponse Birdeye invalide : {json_response}")
         tokens = json_response['data']['tokens']
+        bot.send_message(chat_id, f"⬇️ {len(tokens)} tokens détectés sur Solana via Birdeye")
         for token in tokens:
             token_address = token['address']
             if token_address not in detected_tokens:
@@ -459,11 +472,16 @@ def detect_new_tokens_solana(chat_id):
 def check_solana_token(chat_id, token_address):
     try:
         response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-        data = response.json()['data']
-        volume_24h = float(data.get('v24hUSD', 0))
-        liquidity = float(data.get('liquidity', 0))
-        market_cap = float(data.get('mc', 0))
-        supply = float(data.get('supply', 0))
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"Réponse Birdeye pour {token_address}: {data}")
+        if 'data' not in data:
+            raise KeyError(f"Clé 'data' manquante dans la réponse Birdeye: {data}")
+        token_data = data['data']
+        volume_24h = float(token_data.get('v24hUSD', 0))
+        liquidity = float(token_data.get('liquidity', 0))
+        market_cap = float(token_data.get('mc', 0))
+        supply = float(token_data.get('supply', 0))
         tx_per_min = get_real_tx_per_min_solana(token_address)
         if not (MIN_TX_PER_MIN_SOL <= tx_per_min <= MAX_TX_PER_MIN_SOL):
             logger.info(f"{token_address}: tx/min {tx_per_min} hors plage [{MIN_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]")
@@ -656,11 +674,10 @@ def trading_cycle(chat_id):
             detect_new_tokens_bsc(chat_id)
             detect_new_tokens_solana(chat_id)
             monitor_twitter(chat_id)
-            time.sleep(2)
         except Exception as e:
             logger.error(f"Erreur dans trading_cycle: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}. Reprise dans 10s...')
-            time.sleep(10)
+        time.sleep(10)  # Déplacé hors du try pour éviter blocage
     logger.info("Trading_cycle arrêté.")
     bot.send_message(chat_id, "ℹ️ Cycle de trading terminé.")
 
@@ -916,7 +933,7 @@ def adjust_max_market_cap_sol(message):
     try:
         new_value = float(message.text)
         if new_value >= MIN_MARKET_CAP_SOL:
-            MAX_MARKET_CAP_SOL = new_value
+            MAX_MARKET_CAP_SOL = new_value  # Corrigé de "MAX_MARKET_CAP_sol" à "MAX_MARKET_CAP_SOL"
             bot.send_message(chat_id, f'✅ Max Market Cap Solana mis à jour à ${MAX_MARKET_CAP_SOL}')
         else:
             bot.send_message(chat_id, "⚠️ La valeur doit être supérieure au minimum!")
