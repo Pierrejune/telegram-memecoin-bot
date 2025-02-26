@@ -16,7 +16,6 @@ from solders.instruction import Instruction
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import threading
-from dotenv import load_dotenv
 
 # Configuration des logs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -36,9 +35,8 @@ last_valid_token_time = time.time()
 twitter_last_reset = time.time()
 twitter_requests_remaining = 500
 
-# Chargement des variables d’environnement
-load_dotenv()
-logger.info("Chargement des variables d’environnement...")
+# Chargement des variables d’environnement depuis Cloud Run
+logger.info("Chargement des variables d’environnement depuis Cloud Run...")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
@@ -90,9 +88,9 @@ MAX_MARKET_CAP_SOL = 1500000
 MIN_MARKET_CAP_BSC = 75000
 MAX_MARKET_CAP_BSC = 3000000
 MAX_TAX = 10
-MIN_POSITIVE_TX_PER_MIN_BSC = 5  # Nouveau : minimum d'achats par minute
+MIN_POSITIVE_TX_PER_MIN_BSC = 5  # Minimum d'achats par minute pour BSC
 MAX_TX_PER_MIN_BSC = 75
-MIN_POSITIVE_TX_PER_MIN_SOL = 10  # Nouveau : minimum d'achats par minute
+MIN_POSITIVE_TX_PER_MIN_SOL = 10  # Minimum d'achats par minute pour Solana
 MAX_TX_PER_MIN_SOL = 150
 
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
@@ -106,7 +104,6 @@ w3 = None
 solana_keypair = None
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-
 def initialize_bot():
     global w3, solana_keypair
     logger.info("Initialisation différée du bot...")
@@ -185,8 +182,7 @@ def get_real_tx_per_min_solana(token_address):
     except Exception as e:
         logger.error(f"Erreur calcul tx/min Solana pour {token_address}: {str(e)}")
         return 0
-
-def monitor_twitter(chat_id):
+        def monitor_twitter(chat_id):
     global twitter_requests_remaining, twitter_last_reset, last_twitter_call
     logger.info("Surveillance Twitter démarrée...")
     bot.send_message(chat_id, "📡 Surveillance Twitter activée...")
@@ -207,7 +203,7 @@ def monitor_twitter(chat_id):
                 error_count = 0
 
             if twitter_requests_remaining <= 10:
-                wait_time = 900 - (current_time - twitter_last_reset) + 10
+                wait_time = max(900 - (current_time - twitter_last_reset), 10)
                 logger.warning(f"Quota faible, attente de {wait_time:.1f}s...")
                 bot.send_message(chat_id, f"⚠️ Quota Twitter bas, pause de {wait_time:.1f}s...")
                 time.sleep(wait_time)
@@ -355,8 +351,7 @@ def check_twitter_token(chat_id, token_address):
         logger.error(f"Erreur vérification token X {token_address} : {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vérification token X {token_address}: {str(e)}')
         return False
-
-def detect_new_tokens_bsc(chat_id):
+        def detect_new_tokens_bsc(chat_id):
     global loose_mode_bsc, last_valid_token_time
     bot.send_message(chat_id, "🔍 Début détection BSC...")
     try:
@@ -456,7 +451,8 @@ def check_bsc_token(chat_id, token_address, loose_mode):
         return True
     except Exception as e:
         logger.error(f"Erreur vérification BSC {token_address}: {str(e)}")
-        return e
+        bot.send_message(chat_id, f'⚠️ Erreur vérification BSC {token_address}: {str(e)}')
+        return False
 
 def detect_new_tokens_solana(chat_id):
     bot.send_message(chat_id, "🔍 Début détection Solana via Birdeye...")
@@ -701,28 +697,7 @@ def monitor_and_sell(chat_id):
             logger.error(f"Erreur surveillance globale: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur surveillance: {str(e)}. Reprise dans 5s...')
             time.sleep(5)
-
-def trading_cycle(chat_id):
-    global trade_active
-    cycle_count = 0
-    threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
-    twitter_thread = threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True)
-    twitter_thread.start()
-    while trade_active:
-        try:
-            cycle_count += 1
-            bot.send_message(chat_id, f'🔍 Début du cycle de détection #{cycle_count}...')
-            logger.info(f"Cycle {cycle_count} démarré")
-            detect_new_tokens_bsc(chat_id)
-            detect_new_tokens_solana(chat_id)
-            time.sleep(10)
-        except Exception as e:
-            logger.error(f"Erreur dans trading_cycle: {str(e)}")
-            bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}. Reprise dans 10s...')
-            time.sleep(10)
-    logger.info("Trading_cycle arrêté.")
-    bot.send_message(chat_id, "ℹ️ Cycle de trading terminé.")
-    @app.route("/webhook", methods=['POST'])
+            @app.route("/webhook", methods=['POST'])
 def webhook():
     logger.info("Webhook reçu")
     try:
@@ -870,6 +845,27 @@ def callback_query(call):
     except Exception as e:
         logger.error(f"Erreur dans callback_query: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur générale: {str(e)}')
+
+def trading_cycle(chat_id):
+    global trade_active
+    cycle_count = 0
+    threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
+    twitter_thread = threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True)
+    twitter_thread.start()
+    while trade_active:
+        try:
+            cycle_count += 1
+            bot.send_message(chat_id, f'🔍 Début du cycle de détection #{cycle_count}...')
+            logger.info(f"Cycle {cycle_count} démarré")
+            detect_new_tokens_bsc(chat_id)
+            detect_new_tokens_solana(chat_id)
+            time.sleep(10)
+        except Exception as e:
+            logger.error(f"Erreur dans trading_cycle: {str(e)}")
+            bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}. Reprise dans 10s...')
+            time.sleep(10)
+    logger.info("Trading_cycle arrêté.")
+    bot.send_message(chat_id, "ℹ️ Cycle de trading terminé.")
 
 def show_config_menu(chat_id):
     markup = InlineKeyboardMarkup()
@@ -1242,3 +1238,4 @@ if __name__ == "__main__":
     logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
     
+        
