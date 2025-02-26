@@ -80,7 +80,7 @@ twitter_tokens = []
 
 MIN_VOLUME_SOL = 25000
 MAX_VOLUME_SOL = 750000
-MIN_VOLUME_BSC = 1000  # Réduit pour détecter plus de tokens
+MIN_VOLUME_BSC = 1000
 MAX_VOLUME_BSC = 1000000
 MIN_LIQUIDITY = 50000
 MIN_MARKET_CAP_SOL = 50000
@@ -88,9 +88,9 @@ MAX_MARKET_CAP_SOL = 1500000
 MIN_MARKET_CAP_BSC = 75000
 MAX_MARKET_CAP_BSC = 3000000
 MAX_TAX = 10
-MIN_POSITIVE_TX_PER_MIN_BSC = 5  # Minimum d'achats par minute pour BSC
+MIN_POSITIVE_TX_PER_MIN_BSC = 5
 MAX_TX_PER_MIN_BSC = 75
-MIN_POSITIVE_TX_PER_MIN_SOL = 10  # Minimum d'achats par minute pour Solana
+MIN_POSITIVE_TX_PER_MIN_SOL = 10
 MAX_TX_PER_MIN_SOL = 150
 
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
@@ -104,6 +104,7 @@ w3 = None
 solana_keypair = None
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+
 def initialize_bot():
     global w3, solana_keypair
     logger.info("Initialisation différée du bot...")
@@ -118,8 +119,7 @@ def initialize_bot():
     except Exception as e:
         logger.error(f"Erreur dans l'initialisation différée: {str(e)}")
         raise
-
-def is_safe_token_bsc(token_address):
+        def is_safe_token_bsc(token_address):
     try:
         response = session.get(f"https://api.honeypot.is/v2/IsHoneypot?address={token_address}", timeout=10)
         data = response.json()
@@ -182,7 +182,8 @@ def get_real_tx_per_min_solana(token_address):
     except Exception as e:
         logger.error(f"Erreur calcul tx/min Solana pour {token_address}: {str(e)}")
         return 0
-        def monitor_twitter(chat_id):
+
+def monitor_twitter(chat_id):
     global twitter_requests_remaining, twitter_last_reset, last_twitter_call
     logger.info("Surveillance Twitter démarrée...")
     bot.send_message(chat_id, "📡 Surveillance Twitter activée...")
@@ -351,7 +352,8 @@ def check_twitter_token(chat_id, token_address):
         logger.error(f"Erreur vérification token X {token_address} : {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vérification token X {token_address}: {str(e)}')
         return False
-        def detect_new_tokens_bsc(chat_id):
+
+def detect_new_tokens_bsc(chat_id):
     global loose_mode_bsc, last_valid_token_time
     bot.send_message(chat_id, "🔍 Début détection BSC...")
     try:
@@ -697,7 +699,46 @@ def monitor_and_sell(chat_id):
             logger.error(f"Erreur surveillance globale: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur surveillance: {str(e)}. Reprise dans 5s...')
             time.sleep(5)
-            @app.route("/webhook", methods=['POST'])
+
+def trading_cycle(chat_id):
+    global trade_active
+    cycle_count = 0
+    threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
+    twitter_thread = threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True)
+    twitter_thread.start()
+    while trade_active:
+        try:
+            cycle_count += 1
+            bot.send_message(chat_id, f'🔍 Début du cycle de détection #{cycle_count}...')
+            logger.info(f"Cycle {cycle_count} démarré")
+            detect_new_tokens_bsc(chat_id)
+            detect_new_tokens_solana(chat_id)
+            time.sleep(10)
+        except Exception as e:
+            logger.error(f"Erreur dans trading_cycle: {str(e)}")
+            bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}. Reprise dans 10s...')
+            time.sleep(10)
+    logger.info("Trading_cycle arrêté.")
+    bot.send_message(chat_id, "ℹ️ Cycle de trading terminé.")
+
+def get_current_market_cap(contract_address):
+    try:
+        if contract_address in portfolio and portfolio[contract_address]['chain'] == 'solana':
+            response = session.get(f"https://public-api.birdeye.so/public/price?address={contract_address}", headers=BIRDEYE_HEADERS, timeout=10)
+            price = response.json()['data']['value']
+            supply = detected_tokens[contract_address]['supply']
+            return price * supply
+        else:
+            token_contract = w3.eth.contract(address=w3.to_checksum_address(contract_address), abi=ERC20_ABI)
+            supply = token_contract.functions.totalSupply().call() / 10**18
+            response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{contract_address}", timeout=10)
+            data = response.json()['pairs'][0] if response.json()['pairs'] else {}
+            volume_24h = float(data.get('volume', {}).get('h24', 0))
+            return volume_24h * supply
+    except Exception as e:
+        logger.error(f"Erreur market cap: {str(e)}")
+        return detected_tokens.get(contract_address, {}).get('market_cap', 0)
+        @app.route("/webhook", methods=['POST'])
 def webhook():
     logger.info("Webhook reçu")
     try:
@@ -845,27 +886,6 @@ def callback_query(call):
     except Exception as e:
         logger.error(f"Erreur dans callback_query: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur générale: {str(e)}')
-
-def trading_cycle(chat_id):
-    global trade_active
-    cycle_count = 0
-    threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
-    twitter_thread = threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True)
-    twitter_thread.start()
-    while trade_active:
-        try:
-            cycle_count += 1
-            bot.send_message(chat_id, f'🔍 Début du cycle de détection #{cycle_count}...')
-            logger.info(f"Cycle {cycle_count} démarré")
-            detect_new_tokens_bsc(chat_id)
-            detect_new_tokens_solana(chat_id)
-            time.sleep(10)
-        except Exception as e:
-            logger.error(f"Erreur dans trading_cycle: {str(e)}")
-            bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}. Reprise dans 10s...')
-            time.sleep(10)
-    logger.info("Trading_cycle arrêté.")
-    bot.send_message(chat_id, "ℹ️ Cycle de trading terminé.")
 
 def show_config_menu(chat_id):
     markup = InlineKeyboardMarkup()
@@ -1161,24 +1181,6 @@ def get_solana_balance(wallet_address):
         logger.error(f"Erreur solde Solana: {str(e)}")
         return 0
 
-def get_current_market_cap(contract_address):
-    try:
-        if contract_address in portfolio and portfolio[contract_address]['chain'] == 'solana':
-            response = session.get(f"https://public-api.birdeye.so/public/price?address={contract_address}", headers=BIRDEYE_HEADERS, timeout=10)
-            price = response.json()['data']['value']
-            supply = detected_tokens[contract_address]['supply']
-            return price * supply
-        else:
-            token_contract = w3.eth.contract(address=w3.to_checksum_address(contract_address), abi=ERC20_ABI)
-            supply = token_contract.functions.totalSupply().call() / 10**18
-            response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{contract_address}", timeout=10)
-            data = response.json()['pairs'][0] if response.json()['pairs'] else {}
-            volume_24h = float(data.get('volume', {}).get('h24', 0))
-            return volume_24h * supply
-    except Exception as e:
-        logger.error(f"Erreur market cap: {str(e)}")
-        return detected_tokens.get(contract_address, {}).get('market_cap', 0)
-
 def refresh_token(chat_id, token):
     try:
         current_mc = get_current_market_cap(token)
@@ -1234,8 +1236,9 @@ def run_bot():
 
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
+    # Lancement de l'initialisation et du webhook dans un thread séparé
     threading.Thread(target=run_bot, daemon=True).start()
+    # Démarrage immédiat de Flask pour écouter sur le port 8080
     logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
     
-        
