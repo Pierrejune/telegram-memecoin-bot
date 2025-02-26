@@ -16,7 +16,7 @@ from solders.instruction import Instruction
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import threading
-from dotenv import load_dotenv  # Ajout pour charger .env
+from dotenv import load_dotenv
 
 # Configuration des logs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -37,7 +37,7 @@ twitter_last_reset = time.time()
 twitter_requests_remaining = 500  # Quota initial gratuit Twitter
 
 # Chargement des variables d’environnement
-load_dotenv()  # Chargement du fichier .env
+load_dotenv()
 logger.info("Chargement des variables d’environnement...")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
@@ -190,20 +190,14 @@ def monitor_twitter(chat_id):
                 time.sleep(wait_time)
                 continue
 
-            delay = max(base_delay, (900 - (current_time - twitter_last_reset)) / max(1, twitter_requests_remaining))
+            delay = max(base_delay * 2, (900 - (current_time - twitter_last_reset)) / max(1, twitter_requests_remaining - 1))
             time.sleep(max(0, delay - (current_time - last_twitter_call)))
 
             response = session.get(
                 f"https://api.twitter.com/2/tweets/search/recent?query={query_general}&max_results=20&expansions=author_id&user.fields=public_metrics",
                 headers=TWITTER_HEADERS, timeout=10
             )
-            if response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 900))
-                logger.warning(f"429 général, attente {retry_after}s")
-                bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause {retry_after}s...")
-                time.sleep(retry_after)
-                continue
-            response.raise_for_status()  # Vérifie les erreurs HTTP
+            response.raise_for_status()
             twitter_requests_remaining -= 1
             last_twitter_call = current_time
             data = response.json()
@@ -227,11 +221,6 @@ def monitor_twitter(chat_id):
                 f"https://api.twitter.com/2/tweets/search/recent?query={query_kanye}&max_results=10",
                 headers=TWITTER_HEADERS, timeout=10
             )
-            if response_kanye.status_code == 429:
-                retry_after = int(response_kanye.headers.get('Retry-After', 900))
-                logger.warning(f"429 Kanye, attente {retry_after}s")
-                time.sleep(retry_after)
-                continue
             response_kanye.raise_for_status()
             twitter_requests_remaining -= 1
             last_twitter_call = current_time
@@ -245,11 +234,22 @@ def monitor_twitter(chat_id):
                             twitter_tokens.append(word)
                             bot.send_message(chat_id, f'🔍 Token détecté via X (@kanyewest): {word}')
                             check_twitter_token(chat_id, word)
+        except requests.exceptions.RequestException as e:
+            if getattr(e.response, 'status_code', None) == 429:
+                wait_time = int(e.response.headers.get('Retry-After', 900))
+                logger.warning(f"429 détecté, attente de {wait_time}s")
+                bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause de {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"Erreur Twitter: {str(e)}")
+                bot.send_message(chat_id, f'⚠️ Erreur Twitter: {str(e)}. Reprise dans 60s...')
+                time.sleep(60)
+            continue
         except Exception as e:
-            logger.error(f"Erreur Twitter: {str(e)}")
+            logger.error(f"Erreur Twitter inattendue: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur Twitter: {str(e)}. Reprise dans 60s...')
             time.sleep(60)
-            continue  # Continue même après une erreur
+            continue
 
 def check_twitter_token(chat_id, token_address):
     try:
@@ -348,12 +348,12 @@ def detect_new_tokens_bsc(chat_id):
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
         logger.info(f"Bloc actuel : {latest_block}")
-        events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 50, toBlock=latest_block)
+        events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 200, toBlock=latest_block)  # Élargi à 200 blocs
         logger.info(f"Événements trouvés : {len(events)}")
         bot.send_message(chat_id, f"⬇️ {len(events)} nouvelles paires détectées sur BSC")
         if not events:
-            logger.info("Aucun événement PairCreated trouvé dans les 50 derniers blocs.")
-            bot.send_message(chat_id, "ℹ️ Aucun événement PairCreated détecté dans les 50 derniers blocs.")
+            logger.info("Aucun événement PairCreated trouvé dans les 200 derniers blocs.")
+            bot.send_message(chat_id, "ℹ️ Aucun événement PairCreated détecté dans les 200 derniers blocs.")
             return
         
         rejected_count = 0
@@ -448,17 +448,22 @@ def detect_new_tokens_solana(chat_id):
         response = session.get("https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=10", headers=BIRDEYE_HEADERS, timeout=10)
         response.raise_for_status()
         json_response = response.json()
-        logger.info(f"Réponse Birdeye : {json_response}")
-        if 'data' not in json_response or 'tokens' not in json_response['data']:
-            raise ValueError(f"Réponse Birdeye invalide : {json_response}")
+        logger.info(f"Réponse Birdeye complète : {json_response}")
+        if 'data' not in json_response or 'tokens' not in json_response.get('data', {}):
+            raise ValueError(f"Réponse Birdeye invalide ou vide : {json_response}")
         tokens = json_response['data']['tokens']
         bot.send_message(chat_id, f"⬇️ {len(tokens)} tokens détectés sur Solana via Birdeye")
         for token in tokens:
             token_address = token['address']
             if token_address not in detected_tokens:
                 response = session.get(f"https://public-api.birdeye.so/public/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-                data = response.json()['data']
-                volume_24h = float(data.get('v24hUSD', 0))
+                response.raise_for_status()
+                data = response.json()
+                if 'data' not in data:
+                    logger.error(f"Token {token_address} - Réponse sans 'data': {data}")
+                    continue
+                token_data = data['data']
+                volume_24h = float(token_data.get('v24hUSD', 0))
                 if volume_24h > MIN_VOLUME_SOL:
                     bot.send_message(chat_id, f'🆕 Token Solana détecté via Birdeye : {token_address} (Vol: ${volume_24h:.2f})')
                     check_solana_token(chat_id, token_address)
@@ -677,7 +682,7 @@ def trading_cycle(chat_id):
         except Exception as e:
             logger.error(f"Erreur dans trading_cycle: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}. Reprise dans 10s...')
-        time.sleep(10)  # Déplacé hors du try pour éviter blocage
+        time.sleep(10)
     logger.info("Trading_cycle arrêté.")
     bot.send_message(chat_id, "ℹ️ Cycle de trading terminé.")
 
@@ -933,7 +938,7 @@ def adjust_max_market_cap_sol(message):
     try:
         new_value = float(message.text)
         if new_value >= MIN_MARKET_CAP_SOL:
-            MAX_MARKET_CAP_SOL = new_value  # Corrigé de "MAX_MARKET_CAP_sol" à "MAX_MARKET_CAP_SOL"
+            MAX_MARKET_CAP_SOL = new_value
             bot.send_message(chat_id, f'✅ Max Market Cap Solana mis à jour à ${MAX_MARKET_CAP_SOL}')
         else:
             bot.send_message(chat_id, "⚠️ La valeur doit être supérieure au minimum!")
