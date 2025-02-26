@@ -94,7 +94,7 @@ MIN_POSITIVE_TX_PER_MIN_BSC = 2
 MAX_TX_PER_MIN_BSC = 75
 MIN_POSITIVE_TX_PER_MIN_SOL = 5
 MAX_TX_PER_MIN_SOL = 150
-BUY_SELL_RATIO_THRESHOLD = 2  # Achats doivent être au moins 2x supérieurs aux ventes
+BUY_SELL_RATIO_THRESHOLD = 2  # Achats doivent être 2x supérieurs aux ventes
 
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
@@ -108,19 +108,22 @@ solana_keypair = None
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
-def initialize_bot():
+def initialize_bot(chat_id):
     global w3, solana_keypair
     logger.info("Initialisation différée du bot...")
     try:
         w3 = Web3(Web3.HTTPProvider(BSC_RPC))
         if not w3.is_connected():
             logger.error(f"Connexion BSC échouée sur {BSC_RPC}")
+            bot.send_message(chat_id, f"⚠️ Connexion BSC échouée sur {BSC_RPC}")
             raise ConnectionError("Connexion BSC échouée")
         logger.info(f"Connexion BSC réussie sur {BSC_RPC}. Bloc actuel : {w3.eth.block_number}")
         solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
         logger.info("Clé Solana initialisée.")
+        bot.send_message(chat_id, "✅ Bot initialisé avec succès.")
     except Exception as e:
         logger.error(f"Erreur dans l'initialisation différée: {str(e)}")
+        bot.send_message(chat_id, f'⚠️ Erreur initialisation bot: {str(e)}')
         raise
 
 def is_safe_token_bsc(token_address):
@@ -302,7 +305,6 @@ def check_twitter_token(chat_id, token_address):
             market_cap = volume_24h * supply
             buy_tx_per_min, sell_tx_per_min = get_real_tx_per_min_bsc(token_address)
             
-            # Vérification du ratio achats/ventes
             if sell_tx_per_min > 0:
                 buy_sell_ratio = buy_tx_per_min / sell_tx_per_min
                 if buy_sell_ratio < BUY_SELL_RATIO_THRESHOLD:
@@ -348,7 +350,6 @@ def check_twitter_token(chat_id, token_address):
             supply = float(token_data.get('supply', 0))
             buy_tx_per_min, sell_tx_per_min = get_real_tx_per_min_solana(token_address)
             
-            # Vérification du ratio achats/ventes
             if sell_tx_per_min > 0:
                 buy_sell_ratio = buy_tx_per_min / sell_tx_per_min
                 if buy_sell_ratio < BUY_SELL_RATIO_THRESHOLD:
@@ -451,7 +452,6 @@ def check_bsc_token(chat_id, token_address, loose_mode):
         market_cap = volume_24h * supply
         buy_tx_per_min, sell_tx_per_min = get_real_tx_per_min_bsc(token_address)
 
-        # Vérification du ratio achats/ventes
         if sell_tx_per_min > 0:
             buy_sell_ratio = buy_tx_per_min / sell_tx_per_min
             if buy_sell_ratio < BUY_SELL_RATIO_THRESHOLD:
@@ -556,7 +556,6 @@ def check_solana_token(chat_id, token_address):
         supply = float(token_data.get('supply', 0))
         buy_tx_per_min, sell_tx_per_min = get_real_tx_per_min_solana(token_address)
         
-        # Vérification du ratio achats/ventes
         if sell_tx_per_min > 0:
             buy_sell_ratio = buy_tx_per_min / sell_tx_per_min
             if buy_sell_ratio < BUY_SELL_RATIO_THRESHOLD:
@@ -616,12 +615,14 @@ def webhook():
 @bot.message_handler(commands=['start'])
 def start_message(message):
     logger.info("Commande /start reçue")
+    chat_id = message.chat.id
     try:
-        bot.send_message(message.chat.id, "✅ Bot démarré!")
-        show_main_menu(message.chat.id)
+        bot.send_message(chat_id, "✅ Bot démarré!")
+        threading.Thread(target=initialize_bot, args=(chat_id,), daemon=True).start()  # Initialisation différée
+        show_main_menu(chat_id)
     except Exception as e:
         logger.error(f"Erreur dans start_message: {str(e)}")
-        bot.send_message(message.chat.id, f'⚠️ Erreur au démarrage: {str(e)}')
+        bot.send_message(chat_id, f'⚠️ Erreur au démarrage: {str(e)}')
 
 @bot.message_handler(commands=['menu'])
 def menu_message(message):
@@ -1182,7 +1183,7 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
             bot.send_message(chat_id, f'⏳ Vente en cours de {amount} BNB de {contract_address}, TX: {tx_hash.hex()}')
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
             if receipt.status == 1:
-                                del portfolio[contract_address]
+                del portfolio[contract_address]
                 bot.send_message(chat_id, f'✅ Vente effectuée : {amount} BNB de {contract_address}')
             else:
                 bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}, TX: {tx_hash.hex()}')
@@ -1191,7 +1192,7 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
             bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
 
 def monitor_and_sell(chat_id):
-    while trade_active:
+        while trade_active:
         try:
             if not portfolio:
                 time.sleep(1)
@@ -1308,30 +1309,31 @@ def sell_token_immediate(chat_id, token):
         logger.error(f"Erreur vente immédiate: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vente immédiate {token}: {str(e)}')
 
-def set_webhook():
+def set_webhook(chat_id):
     logger.info("Configuration du webhook...")
     try:
         bot.remove_webhook()
         time.sleep(1)
         bot.set_webhook(url=WEBHOOK_URL)
         logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
+        bot.send_message(chat_id, f"✅ Webhook configuré sur {WEBHOOK_URL}")
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
-        raise
+        bot.send_message(chat_id, f'⚠️ Erreur configuration webhook: {str(e)}')
 
 def run_bot(chat_id):
-    logger.info("Démarrage du bot...")
+    logger.info("Démarrage du bot dans un thread...")
     try:
-        initialize_bot()
-        set_webhook()
-        logger.info("Bot initialisé avec succès.")
+        initialize_bot(chat_id)
+        set_webhook(chat_id)
+        logger.info("Bot initialisé avec succès dans le thread.")
     except Exception as e:
-        logger.error(f"Erreur lors du démarrage du bot: {str(e)}")
+        logger.error(f"Erreur lors du démarrage du bot dans le thread: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur démarrage bot: {str(e)}')
-        raise
 
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
     logger.info(f"Flask démarré sur 0.0.0.0:{PORT}")
+    # Note: run_bot est déclenché via la commande /start pour éviter un blocage au démarrage
     
