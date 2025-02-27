@@ -22,6 +22,7 @@ from telethon import TelegramClient, events
 from dotenv import load_dotenv
 from statistics import mean, stdev
 from typing import Dict, List, Optional
+import tempfile
 
 # Configuration des logs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -175,7 +176,7 @@ def get_tx_ratio_bsc(token_address: str) -> float:
     try:
         latest_block = w3.eth.block_number
         buy_count, sell_count = 0, 0
-        for block_num in range(max(latest_block - 200, 0), latest_block + 1):  # Étendu à 200 blocs
+        for block_num in range(max(latest_block - 500, 0), latest_block + 1):  # Étendu à 500 blocs
             block = w3.eth.get_block(block_num, full_transactions=True)
             for tx in block['transactions']:
                 if tx.get('to') == PANCAKE_ROUTER_ADDRESS or tx.get('from') == token_address:
@@ -235,7 +236,7 @@ def monitor_twitter(chat_id: int) -> None:
     global twitter_requests_remaining, twitter_last_reset, last_twitter_call
     logger.info("Surveillance Twitter démarrée...")
     bot.send_message(chat_id, "📡 Surveillance Twitter activée...")
-    base_delay = 20.0  # Augmenté à 20s pour éviter 429
+    base_delay = 30.0  # Augmenté à 30s pour éviter 429
     error_count = 0
     max_errors = 10
 
@@ -251,10 +252,10 @@ def monitor_twitter(chat_id: int) -> None:
                 logger.info("Quota Twitter réinitialisé : 450 requêtes.")
                 error_count = 0
 
-            if twitter_requests_remaining < 20:
+            if twitter_requests_remaining <= 1:  # Plus strict pour éviter 429
                 wait_time = 900 - (current_time - twitter_last_reset) + 10
-                logger.warning(f"Quota faible ({twitter_requests_remaining}), attente de {wait_time:.1f}s...")
-                bot.send_message(chat_id, f"⚠️ Quota Twitter bas ({twitter_requests_remaining}), pause de {wait_time:.1f}s...")
+                logger.warning(f"Quota épuisé ({twitter_requests_remaining}), attente de {wait_time:.1f}s...")
+                bot.send_message(chat_id, f"⚠️ Quota Twitter épuisé ({twitter_requests_remaining}), pause de {wait_time:.1f}s...")
                 time.sleep(wait_time)
                 continue
 
@@ -315,8 +316,10 @@ async def monitor_telegram(chat_id: int) -> None:
         bot.send_message(chat_id, "⚠️ Surveillance Telegram désactivée : clés API manquantes.")
         return
     try:
-        # Utiliser une session en mémoire pour éviter les conflits SQLite dans Cloud Run
-        telegram_client = TelegramClient(None, int(TELEGRAM_API_ID), TELEGRAM_API_HASH, in_memory=True)
+        # Utiliser un fichier temporaire unique pour la session
+        with tempfile.NamedTemporaryFile(suffix='.session', delete=False) as temp_session:
+            session_file = temp_session.name
+        telegram_client = TelegramClient(session_file, int(TELEGRAM_API_ID), TELEGRAM_API_HASH)
         async with telegram_client:
             @telegram_client.on(events.NewMessage(chats=['memecoin_group']))  # Remplacez par un vrai groupe
             async def handler(event):
@@ -336,6 +339,9 @@ async def monitor_telegram(chat_id: int) -> None:
     except Exception as e:
         logger.error(f"Erreur dans monitor_telegram: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur surveillance Telegram: {str(e)}')
+    finally:
+        if os.path.exists(session_file):
+            os.remove(session_file)  # Nettoyer le fichier temporaire
 
 def check_twitter_token(chat_id: int, token_address: str) -> bool:
     try:
@@ -357,8 +363,11 @@ def check_twitter_token(chat_id: int, token_address: str) -> bool:
             buy_sell_ratio = get_tx_ratio_bsc(token_address)
             volatility = calculate_volatility(token_address, 'bsc')
 
-            if buy_sell_ratio < MIN_BUY_SELL_RATIO_BSC:
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO_BSC}')
+            # Abaisser temporairement le seuil pour tester
+            min_ratio = 0.5 if buy_sell_ratio == 0 else MIN_BUY_SELL_RATIO_BSC
+
+            if buy_sell_ratio < min_ratio:
+                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente {buy_sell_ratio:.2f} < {min_ratio}')
                 return False
             if not (MIN_VOLUME_BSC <= volume_24h <= MAX_VOLUME_BSC):
                 bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_BSC}, {MAX_VOLUME_BSC}]')
@@ -386,7 +395,7 @@ def check_twitter_token(chat_id: int, token_address: str) -> bool:
             if token_address == "So11111111111111111111111111111111111111112":
                 logger.info(f"Ignorer Wrapped SOL: {token_address}")
                 return False
-            max_retries = 3
+            max_retries = 5  # Augmenté à 5
             for attempt in range(max_retries):
                 try:
                     response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
@@ -395,7 +404,7 @@ def check_twitter_token(chat_id: int, token_address: str) -> bool:
                     if not data:
                         logger.warning(f"Réponse vide de Birdeye pour {token_address} (tentative {attempt + 1}/{max_retries})")
                         if attempt < max_retries - 1:
-                            time.sleep(5)
+                            time.sleep(10)  # Délai plus long
                             continue
                         return False
                     volume_24h = float(data.get('v24hUSD', 0))
@@ -433,7 +442,7 @@ def check_twitter_token(chat_id: int, token_address: str) -> bool:
                 except Exception as e:
                     logger.error(f"Erreur vérification Solana {token_address} (tentative {attempt + 1}/{max_retries}): {str(e)}")
                     if attempt < max_retries - 1:
-                        time.sleep(5)
+                        time.sleep(10)
                     else:
                         bot.send_message(chat_id, f'⚠️ Erreur vérification Solana {token_address} après {max_retries} tentatives: {str(e)}')
                         return False
@@ -532,7 +541,7 @@ def check_bsc_token(chat_id: int, token_address: str, loose_mode: bool) -> bool:
         min_liquidity = MIN_LIQUIDITY * 0.5 if loose_mode else MIN_LIQUIDITY
         min_market_cap = MIN_MARKET_CAP_BSC * 0.5 if loose_mode else MIN_MARKET_CAP_BSC
         max_market_cap = MAX_MARKET_CAP_BSC
-        min_ratio = MIN_BUY_SELL_RATIO_BSC * 0.5 if loose_mode else MIN_BUY_SELL_RATIO_BSC
+        min_ratio = 0.5 if loose_mode or buy_sell_ratio == 0 else MIN_BUY_SELL_RATIO_BSC  # Abaissé pour tester
 
         if buy_sell_ratio < min_ratio:
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente {buy_sell_ratio:.2f} < {min_ratio}')
@@ -596,7 +605,7 @@ def check_solana_token(chat_id: int, token_address: str) -> None:
             logger.info(f"Ignorer Wrapped SOL: {token_address}")
             return
 
-        max_retries = 3
+        max_retries = 5  # Augmenté à 5
         for attempt in range(max_retries):
             try:
                 response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
@@ -605,7 +614,7 @@ def check_solana_token(chat_id: int, token_address: str) -> None:
                 if not data:
                     logger.warning(f"Réponse vide de Birdeye pour {token_address} (tentative {attempt + 1}/{max_retries})")
                     if attempt < max_retries - 1:
-                        time.sleep(5)
+                        time.sleep(10)
                         continue
                     return
                 volume_24h = float(data.get('v24hUSD', 0))
@@ -645,7 +654,7 @@ def check_solana_token(chat_id: int, token_address: str) -> None:
             except Exception as e:
                 logger.error(f"Erreur vérification Solana {token_address} (tentative {attempt + 1}/{max_retries}): {str(e)}")
                 if attempt < max_retries - 1:
-                    time.sleep(5)
+                    time.sleep(10)
                 else:
                     bot.send_message(chat_id, f'⚠️ Erreur vérification Solana {token_address} après {max_retries} tentatives: {str(e)}')
     except Exception as e:
@@ -722,7 +731,6 @@ def callback_query(call):
                 trade_active = True
                 bot.send_message(chat_id, "▶️ Trading lancé avec succès!")
                 threading.Thread(target=trading_cycle, args=(chat_id,), daemon=True).start()
-                # Lancer les threads une seule fois ici
                 threading.Thread(target=snipe_new_pairs_bsc, args=(chat_id,), daemon=True).start()
                 threading.Thread(target=lambda: asyncio.run(monitor_telegram(chat_id)), daemon=True).start()
             else:
