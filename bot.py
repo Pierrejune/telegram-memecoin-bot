@@ -73,9 +73,9 @@ solana_keypair = None
 mise_depart_bsc = 0.02
 mise_depart_sol = 0.37
 gas_fee = 5
-stop_loss_threshold = 15  # Prudent mais rapide
+stop_loss_threshold = 15
 trailing_stop_percentage = 5
-take_profit_steps = [1.5, 2, 5]  # Progressif et agressif
+take_profit_steps = [1.5, 2, 5]
 detected_tokens = {}
 trade_active = False
 portfolio: Dict[str, dict] = {}
@@ -83,17 +83,19 @@ twitter_tokens = []
 max_positions = 3
 profit_reinvestment_ratio = 0.5
 
-MIN_VOLUME_SOL = 2000
-MAX_VOLUME_SOL = 1000000
-MIN_VOLUME_BSC = 2000
-MAX_VOLUME_BSC = 1500000
+MIN_VOLUME_SOL = 10000
+MAX_VOLUME_SOL = 500000
+MIN_VOLUME_BSC = 10000
+MAX_VOLUME_BSC = 500000
 MIN_LIQUIDITY = 30000
 MIN_MARKET_CAP_SOL = 75000
 MAX_MARKET_CAP_SOL = 2000000
 MIN_MARKET_CAP_BSC = 75000
 MAX_MARKET_CAP_BSC = 4000000
-MIN_BUY_SELL_RATIO_BSC = 2.0  # Élevé pour forte croissance
+MIN_BUY_SELL_RATIO_BSC = 2.0
 MIN_BUY_SELL_RATIO_SOL = 2.0
+MAX_HOLDER_PERCENTAGE = 20.0
+MIN_RECENT_TXNS = 5
 
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
@@ -121,6 +123,24 @@ def initialize_bot():
         logger.error(f"Erreur dans l'initialisation différée: {str(e)}")
         raise
 
+def is_safe_token_bsc(token_address: str) -> bool:
+    try:
+        response = session.get(f"https://api.honeypot.is/v2/IsHoneypot?address={token_address}", timeout=10)
+        data = response.json()
+        return not data.get("isHoneypot", True) and data.get("buyTax", 0) <= 10 and data.get("sellTax", 0) <= 10
+    except Exception as e:
+        logger.error(f"Erreur vérification Honeypot BSC: {str(e)}")
+        return False
+
+def is_safe_token_solana(token_address: str) -> bool:
+    try:
+        response = session.get(f"https://public-api.birdeye.so/v1/token/token_security?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
+        data = response.json()['data']
+        return data.get('is_open_source', False) and not data.get('is_honeypot', True)
+    except Exception as e:
+        logger.error(f"Erreur vérification sécurité Solana: {str(e)}")
+        return False
+
 def get_token_data_bsc(token_address: str) -> Dict[str, float]:
     try:
         response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=10)
@@ -129,16 +149,18 @@ def get_token_data_bsc(token_address: str) -> Dict[str, float]:
         liquidity = float(data.get('liquidity', {}).get('usd', 0))
         market_cap = float(data.get('marketCap', 0))
         price = float(data.get('priceUsd', 0))
-        buy_count = float(data.get('txns', {}).get('h24', {}).get('buys', 0))
-        sell_count = float(data.get('txns', {}).get('h24', {}).get('sells', 0))
-        buy_sell_ratio = buy_count / max(sell_count, 1)
+        buy_count_5m = float(data.get('txns', {}).get('m5', {}).get('buys', 0))
+        sell_count_5m = float(data.get('txns', {}).get('m5', {}).get('sells', 0))
+        buy_sell_ratio_5m = buy_count_5m / max(sell_count_5m, 1)
+        recent_buy_count = buy_count_5m
+        
         return {
             'volume_24h': volume_24h, 'liquidity': liquidity, 'market_cap': market_cap,
-            'price': price, 'buy_sell_ratio': buy_sell_ratio
+            'price': price, 'buy_sell_ratio': buy_sell_ratio_5m, 'recent_buy_count': recent_buy_count
         }
     except Exception as e:
         logger.error(f"Erreur récupération données DexScreener BSC {token_address}: {str(e)}")
-        return {'volume_24h': 0, 'liquidity': 0, 'market_cap': 0, 'price': 0, 'buy_sell_ratio': 0}
+        return {'volume_24h': 0, 'liquidity': 0, 'market_cap': 0, 'price': 0, 'buy_sell_ratio': 0, 'recent_buy_count': 0}
 
 def get_token_data_solana(token_address: str) -> Dict[str, float]:
     try:
@@ -148,16 +170,34 @@ def get_token_data_solana(token_address: str) -> Dict[str, float]:
         liquidity = float(data.get('liquidity', {}).get('usd', 0))
         market_cap = float(data.get('marketCap', 0))
         price = float(data.get('priceUsd', 0))
-        buy_count = float(data.get('txns', {}).get('h24', {}).get('buys', 0))
-        sell_count = float(data.get('txns', {}).get('h24', {}).get('sells', 0))
-        buy_sell_ratio = buy_count / max(sell_count, 1)
+        buy_count_5m = float(data.get('txns', {}).get('m5', {}).get('buys', 0))
+        sell_count_5m = float(data.get('txns', {}).get('m5', {}).get('sells', 0))
+        buy_sell_ratio_5m = buy_count_5m / max(sell_count_5m, 1)
+        recent_buy_count = buy_count_5m
+        
+        # Vérification supplémentaire Birdeye pour holders et sécurité
+        top_holder_pct = get_holder_distribution(token_address, 'solana')
         return {
             'volume_24h': volume_24h, 'liquidity': liquidity, 'market_cap': market_cap,
-            'price': price, 'buy_sell_ratio': buy_sell_ratio
+            'price': price, 'buy_sell_ratio': buy_sell_ratio_5m, 'recent_buy_count': recent_buy_count,
+            'top_holder_pct': top_holder_pct
         }
     except Exception as e:
         logger.error(f"Erreur récupération données DexScreener Solana {token_address}: {str(e)}")
-        return {'volume_24h': 0, 'liquidity': 0, 'market_cap': 0, 'price': 0, 'buy_sell_ratio': 0}
+        return {'volume_24h': 0, 'liquidity': 0, 'market_cap': 0, 'price': 0, 'buy_sell_ratio': 0, 'recent_buy_count': 0, 'top_holder_pct': 100}
+
+def get_holder_distribution(token_address: str, chain: str) -> float:
+    if chain == 'solana':
+        try:
+            response = session.get(f"https://public-api.birdeye.so/v1/token/token_security?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
+            data = response.json()['data']
+            top_holder = max(data.get('top_10_holder_percent', 0), data.get('top_20_holder_percent', 0))
+            return top_holder
+        except Exception as e:
+            logger.error(f"Erreur récupération distribution holders {token_address}: {str(e)}")
+            return 100
+    else:
+        return 0  # Placeholder pour BSC, nécessite API payante
 
 def monitor_twitter(chat_id: int) -> None:
     global twitter_requests_remaining, twitter_last_reset, last_twitter_call
@@ -219,9 +259,9 @@ def monitor_twitter(chat_id: int) -> None:
                 time.sleep(60)
         except Exception as e:
             logger.error(f"Erreur Twitter inattendue: {str(e)}")
+            bot.send_message(chat_id, f'⚠️ Erreur Twitter: {str(e)}. Reprise dans 60s...')
             time.sleep(60)
         logger.info("Redémarrage surveillance Twitter après erreur...")
-    logger.info("Surveillance Twitter arrêtée.")
 
 def check_twitter_token(chat_id: int, token_address: str) -> bool:
     try:
@@ -229,67 +269,65 @@ def check_twitter_token(chat_id: int, token_address: str) -> bool:
             bot.send_message(chat_id, f'⚠️ Limite de {max_positions} positions atteinte, token {token_address} ignoré.')
             return False
 
-        if token_address.startswith("0x"):
-            data = get_token_data_bsc(token_address)
-            volume_24h = data['volume_24h']
-            liquidity = data['liquidity']
-            market_cap = data['market_cap']
-            buy_sell_ratio = data['buy_sell_ratio']
-            price = data['price']
+        chain = 'bsc' if token_address.startswith("0x") else 'solana'
+        data = get_token_data_bsc(token_address) if chain == 'bsc' else get_token_data_solana(token_address)
+        volume_24h = data['volume_24h']
+        liquidity = data['liquidity']
+        market_cap = data['market_cap']
+        buy_sell_ratio = data['buy_sell_ratio']
+        recent_buy_count = data['recent_buy_count']
+        price = data['price']
+        top_holder_pct = data.get('top_holder_pct', 0) if chain == 'solana' else get_holder_distribution(token_address, chain)
 
-            if buy_sell_ratio < MIN_BUY_SELL_RATIO_BSC:
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO_BSC}')
-                return False
-            if volume_24h < MIN_VOLUME_BSC or volume_24h > MAX_VOLUME_BSC:
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_BSC}, {MAX_VOLUME_BSC}]')
-                return False
-            if liquidity < MIN_LIQUIDITY:
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : liquidité ${liquidity} < ${MIN_LIQUIDITY}')
-                return False
-            if market_cap < MIN_MARKET_CAP_BSC or market_cap > MAX_MARKET_CAP_BSC:
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : market cap ${market_cap} hors plage [{MIN_MARKET_CAP_BSC}, {MAX_MARKET_CAP_BSC}]')
-                return False
-            
-            bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (BSC) - Ratio A/V: {buy_sell_ratio:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
-            detected_tokens[token_address] = {
-                'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
-                'market_cap': market_cap, 'supply': market_cap / price, 'price': price,
-                'buy_sell_ratio': buy_sell_ratio
-            }
-            buy_token_bsc(chat_id, token_address, mise_depart_bsc)
-            return True
+        if chain == 'bsc':
+            min_ratio = MIN_BUY_SELL_RATIO_BSC
+            min_volume = MIN_VOLUME_BSC
+            max_volume = MAX_VOLUME_BSC
+            min_market_cap = MIN_MARKET_CAP_BSC
+            max_market_cap = MAX_MARKET_CAP_BSC
         else:
-            if token_address == "So11111111111111111111111111111111111111112":
-                logger.info(f"Ignorer Wrapped SOL: {token_address}")
-                return False
-            data = get_token_data_solana(token_address)
-            volume_24h = data['volume_24h']
-            liquidity = data['liquidity']
-            market_cap = data['market_cap']
-            buy_sell_ratio = data['buy_sell_ratio']
-            price = data['price']
+            min_ratio = MIN_BUY_SELL_RATIO_SOL
+            min_volume = MIN_VOLUME_SOL
+            max_volume = MAX_VOLUME_SOL
+            min_market_cap = MIN_MARKET_CAP_SOL
+            max_market_cap = MAX_MARKET_CAP_SOL
 
-            if buy_sell_ratio < MIN_BUY_SELL_RATIO_SOL:
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO_SOL}')
-                return False
-            if volume_24h < MIN_VOLUME_SOL or volume_24h > MAX_VOLUME_SOL:
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]')
-                return False
-            if liquidity < MIN_LIQUIDITY:
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : liquidité ${liquidity} < ${MIN_LIQUIDITY}')
-                return False
-            if market_cap < MIN_MARKET_CAP_SOL or market_cap > MAX_MARKET_CAP_SOL:
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : market cap ${market_cap} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]')
-                return False
-            
-            bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (Solana) - Ratio A/V: {buy_sell_ratio:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
-            detected_tokens[token_address] = {
-                'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
-                'market_cap': market_cap, 'supply': market_cap / price, 'price': price,
-                'buy_sell_ratio': buy_sell_ratio
-            }
+        if buy_sell_ratio < min_ratio:
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente 5min {buy_sell_ratio:.2f} < {min_ratio}')
+            return False
+        if volume_24h < min_volume or volume_24h > max_volume:
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volume ${volume_24h} hors plage [{min_volume}, {max_volume}]')
+            return False
+        if liquidity < MIN_LIQUIDITY:
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : liquidité ${liquidity} < ${MIN_LIQUIDITY}')
+            return False
+        if market_cap < min_market_cap or market_cap > max_market_cap:
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : market cap ${market_cap} hors plage [{min_market_cap}, {max_market_cap}]')
+            return False
+        if recent_buy_count < MIN_RECENT_TXNS:
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : {recent_buy_count} achats récents < {MIN_RECENT_TXNS} en 5 min')
+            return False
+        if top_holder_pct > MAX_HOLDER_PERCENTAGE:
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : top holder détient {top_holder_pct}% > {MAX_HOLDER_PERCENTAGE}%')
+            return False
+        if chain == 'bsc' and not is_safe_token_bsc(token_address):
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : possible rug ou taxes élevées')
+            return False
+        if chain == 'solana' and not is_safe_token_solana(token_address):
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : possible rug ou non open-source')
+            return False
+
+        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} ({chain}) - Ratio A/V 5min: {buy_sell_ratio:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}, Achats 5min: {recent_buy_count}')
+        detected_tokens[token_address] = {
+            'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
+            'market_cap': market_cap, 'supply': market_cap / price, 'price': price,
+            'buy_sell_ratio': buy_sell_ratio, 'recent_buy_count': recent_buy_count
+        }
+        if chain == 'bsc':
+            buy_token_bsc(chat_id, token_address, mise_depart_bsc)
+        else:
             buy_token_solana(chat_id, token_address, mise_depart_sol)
-            return True
+        return True
     except Exception as e:
         logger.error(f"Erreur vérification token {token_address}: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vérification token {token_address}: {str(e)}')
@@ -327,10 +365,12 @@ def check_bsc_token(chat_id: int, token_address: str) -> bool:
         liquidity = data['liquidity']
         market_cap = data['market_cap']
         buy_sell_ratio = data['buy_sell_ratio']
+        recent_buy_count = data['recent_buy_count']
         price = data['price']
+        top_holder_pct = get_holder_distribution(token_address, 'bsc')
 
         if buy_sell_ratio < MIN_BUY_SELL_RATIO_BSC:
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO_BSC}')
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente 5min {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO_BSC}')
             return False
         if volume_24h < MIN_VOLUME_BSC or volume_24h > MAX_VOLUME_BSC:
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_BSC}, {MAX_VOLUME_BSC}]')
@@ -341,12 +381,21 @@ def check_bsc_token(chat_id: int, token_address: str) -> bool:
         if market_cap < MIN_MARKET_CAP_BSC or market_cap > MAX_MARKET_CAP_BSC:
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : market cap ${market_cap} hors plage [{MIN_MARKET_CAP_BSC}, {MAX_MARKET_CAP_BSC}]')
             return False
+        if recent_buy_count < MIN_RECENT_TXNS:
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : {recent_buy_count} achats récents < {MIN_RECENT_TXNS} en 5 min')
+            return False
+        if top_holder_pct > MAX_HOLDER_PERCENTAGE:
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : top holder détient {top_holder_pct}% > {MAX_HOLDER_PERCENTAGE}%')
+            return False
+        if not is_safe_token_bsc(token_address):
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : possible rug ou taxes élevées')
+            return False
         
-        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (BSC) - Ratio A/V: {buy_sell_ratio:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
+        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (BSC) - Ratio A/V 5min: {buy_sell_ratio:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}, Achats 5min: {recent_buy_count}')
         detected_tokens[token_address] = {
             'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
             'market_cap': market_cap, 'supply': market_cap / price, 'price': price,
-            'buy_sell_ratio': buy_sell_ratio
+            'buy_sell_ratio': buy_sell_ratio, 'recent_buy_count': recent_buy_count
         }
         buy_token_bsc(chat_id, token_address, mise_depart_bsc)
         return True
@@ -428,10 +477,12 @@ def check_solana_token(chat_id: int, token_address: str) -> bool:
         liquidity = data['liquidity']
         market_cap = data['market_cap']
         buy_sell_ratio = data['buy_sell_ratio']
+        recent_buy_count = data['recent_buy_count']
         price = data['price']
+        top_holder_pct = data['top_holder_pct']
 
         if buy_sell_ratio < MIN_BUY_SELL_RATIO_SOL:
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO_SOL}')
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente 5min {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO_SOL}')
             return False
         if volume_24h < MIN_VOLUME_SOL or volume_24h > MAX_VOLUME_SOL:
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]')
@@ -442,12 +493,21 @@ def check_solana_token(chat_id: int, token_address: str) -> bool:
         if market_cap < MIN_MARKET_CAP_SOL or market_cap > MAX_MARKET_CAP_SOL:
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : market cap ${market_cap} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]')
             return False
+        if recent_buy_count < MIN_RECENT_TXNS:
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : {recent_buy_count} achats récents < {MIN_RECENT_TXNS} en 5 min')
+            return False
+        if top_holder_pct > MAX_HOLDER_PERCENTAGE:
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : top holder détient {top_holder_pct}% > {MAX_HOLDER_PERCENTAGE}%')
+            return False
+        if not is_safe_token_solana(token_address):
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : possible rug ou non open-source')
+            return False
         
-        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (Solana) - Ratio A/V: {buy_sell_ratio:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
+        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (Solana) - Ratio A/V 5min: {buy_sell_ratio:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}, Achats 5min: {recent_buy_count}')
         detected_tokens[token_address] = {
             'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
             'market_cap': market_cap, 'supply': market_cap / price, 'price': price,
-            'buy_sell_ratio': buy_sell_ratio
+            'buy_sell_ratio': buy_sell_ratio, 'recent_buy_count': recent_buy_count
         }
         buy_token_solana(chat_id, token_address, mise_depart_sol)
         return True
@@ -498,13 +558,18 @@ def show_main_menu(chat_id: int) -> None:
         InlineKeyboardButton("⚙️ Configure", callback_data="config"),
         InlineKeyboardButton("▶️ Lancer", callback_data="launch"),
         InlineKeyboardButton("⏹️ Arrêter", callback_data="stop"),
-        InlineKeyboardButton("💰 Portefeuille", callback_data="portfolio")
+        InlineKeyboardButton("💰 Portefeuille", callback_data="portfolio"),
+        InlineKeyboardButton("🔧 Réglages", callback_data="settings"),
+        InlineKeyboardButton("📈 TP/SL", callback_data="tp_sl_settings"),
+        InlineKeyboardButton("📊 Seuils", callback_data="threshold_settings")
     )
     bot.send_message(chat_id, "Voici le menu principal:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
-    global mise_depart_bsc, mise_depart_sol, trade_active, gas_fee
+    global mise_depart_bsc, mise_depart_sol, trade_active, gas_fee, stop_loss_threshold, take_profit_steps
+    global MIN_VOLUME_BSC, MAX_VOLUME_BSC, MIN_LIQUIDITY, MIN_MARKET_CAP_BSC, MAX_MARKET_CAP_BSC
+    global MIN_VOLUME_SOL, MAX_VOLUME_SOL, MIN_MARKET_CAP_SOL, MAX_MARKET_CAP_SOL, MIN_BUY_SELL_RATIO_BSC, MIN_BUY_SELL_RATIO_SOL
     chat_id = call.message.chat.id
     logger.info(f"Callback reçu: {call.data}")
     try:
@@ -530,12 +595,72 @@ def callback_query(call):
             bot.send_message(chat_id, "⏹️ Trading arrêté.")
         elif call.data == "portfolio":
             show_portfolio(chat_id)
+        elif call.data == "settings":
+            show_settings_menu(chat_id)
+        elif call.data == "tp_sl_settings":
+            show_tp_sl_menu(chat_id)
+        elif call.data == "threshold_settings":
+            show_threshold_menu(chat_id)
         elif call.data == "increase_mise_bsc":
             mise_depart_bsc += 0.01
             bot.send_message(chat_id, f'🔍 Mise BSC augmentée à {mise_depart_bsc} BNB')
         elif call.data == "increase_mise_sol":
             mise_depart_sol += 0.01
             bot.send_message(chat_id, f'🔍 Mise Solana augmentée à {mise_depart_sol} SOL')
+        elif call.data == "adjust_mise_bsc":
+            bot.send_message(chat_id, "Entrez la nouvelle mise BSC (en BNB, ex. : 0.02) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_mise_bsc)
+        elif call.data == "adjust_mise_sol":
+            bot.send_message(chat_id, "Entrez la nouvelle mise Solana (en SOL, ex. : 0.37) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_mise_sol)
+        elif call.data == "adjust_gas":
+            bot.send_message(chat_id, "Entrez les nouveaux frais de gas (en Gwei, ex. : 5) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_gas_fee)
+        elif call.data == "adjust_stop_loss":
+            bot.send_message(chat_id, "Entrez le nouveau seuil de Stop-Loss (en %, ex. : 15) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_stop_loss)
+        elif call.data == "adjust_take_profit":
+            bot.send_message(chat_id, "Entrez les nouveaux seuils de Take-Profit (3 valeurs séparées par des virgules, ex. : 1.5,2,5) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_take_profit)
+        elif call.data == "adjust_min_volume_bsc":
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de volume BSC (en $, ex. : 10000) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_volume_bsc)
+        elif call.data == "adjust_max_volume_bsc":
+            bot.send_message(chat_id, "Entrez le nouveau seuil max de volume BSC (en $, ex. : 500000) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_max_volume_bsc)
+        elif call.data == "adjust_min_liquidity":
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de liquidité (en $, ex. : 30000) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_liquidity)
+        elif call.data == "adjust_min_market_cap_bsc":
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de market cap BSC (en $, ex. : 75000) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_market_cap_bsc)
+        elif call.data == "adjust_max_market_cap_bsc":
+            bot.send_message(chat_id, "Entrez le nouveau seuil max de market cap BSC (en $, ex. : 4000000) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_max_market_cap_bsc)
+        elif call.data == "adjust_min_volume_sol":
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de volume Solana (en $, ex. : 10000) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_volume_sol)
+        elif call.data == "adjust_max_volume_sol":
+            bot.send_message(chat_id, "Entrez le nouveau seuil max de volume Solana (en $, ex. : 500000) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_max_volume_sol)
+        elif call.data == "adjust_min_market_cap_sol":
+            bot.send_message(chat_id, "Entrez le nouveau seuil min de market cap Solana (en $, ex. : 75000) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_market_cap_sol)
+        elif call.data == "adjust_max_market_cap_sol":
+            bot.send_message(chat_id, "Entrez le nouveau seuil max de market cap Solana (en $, ex. : 2000000) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_max_market_cap_sol)
+        elif call.data == "adjust_buy_sell_ratio_bsc":
+            bot.send_message(chat_id, "Entrez le nouveau ratio achat/vente min pour BSC (ex. : 2.0) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_buy_sell_ratio_bsc)
+        elif call.data == "adjust_buy_sell_ratio_sol":
+            bot.send_message(chat_id, "Entrez le nouveau ratio achat/vente min pour Solana (ex. : 2.0) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_buy_sell_ratio_sol)
+        elif call.data.startswith("refresh_"):
+            token = call.data.split("_")[1]
+            refresh_token(chat_id, token)
+        elif call.data.startswith("sell_"):
+            token = call.data.split("_")[1]
+            sell_token_immediate(chat_id, token)
     except Exception as e:
         logger.error(f"Erreur dans callback_query: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur générale: {str(e)}')
@@ -566,6 +691,255 @@ def show_config_menu(chat_id: int) -> None:
         InlineKeyboardButton("➕ Augmenter mise SOL (+0.01 SOL)", callback_data="increase_mise_sol")
     )
     bot.send_message(chat_id, "⚙️ Configuration:", reply_markup=markup)
+
+def show_settings_menu(chat_id: int) -> None:
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("🔧 Ajuster Mise BSC", callback_data="adjust_mise_bsc"),
+        InlineKeyboardButton("🔧 Ajuster Mise Solana", callback_data="adjust_mise_sol"),
+        InlineKeyboardButton("🔧 Ajuster Gas Fee (BSC)", callback_data="adjust_gas")
+    )
+    bot.send_message(chat_id, "🔧 Réglages:", reply_markup=markup)
+
+def show_tp_sl_menu(chat_id: int) -> None:
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("📉 Ajuster Stop-Loss", callback_data="adjust_stop_loss"),
+        InlineKeyboardButton("📈 Ajuster Take-Profit", callback_data="adjust_take_profit")
+    )
+    bot.send_message(chat_id, "📈 Configuration TP/SL", reply_markup=markup)
+
+def show_threshold_menu(chat_id: int) -> None:
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("📊 Min Volume BSC", callback_data="adjust_min_volume_bsc"),
+        InlineKeyboardButton("📊 Max Volume BSC", callback_data="adjust_max_volume_bsc"),
+        InlineKeyboardButton("📊 Min Liquidité", callback_data="adjust_min_liquidity"),
+        InlineKeyboardButton("📊 Min Market Cap BSC", callback_data="adjust_min_market_cap_bsc"),
+        InlineKeyboardButton("📊 Max Market Cap BSC", callback_data="adjust_max_market_cap_bsc"),
+        InlineKeyboardButton("📊 Min Volume Solana", callback_data="adjust_min_volume_sol"),
+        InlineKeyboardButton("📊 Max Volume Solana", callback_data="adjust_max_volume_sol"),
+        InlineKeyboardButton("📊 Min Market Cap Solana", callback_data="adjust_min_market_cap_sol"),
+        InlineKeyboardButton("📊 Max Market Cap Solana", callback_data="adjust_max_market_cap_sol"),
+        InlineKeyboardButton("📊 Ratio A/V BSC", callback_data="adjust_buy_sell_ratio_bsc"),
+        InlineKeyboardButton("📊 Ratio A/V Solana", callback_data="adjust_buy_sell_ratio_sol")
+    )
+    bot.send_message(chat_id, (
+        f'📊 Seuils de détection :\n- BSC Volume: {MIN_VOLUME_BSC} $ - {MAX_VOLUME_BSC} $\n'
+        f'- BSC Ratio A/V: {MIN_BUY_SELL_RATIO_BSC}\n'
+        f'- BSC Market Cap : {MIN_MARKET_CAP_BSC} $ - {MAX_MARKET_CAP_BSC} $\n'
+        f'- Min Liquidité : {MIN_LIQUIDITY} $\n- Solana Volume: {MIN_VOLUME_SOL} $ - {MAX_VOLUME_SOL} $\n'
+        f'- Solana Ratio A/V: {MIN_BUY_SELL_RATIO_SOL}\n'
+        f'- Solana Market Cap : {MIN_MARKET_CAP_SOL} $ - {MAX_MARKET_CAP_SOL} $'
+    ), reply_markup=markup)
+
+def adjust_mise_bsc(message):
+    global mise_depart_bsc
+    chat_id = message.chat.id
+    try:
+        new_mise = float(message.text)
+        if new_mise > 0:
+            mise_depart_bsc = new_mise
+            bot.send_message(chat_id, f'✅ Mise BSC mise à jour à {mise_depart_bsc} BNB')
+        else:
+            bot.send_message(chat_id, "⚠️ La mise doit être positive!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 0.02)")
+
+def adjust_mise_sol(message):
+    global mise_depart_sol
+    chat_id = message.chat.id
+    try:
+        new_mise = float(message.text)
+        if new_mise > 0:
+            mise_depart_sol = new_mise
+            bot.send_message(chat_id, f'✅ Mise Solana mise à jour à {mise_depart_sol} SOL')
+        else:
+            bot.send_message(chat_id, "⚠️ La mise doit être positive!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 0.37)")
+
+def adjust_gas_fee(message):
+    global gas_fee
+    chat_id = message.chat.id
+    try:
+        new_gas_fee = float(message.text)
+        if new_gas_fee > 0:
+            gas_fee = new_gas_fee
+            bot.send_message(chat_id, f'✅ Frais de gas mis à jour à {gas_fee} Gwei')
+        else:
+            bot.send_message(chat_id, "⚠️ Les frais de gas doivent être positifs!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 5)")
+
+def adjust_stop_loss(message):
+    global stop_loss_threshold
+    chat_id = message.chat.id
+    try:
+        new_sl = float(message.text)
+        if new_sl > 0:
+            stop_loss_threshold = new_sl
+            bot.send_message(chat_id, f'✅ Stop-Loss mis à jour à {stop_loss_threshold} %')
+        else:
+            bot.send_message(chat_id, "⚠️ Le Stop-Loss doit être positif!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un pourcentage valide (ex. : 15)")
+
+def adjust_take_profit(message):
+    global take_profit_steps
+    chat_id = message.chat.id
+    try:
+        new_tp = [float(x) for x in message.text.split(",")]
+        if len(new_tp) == 3 and all(x > 0 for x in new_tp):
+            take_profit_steps = new_tp
+            bot.send_message(chat_id, f'✅ Take-Profit mis à jour à x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}')
+        else:
+            bot.send_message(chat_id, "⚠️ Entrez 3 valeurs positives séparées par des virgules (ex. : 1.5,2,5)")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 1.5,2,5)")
+
+def adjust_min_volume_bsc(message):
+    global MIN_VOLUME_BSC
+    chat_id = message.chat.id
+    try:
+        new_value = float(message.text)
+        if new_value >= 0:
+            MIN_VOLUME_BSC = new_value
+            bot.send_message(chat_id, f'✅ Min Volume BSC mis à jour à ${MIN_VOLUME_BSC}')
+        else:
+            bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 10000)")
+
+def adjust_max_volume_bsc(message):
+    global MAX_VOLUME_BSC
+    chat_id = message.chat.id
+    try:
+        new_value = float(message.text)
+        if new_value >= MIN_VOLUME_BSC:
+            MAX_VOLUME_BSC = new_value
+            bot.send_message(chat_id, f'✅ Max Volume BSC mis à jour à ${MAX_VOLUME_BSC}')
+        else:
+            bot.send_message(chat_id, "⚠️ La valeur doit être supérieure au minimum!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 500000)")
+
+def adjust_min_liquidity(message):
+    global MIN_LIQUIDITY
+    chat_id = message.chat.id
+    try:
+        new_value = float(message.text)
+        if new_value >= 0:
+            MIN_LIQUIDITY = new_value
+            bot.send_message(chat_id, f'✅ Min Liquidité mis à jour à ${MIN_LIQUIDITY}')
+        else:
+            bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 30000)")
+
+def adjust_min_market_cap_bsc(message):
+    global MIN_MARKET_CAP_BSC
+    chat_id = message.chat.id
+    try:
+        new_value = float(message.text)
+        if new_value >= 0:
+            MIN_MARKET_CAP_BSC = new_value
+            bot.send_message(chat_id, f'✅ Min Market Cap BSC mis à jour à ${MIN_MARKET_CAP_BSC}')
+        else:
+            bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 75000)")
+
+def adjust_max_market_cap_bsc(message):
+    global MAX_MARKET_CAP_BSC
+    chat_id = message.chat.id
+    try:
+        new_value = float(message.text)
+        if new_value >= MIN_MARKET_CAP_BSC:
+            MAX_MARKET_CAP_BSC = new_value
+            bot.send_message(chat_id, f'✅ Max Market Cap BSC mis à jour à ${MAX_MARKET_CAP_BSC}')
+        else:
+            bot.send_message(chat_id, "⚠️ La valeur doit être supérieure au minimum!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 4000000)")
+
+def adjust_min_volume_sol(message):
+    global MIN_VOLUME_SOL
+    chat_id = message.chat.id
+    try:
+        new_value = float(message.text)
+        if new_value >= 0:
+            MIN_VOLUME_SOL = new_value
+            bot.send_message(chat_id, f'✅ Min Volume Solana mis à jour à ${MIN_VOLUME_SOL}')
+        else:
+            bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 10000)")
+
+def adjust_max_volume_sol(message):
+    global MAX_VOLUME_SOL
+    chat_id = message.chat.id
+    try:
+        new_value = float(message.text)
+        if new_value >= MIN_VOLUME_SOL:
+            MAX_VOLUME_SOL = new_value
+            bot.send_message(chat_id, f'✅ Max Volume Solana mis à jour à ${MAX_VOLUME_SOL}')
+        else:
+            bot.send_message(chat_id, "⚠️ La valeur doit être supérieure au minimum!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 500000)")
+
+def adjust_min_market_cap_sol(message):
+    global MIN_MARKET_CAP_SOL
+    chat_id = message.chat.id
+    try:
+        new_value = float(message.text)
+        if new_value >= 0:
+            MIN_MARKET_CAP_SOL = new_value
+            bot.send_message(chat_id, f'✅ Min Market Cap Solana mis à jour à ${MIN_MARKET_CAP_SOL}')
+        else:
+            bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 75000)")
+
+def adjust_max_market_cap_sol(message):
+    global MAX_MARKET_CAP_SOL
+    chat_id = message.chat.id
+    try:
+        new_value = float(message.text)
+        if new_value >= MIN_MARKET_CAP_SOL:
+            MAX_MARKET_CAP_SOL = new_value
+            bot.send_message(chat_id, f'✅ Max Market Cap Solana mis à jour à ${MAX_MARKET_CAP_SOL}')
+        else:
+            bot.send_message(chat_id, "⚠️ La valeur doit être supérieure au minimum!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 2000000)")
+
+def adjust_buy_sell_ratio_bsc(message):
+    global MIN_BUY_SELL_RATIO_BSC
+    chat_id = message.chat.id
+    try:
+        new_ratio = float(message.text)
+        if new_ratio > 0:
+            MIN_BUY_SELL_RATIO_BSC = new_ratio
+            bot.send_message(chat_id, f'✅ Ratio A/V BSC mis à jour à {MIN_BUY_SELL_RATIO_BSC}')
+        else:
+            bot.send_message(chat_id, "⚠️ Le ratio doit être positif!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 2.0)")
+
+def adjust_buy_sell_ratio_sol(message):
+    global MIN_BUY_SELL_RATIO_SOL
+    chat_id = message.chat.id
+    try:
+        new_ratio = float(message.text)
+        if new_ratio > 0:
+            MIN_BUY_SELL_RATIO_SOL = new_ratio
+            bot.send_message(chat_id, f'✅ Ratio A/V Solana mis à jour à {MIN_BUY_SELL_RATIO_SOL}')
+        else:
+            bot.send_message(chat_id, "⚠️ Le ratio doit être positif!")
+    except ValueError:
+        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 2.0)")
 
 def buy_token_bsc(chat_id: int, contract_address: str, amount: float) -> None:
     try:
@@ -610,7 +984,7 @@ def buy_token_solana(chat_id: int, contract_address: str, amount: float) -> None
             "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
         }, timeout=5)
         blockhash = response.json()['result']['value']['blockhash']
-        txcession = Transaction()
+        tx = Transaction.from_recent_blockhash(Pubkey.from_string(blockhash))
         instruction = Instruction(
             program_id=RAYDIUM_PROGRAM_ID,
             accounts=[
@@ -621,8 +995,7 @@ def buy_token_solana(chat_id: int, contract_address: str, amount: float) -> None
             data=bytes([2]) + amount_in.to_bytes(8, 'little')
         )
         tx.add(instruction)
-        tx.recent_blockhash = Pubkey.from_string(blockhash)
-        tx.sign(solana_keypair)
+        tx.sign([solana_keypair])
         tx_hash = session.post(SOLANA_RPC, json={
             "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
             "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
@@ -652,7 +1025,7 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
                 "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
             }, timeout=5)
             blockhash = response.json()['result']['value']['blockhash']
-            tx = Transaction()
+            tx = Transaction.from_recent_blockhash(Pubkey.from_string(blockhash))
             instruction = Instruction(
                 program_id=RAYDIUM_PROGRAM_ID,
                 accounts=[
@@ -663,8 +1036,7 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
                 data=bytes([3]) + amount_out.to_bytes(8, 'little')
             )
             tx.add(instruction)
-            tx.recent_blockhash = Pubkey.from_string(blockhash)
-            tx.sign(solana_keypair)
+            tx.sign([solana_keypair])
             tx_hash = session.post(SOLANA_RPC, json={
                 "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
                 "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
@@ -734,20 +1106,19 @@ def monitor_and_sell(chat_id: int) -> None:
                 data['highest_price'] = max(data['highest_price'], current_price)
                 trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
 
-                # Vente basée uniquement sur les seuils, sans contrainte temporelle
-                if profit_pct >= take_profit_steps[2] * 100:  # Take-profit max (x5)
+                if profit_pct >= take_profit_steps[2] * 100:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
-                elif profit_pct >= take_profit_steps[1] * 100 and trend < 1.05:  # Take-profit intermédiaire (x2) si stagnation
+                elif profit_pct >= take_profit_steps[1] * 100 and trend < 1.05:
                     sell_amount = amount / 2
                     sell_token(chat_id, contract_address, sell_amount, chain, current_price)
                     portfolio[contract_address]['amount'] -= sell_amount
-                elif profit_pct >= take_profit_steps[0] * 100 and trend < 1.02:  # Take-profit initial (x1.5) si ralentissement
+                elif profit_pct >= take_profit_steps[0] * 100 and trend < 1.02:
                     sell_amount = amount / 3
                     sell_token(chat_id, contract_address, sell_amount, chain, current_price)
                     portfolio[contract_address]['amount'] -= sell_amount
-                elif current_price <= trailing_stop_price:  # Trailing stop
+                elif current_price <= trailing_stop_price:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
-                elif loss_pct >= stop_loss_threshold:  # Stop-loss
+                elif loss_pct >= stop_loss_threshold:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
             time.sleep(2)
         except Exception as e:
@@ -770,7 +1141,9 @@ def show_portfolio(chat_id: int) -> None:
             )
             msg += (
                 f"Token: {ca} ({data['chain']})\nMC Achat: ${data['market_cap_at_buy']:.2f}\n"
-                f"MC Actuel: ${current_mc:.2f}\nProfit: {profit:.2f}%\nProfit cumulé: {data['profit']:.4f} {data['chain'].upper()}\n\n"
+                f"MC Actuel: ${current_mc:.2f}\nProfit: {profit:.2f}%\nProfit cumulé: {data['profit']:.4f} {data['chain'].upper()}\n"
+                f"Take-Profit: x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}\n"
+                f"Trailing Stop: -{trailing_stop_percentage}% sous pic\nStop-Loss: -{stop_loss_threshold} %\n\n"
             )
         bot.send_message(chat_id, msg, reply_markup=markup if portfolio else None)
     except Exception as e:
@@ -810,7 +1183,9 @@ def refresh_token(chat_id: int, token: str) -> None:
         msg = (
             f"Token: {token} ({portfolio[token]['chain']})\nContrat: {token}\n"
             f"MC Achat: ${portfolio[token]['market_cap_at_buy']:.2f}\nMC Actuel: ${current_mc:.2f}\n"
-            f"Profit: {profit:.2f}%\nProfit cumulé: {portfolio[token]['profit']:.4f} {portfolio[token]['chain'].upper()}\n"
+            f"Profit: {profit:.2f}%\nProfit cumulé: ${portfolio[token]['profit']:.4f} {portfolio[token]['chain'].upper()}\n"
+            f"Take-Profit: x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}\n"
+            f"Trailing Stop: -{trailing_stop_percentage}% sous pic\nStop-Loss: -{stop_loss_threshold} %"
         )
         bot.send_message(chat_id, f'🔍 Portefeuille rafraîchi pour {token}:\n{msg}', reply_markup=markup)
     except Exception as e:
