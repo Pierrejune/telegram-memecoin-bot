@@ -52,7 +52,7 @@ TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 PORT = int(os.getenv("PORT", 8080))
-BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")  # HTTP par défaut, WebSocket en option
+BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 
 BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
@@ -175,7 +175,7 @@ def get_tx_ratio_bsc(token_address: str) -> float:
     try:
         latest_block = w3.eth.block_number
         buy_count, sell_count = 0, 0
-        for block_num in range(max(latest_block - 100, 0), latest_block + 1):
+        for block_num in range(max(latest_block - 200, 0), latest_block + 1):  # Étendu à 200 blocs
             block = w3.eth.get_block(block_num, full_transactions=True)
             for tx in block['transactions']:
                 if tx.get('to') == PANCAKE_ROUTER_ADDRESS or tx.get('from') == token_address:
@@ -235,7 +235,7 @@ def monitor_twitter(chat_id: int) -> None:
     global twitter_requests_remaining, twitter_last_reset, last_twitter_call
     logger.info("Surveillance Twitter démarrée...")
     bot.send_message(chat_id, "📡 Surveillance Twitter activée...")
-    base_delay = 15.0
+    base_delay = 20.0  # Augmenté à 20s pour éviter 429
     error_count = 0
     max_errors = 10
 
@@ -315,18 +315,22 @@ async def monitor_telegram(chat_id: int) -> None:
         bot.send_message(chat_id, "⚠️ Surveillance Telegram désactivée : clés API manquantes.")
         return
     try:
-        telegram_client = TelegramClient('bot_session', int(TELEGRAM_API_ID), TELEGRAM_API_HASH)
+        # Utiliser une session en mémoire pour éviter les conflits SQLite dans Cloud Run
+        telegram_client = TelegramClient(None, int(TELEGRAM_API_ID), TELEGRAM_API_HASH, in_memory=True)
         async with telegram_client:
             @telegram_client.on(events.NewMessage(chats=['memecoin_group']))  # Remplacez par un vrai groupe
             async def handler(event):
-                text = event.message.text.lower()
-                words = text.split()
-                for word in words:
-                    if (len(word) == 42 and word.startswith("0x")) or len(word) == 44:
-                        if word not in telegram_tokens:
-                            telegram_tokens.append(word)
-                            bot.send_message(chat_id, f'🔍 Token détecté via Telegram: {word}')
-                            check_twitter_token(chat_id, word)
+                try:
+                    text = event.message.text.lower()
+                    words = text.split()
+                    for word in words:
+                        if (len(word) == 42 and word.startswith("0x")) or len(word) == 44:
+                            if word not in telegram_tokens:
+                                telegram_tokens.append(word)
+                                bot.send_message(chat_id, f'🔍 Token détecté via Telegram: {word}')
+                                check_twitter_token(chat_id, word)
+                except Exception as e:
+                    logger.error(f"Erreur dans handler Telegram: {str(e)}")
             logger.info("Surveillance Telegram active.")
             await telegram_client.run_until_disconnected()
     except Exception as e:
@@ -382,44 +386,57 @@ def check_twitter_token(chat_id: int, token_address: str) -> bool:
             if token_address == "So11111111111111111111111111111111111111112":
                 logger.info(f"Ignorer Wrapped SOL: {token_address}")
                 return False
-            response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-            response.raise_for_status()
-            data = response.json().get('data', {})
-            if not data:
-                logger.warning(f"Réponse vide de Birdeye pour {token_address}")
-                return False
-            volume_24h = float(data.get('v24hUSD', 0))
-            liquidity = float(data.get('liquidity', 0))
-            market_cap = float(data.get('mc', 0))
-            supply = float(data.get('supply', 0))
-            buy_sell_ratio = get_tx_ratio_solana(token_address)
-            volatility = calculate_volatility(token_address, 'solana')
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
+                    response.raise_for_status()
+                    data = response.json().get('data', {})
+                    if not data:
+                        logger.warning(f"Réponse vide de Birdeye pour {token_address} (tentative {attempt + 1}/{max_retries})")
+                        if attempt < max_retries - 1:
+                            time.sleep(5)
+                            continue
+                        return False
+                    volume_24h = float(data.get('v24hUSD', 0))
+                    liquidity = float(data.get('liquidity', 0))
+                    market_cap = float(data.get('mc', 0))
+                    supply = float(data.get('supply', 0))
+                    buy_sell_ratio = get_tx_ratio_solana(token_address)
+                    volatility = calculate_volatility(token_address, 'solana')
 
-            if buy_sell_ratio < MIN_BUY_SELL_RATIO_SOL:
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO_SOL}')
-                return False
-            if not (MIN_VOLUME_SOL <= volume_24h <= MAX_VOLUME_SOL):
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]')
-                return False
-            if liquidity < MIN_LIQUIDITY:
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : liquidité ${liquidity} < ${MIN_LIQUIDITY}')
-                return False
-            if not (MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : market cap ${market_cap} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]')
-                return False
-            if not is_safe_token_solana(token_address):
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : possible rug ou liquidité insuffisante')
-                return False
-            if volatility < MIN_VOLATILITY:
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volatilité {volatility:.2f}% < {MIN_VOLATILITY}%')
-                return False
-            bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (Solana) - Ratio A/V: {buy_sell_ratio:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}, Volatilité: {volatility:.2f}%')
-            detected_tokens[token_address] = {
-                'address': token_address, 'volume': volume_24h, 'buy_sell_ratio': buy_sell_ratio,
-                'liquidity': liquidity, 'market_cap': market_cap, 'supply': supply, 'volatility': volatility
-            }
-            buy_token_solana(chat_id, token_address, mise_depart_sol)
-            return True
+                    if buy_sell_ratio < MIN_BUY_SELL_RATIO_SOL:
+                        bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO_SOL}')
+                        return False
+                    if not (MIN_VOLUME_SOL <= volume_24h <= MAX_VOLUME_SOL):
+                        bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]')
+                        return False
+                    if liquidity < MIN_LIQUIDITY:
+                        bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : liquidité ${liquidity} < ${MIN_LIQUIDITY}')
+                        return False
+                    if not (MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
+                        bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : market cap ${market_cap} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]')
+                        return False
+                    if not is_safe_token_solana(token_address):
+                        bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : possible rug ou liquidité insuffisante')
+                        return False
+                    if volatility < MIN_VOLATILITY:
+                        bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volatilité {volatility:.2f}% < {MIN_VOLATILITY}%')
+                        return False
+                    bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (Solana) - Ratio A/V: {buy_sell_ratio:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}, Volatilité: {volatility:.2f}%')
+                    detected_tokens[token_address] = {
+                        'address': token_address, 'volume': volume_24h, 'buy_sell_ratio': buy_sell_ratio,
+                        'liquidity': liquidity, 'market_cap': market_cap, 'supply': supply, 'volatility': volatility
+                    }
+                    buy_token_solana(chat_id, token_address, mise_depart_sol)
+                    return True
+                except Exception as e:
+                    logger.error(f"Erreur vérification Solana {token_address} (tentative {attempt + 1}/{max_retries}): {str(e)}")
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
+                    else:
+                        bot.send_message(chat_id, f'⚠️ Erreur vérification Solana {token_address} après {max_retries} tentatives: {str(e)}')
+                        return False
     except Exception as e:
         logger.error(f"Erreur vérification token {token_address}: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vérification token {token_address}: {str(e)}')
@@ -579,45 +596,58 @@ def check_solana_token(chat_id: int, token_address: str) -> None:
             logger.info(f"Ignorer Wrapped SOL: {token_address}")
             return
 
-        response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-        response.raise_for_status()
-        data = response.json().get('data', {})
-        if not data:
-            logger.warning(f"Réponse vide de Birdeye pour {token_address}")
-            return
-        volume_24h = float(data.get('v24hUSD', 0))
-        liquidity = float(data.get('liquidity', 0))
-        market_cap = float(data.get('mc', 0))
-        supply = float(data.get('supply', 0))
-        buy_sell_ratio = get_tx_ratio_solana(token_address)
-        volatility = calculate_volatility(token_address, 'solana')
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = session.get(f"https://public-api.birdeye.so/v1/token/token_overview?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
+                response.raise_for_status()
+                data = response.json().get('data', {})
+                if not data:
+                    logger.warning(f"Réponse vide de Birdeye pour {token_address} (tentative {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
+                        continue
+                    return
+                volume_24h = float(data.get('v24hUSD', 0))
+                liquidity = float(data.get('liquidity', 0))
+                market_cap = float(data.get('mc', 0))
+                supply = float(data.get('supply', 0))
+                buy_sell_ratio = get_tx_ratio_solana(token_address)
+                volatility = calculate_volatility(token_address, 'solana')
 
-        logger.info(f"Validation {token_address} : Ratio A/V={buy_sell_ratio:.2f}, Vol=${volume_24h}, Liq=${liquidity}, MC=${market_cap}, Volatilité={volatility:.2f}%")
+                logger.info(f"Validation {token_address} : Ratio A/V={buy_sell_ratio:.2f}, Vol=${volume_24h}, Liq=${liquidity}, MC=${market_cap}, Volatilité={volatility:.2f}%")
 
-        if buy_sell_ratio < MIN_BUY_SELL_RATIO_SOL:
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO_SOL}')
-            return
-        if not (MIN_VOLUME_SOL <= volume_24h <= MAX_VOLUME_SOL):
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]')
-            return
-        if liquidity < MIN_LIQUIDITY:
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : liquidité ${liquidity} < ${MIN_LIQUIDITY}')
-            return
-        if not (MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : market cap ${market_cap} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]')
-            return
-        if not is_safe_token_solana(token_address):
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : possible rug ou liquidité insuffisante')
-            return
-        if volatility < MIN_VOLATILITY:
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volatilité {volatility:.2f}% < {MIN_VOLATILITY}%')
-            return
-        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (Solana) - Ratio A/V: {buy_sell_ratio:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}, Volatilité: {volatility:.2f}%')
-        detected_tokens[token_address] = {
-            'address': token_address, 'volume': volume_24h, 'buy_sell_ratio': buy_sell_ratio,
-            'liquidity': liquidity, 'market_cap': market_cap, 'supply': supply, 'volatility': volatility
-        }
-        buy_token_solana(chat_id, token_address, mise_depart_sol)
+                if buy_sell_ratio < MIN_BUY_SELL_RATIO_SOL:
+                    bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO_SOL}')
+                    return
+                if not (MIN_VOLUME_SOL <= volume_24h <= MAX_VOLUME_SOL):
+                    bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]')
+                    return
+                if liquidity < MIN_LIQUIDITY:
+                    bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : liquidité ${liquidity} < ${MIN_LIQUIDITY}')
+                    return
+                if not (MIN_MARKET_CAP_SOL <= market_cap <= MAX_MARKET_CAP_SOL):
+                    bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : market cap ${market_cap} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]')
+                    return
+                if not is_safe_token_solana(token_address):
+                    bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : possible rug ou liquidité insuffisante')
+                    return
+                if volatility < MIN_VOLATILITY:
+                    bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volatilité {volatility:.2f}% < {MIN_VOLATILITY}%')
+                    return
+                bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (Solana) - Ratio A/V: {buy_sell_ratio:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}, Volatilité: {volatility:.2f}%')
+                detected_tokens[token_address] = {
+                    'address': token_address, 'volume': volume_24h, 'buy_sell_ratio': buy_sell_ratio,
+                    'liquidity': liquidity, 'market_cap': market_cap, 'supply': supply, 'volatility': volatility
+                }
+                buy_token_solana(chat_id, token_address, mise_depart_sol)
+                break
+            except Exception as e:
+                logger.error(f"Erreur vérification Solana {token_address} (tentative {attempt + 1}/{max_retries}): {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                else:
+                    bot.send_message(chat_id, f'⚠️ Erreur vérification Solana {token_address} après {max_retries} tentatives: {str(e)}')
     except Exception as e:
         logger.error(f"Erreur vérification Solana {token_address}: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vérification Solana {token_address}: {str(e)}')
@@ -692,6 +722,7 @@ def callback_query(call):
                 trade_active = True
                 bot.send_message(chat_id, "▶️ Trading lancé avec succès!")
                 threading.Thread(target=trading_cycle, args=(chat_id,), daemon=True).start()
+                # Lancer les threads une seule fois ici
                 threading.Thread(target=snipe_new_pairs_bsc, args=(chat_id,), daemon=True).start()
                 threading.Thread(target=lambda: asyncio.run(monitor_telegram(chat_id)), daemon=True).start()
             else:
@@ -770,8 +801,6 @@ def trading_cycle(chat_id: int) -> None:
     cycle_count = 0
     threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True).start()
     threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
-    threading.Thread(target=snipe_new_pairs_bsc, args=(chat_id,), daemon=True).start()
-    threading.Thread(target=lambda: asyncio.run(monitor_telegram(chat_id)), daemon=True).start()
     while trade_active:
         try:
             cycle_count += 1
