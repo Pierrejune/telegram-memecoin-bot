@@ -82,7 +82,7 @@ twitter_tokens = []
 
 MIN_VOLUME_SOL = 25000
 MAX_VOLUME_SOL = 750000
-MIN_VOLUME_BSC = 1000
+MIN_VOLUME_BSC = 1000  # Réduit pour détecter plus de tokens
 MAX_VOLUME_BSC = 1000000
 MIN_LIQUIDITY = 50000
 MIN_MARKET_CAP_SOL = 50000
@@ -90,11 +90,10 @@ MAX_MARKET_CAP_SOL = 1500000
 MIN_MARKET_CAP_BSC = 75000
 MAX_MARKET_CAP_BSC = 3000000
 MAX_TAX = 10
-MIN_POSITIVE_TX_PER_MIN_BSC = 2
+MIN_POSITIVE_TX_PER_MIN_BSC = 5  # Minimum d'achats par minute
 MAX_TX_PER_MIN_BSC = 75
-MIN_POSITIVE_TX_PER_MIN_SOL = 5
+MIN_POSITIVE_TX_PER_MIN_SOL = 10  # Minimum d'achats par minute
 MAX_TX_PER_MIN_SOL = 150
-BUY_SELL_RATIO_THRESHOLD = 2  # Achats doivent être 2x supérieurs aux ventes
 
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
@@ -159,21 +158,17 @@ def get_real_tx_per_min_bsc(token_address):
     try:
         latest_block = w3.eth.block_number
         buy_tx_count = 0
-        sell_tx_count = 0
-        for block_num in range(max(latest_block - 100, 0), latest_block + 1):  # ~5 min
+        for block_num in range(max(latest_block - 50, 0), latest_block + 1):
             block = w3.eth.get_block(block_num, full_transactions=True)
             for tx in block['transactions']:
-                if tx.get('to') == token_address:
-                    buy_tx_count += 1  # Achat
-                elif tx.get('from') == token_address:
-                    sell_tx_count += 1  # Vente
-        normalized_buy_tx = buy_tx_count * 0.6  # Normalisation pour 1 min
-        normalized_sell_tx = sell_tx_count * 0.6
-        logger.info(f"Tx BSC pour {token_address}: Achats/min: {normalized_buy_tx}, Ventes/min: {normalized_sell_tx}")
-        return normalized_buy_tx, normalized_sell_tx
+                if tx.get('to') == token_address:  # Compter uniquement les achats
+                    buy_tx_count += 1
+        normalized_buy_tx = buy_tx_count * 1.2  # Normalisation pour ~1 min
+        logger.info(f"Tx d'achat/min calculé pour {token_address}: {normalized_buy_tx}")
+        return normalized_buy_tx
     except Exception as e:
         logger.error(f"Erreur calcul tx/min BSC pour {token_address}: {str(e)}")
-        return 0, 0
+        return 0
 
 def get_real_tx_per_min_solana(token_address):
     try:
@@ -182,16 +177,14 @@ def get_real_tx_per_min_solana(token_address):
         trades = response.json()['data']['items']
         if not trades:
             logger.warning(f"Aucune transaction récente via Birdeye pour {token_address}")
-            return 0, 0
-        buy_tx_count = sum(1 for trade in trades if trade.get('type') == 'buy')
-        sell_tx_count = sum(1 for trade in trades if trade.get('type') == 'sell')
+            return 0
+        buy_tx_count = sum(1 for trade in trades if trade.get('type') == 'buy')  # Filtrer les achats
         normalized_buy_tx = min(buy_tx_count * 2, MAX_TX_PER_MIN_SOL)
-        normalized_sell_tx = min(sell_tx_count * 2, MAX_TX_PER_MIN_SOL)
-        logger.info(f"Tx Solana pour {token_address}: Achats/min: {normalized_buy_tx}, Ventes/min: {normalized_sell_tx}")
-        return normalized_buy_tx, normalized_sell_tx
+        logger.info(f"Tx d'achat/min calculé pour {token_address}: {normalized_buy_tx}")
+        return normalized_buy_tx
     except Exception as e:
         logger.error(f"Erreur calcul tx/min Solana pour {token_address}: {str(e)}")
-        return 0, 0
+        return 0
 
 def monitor_twitter(chat_id):
     global twitter_requests_remaining, twitter_last_reset, last_twitter_call
@@ -300,20 +293,9 @@ def check_twitter_token(chat_id, token_address):
             volume_24h = float(data.get('volume', {}).get('h24', 0))
             liquidity = float(data.get('liquidity', {}).get('usd', 0))
             market_cap = volume_24h * supply
-            buy_tx_per_min, sell_tx_per_min = get_real_tx_per_min_bsc(token_address)
-            
-            # Vérification du ratio achats/ventes
-            if sell_tx_per_min > 0:
-                buy_sell_ratio = buy_tx_per_min / sell_tx_per_min
-                if buy_sell_ratio < BUY_SELL_RATIO_THRESHOLD:
-                    bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : ratio achats/ventes {buy_sell_ratio:.2f} < {BUY_SELL_RATIO_THRESHOLD}')
-                    return False
-            elif buy_tx_per_min == 0:
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : aucune transaction d\'achat détectée')
-                return False
-
-            if not (MIN_POSITIVE_TX_PER_MIN_BSC <= buy_tx_per_min <= MAX_TX_PER_MIN_BSC):
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : tx d\'achat/min {buy_tx_per_min} hors plage [{MIN_POSITIVE_TX_PER_MIN_BSC}, {MAX_TX_PER_MIN_BSC}]')
+            tx_per_min = get_real_tx_per_min_bsc(token_address)
+            if not (MIN_POSITIVE_TX_PER_MIN_BSC <= tx_per_min <= MAX_TX_PER_MIN_BSC):
+                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : tx d\'achat/min {tx_per_min} hors plage [{MIN_POSITIVE_TX_PER_MIN_BSC}, {MAX_TX_PER_MIN_BSC}]')
                 return False
             if not (MIN_VOLUME_BSC <= volume_24h <= MAX_VOLUME_BSC):
                 bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_BSC}, {MAX_VOLUME_BSC}]')
@@ -327,9 +309,9 @@ def check_twitter_token(chat_id, token_address):
             if not is_safe_token_bsc(token_address):
                 bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : possible rug ou taxes élevées')
                 return False
-            bot.send_message(chat_id, f'🔍 Token X détecté : {token_address} (BSC) - Tx d\'achat/min: {buy_tx_per_min}, Tx vente/min: {sell_tx_per_min}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
+            bot.send_message(chat_id, f'🔍 Token X détecté : {token_address} (BSC) - Tx d\'achat/min: {tx_per_min}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
             detected_tokens[token_address] = {
-                'address': token_address, 'volume': volume_24h, 'tx_per_min': buy_tx_per_min,
+                'address': token_address, 'volume': volume_24h, 'tx_per_min': tx_per_min,
                 'liquidity': liquidity, 'market_cap': market_cap, 'supply': supply
             }
             buy_token_bsc(chat_id, token_address, mise_depart_bsc)
@@ -346,20 +328,9 @@ def check_twitter_token(chat_id, token_address):
             liquidity = float(token_data.get('liquidity', 0))
             market_cap = float(token_data.get('mc', 0))
             supply = float(token_data.get('supply', 0))
-            buy_tx_per_min, sell_tx_per_min = get_real_tx_per_min_solana(token_address)
-            
-            # Vérification du ratio achats/ventes
-            if sell_tx_per_min > 0:
-                buy_sell_ratio = buy_tx_per_min / sell_tx_per_min
-                if buy_sell_ratio < BUY_SELL_RATIO_THRESHOLD:
-                    bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : ratio achats/ventes {buy_sell_ratio:.2f} < {BUY_SELL_RATIO_THRESHOLD}')
-                    return False
-            elif buy_tx_per_min == 0:
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : aucune transaction d\'achat détectée')
-                return False
-
-            if not (MIN_POSITIVE_TX_PER_MIN_SOL <= buy_tx_per_min <= MAX_TX_PER_MIN_SOL):
-                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : tx d\'achat/min {buy_tx_per_min} hors plage [{MIN_POSITIVE_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]')
+            tx_per_min = get_real_tx_per_min_solana(token_address)
+            if not (MIN_POSITIVE_TX_PER_MIN_SOL <= tx_per_min <= MAX_TX_PER_MIN_SOL):
+                bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : tx d\'achat/min {tx_per_min} hors plage [{MIN_POSITIVE_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]')
                 return False
             if not (MIN_VOLUME_SOL <= volume_24h <= MAX_VOLUME_SOL):
                 bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : volume ${volume_24h} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]')
@@ -373,9 +344,9 @@ def check_twitter_token(chat_id, token_address):
             if not is_safe_token_solana(token_address):
                 bot.send_message(chat_id, f'⚠️ Token X {token_address} rejeté : possible rug ou liquidité insuffisante')
                 return False
-            bot.send_message(chat_id, f'🔍 Token X détecté : {token_address} (Solana) - Tx d\'achat/min: {buy_tx_per_min}, Tx vente/min: {sell_tx_per_min}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
+            bot.send_message(chat_id, f'🔍 Token X détecté : {token_address} (Solana) - Tx d\'achat/min: {tx_per_min}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
             detected_tokens[token_address] = {
-                'address': token_address, 'volume': volume_24h, 'tx_per_min': buy_tx_per_min,
+                'address': token_address, 'volume': volume_24h, 'tx_per_min': tx_per_min,
                 'liquidity': liquidity, 'market_cap': market_cap, 'supply': supply
             }
             buy_token_solana(chat_id, token_address, mise_depart_sol)
@@ -390,10 +361,7 @@ def detect_new_tokens_bsc(chat_id):
     bot.send_message(chat_id, "🔍 Début détection BSC...")
     try:
         if not w3.is_connected():
-            logger.error("Connexion au nœud BSC perdue")
-            bot.send_message(chat_id, "⚠️ Connexion au nœud BSC perdue, tentative de reconnexion dans 10s...")
-            time.sleep(10)
-            return
+            raise ConnectionError("Connexion au nœud BSC perdue")
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
         logger.info(f"Bloc actuel : {latest_block}")
@@ -449,19 +417,7 @@ def check_bsc_token(chat_id, token_address, loose_mode):
         volume_24h = float(data.get('volume', {}).get('h24', 0))
         liquidity = float(data.get('liquidity', {}).get('usd', 0))
         market_cap = volume_24h * supply
-        buy_tx_per_min, sell_tx_per_min = get_real_tx_per_min_bsc(token_address)
-
-        # Vérification du ratio achats/ventes
-        if sell_tx_per_min > 0:
-            buy_sell_ratio = buy_tx_per_min / sell_tx_per_min
-            if buy_sell_ratio < BUY_SELL_RATIO_THRESHOLD:
-                logger.info(f"{token_address}: ratio achats/ventes {buy_sell_ratio:.2f} < {BUY_SELL_RATIO_THRESHOLD}")
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achats/ventes {buy_sell_ratio:.2f} < {BUY_SELL_RATIO_THRESHOLD}')
-                return False
-        elif buy_tx_per_min == 0:
-            logger.info(f"{token_address}: aucune transaction d'achat détectée")
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : aucune transaction d\'achat détectée')
-            return False
+        tx_per_min = get_real_tx_per_min_bsc(token_address)
 
         min_volume = MIN_VOLUME_BSC * 0.5 if loose_mode else MIN_VOLUME_BSC
         max_volume = MAX_VOLUME_BSC if loose_mode else MAX_VOLUME_BSC
@@ -470,9 +426,9 @@ def check_bsc_token(chat_id, token_address, loose_mode):
         max_market_cap = MAX_MARKET_CAP_BSC if loose_mode else MAX_MARKET_CAP_BSC
         min_tx = MIN_POSITIVE_TX_PER_MIN_BSC if not loose_mode else 0
 
-        if not (min_tx <= buy_tx_per_min <= MAX_TX_PER_MIN_BSC):
-            logger.info(f"{token_address}: tx d'achat/min {buy_tx_per_min} hors plage [{min_tx}, {MAX_TX_PER_MIN_BSC}]")
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : tx d\'achat/min {buy_tx_per_min} hors plage [{min_tx}, {MAX_TX_PER_MIN_BSC}]')
+        if not (min_tx <= tx_per_min <= MAX_TX_PER_MIN_BSC):
+            logger.info(f"{token_address}: tx d'achat/min {tx_per_min} hors plage [{min_tx}, {MAX_TX_PER_MIN_BSC}]")
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : tx d\'achat/min {tx_per_min} hors plage [{min_tx}, {MAX_TX_PER_MIN_BSC}]')
             return False
         if not (min_volume <= volume_24h <= max_volume):
             logger.info(f"{token_address}: volume {volume_24h} hors plage [{min_volume}, {max_volume}]")
@@ -491,9 +447,9 @@ def check_bsc_token(chat_id, token_address, loose_mode):
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : possible rug ou taxes élevées')
             return False
         
-        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (BSC) - Tx d\'achat/min: {buy_tx_per_min}, Tx vente/min: {sell_tx_per_min}, Vol 24h: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
+        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (BSC) - Tx d\'achat/min: {tx_per_min}, Vol 24h: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
         detected_tokens[token_address] = {
-            'address': token_address, 'volume': volume_24h, 'tx_per_min': buy_tx_per_min,
+            'address': token_address, 'volume': volume_24h, 'tx_per_min': tx_per_min,
             'liquidity': liquidity, 'market_cap': market_cap, 'supply': supply
         }
         buy_token_bsc(chat_id, token_address, mise_depart_bsc)
@@ -554,23 +510,10 @@ def check_solana_token(chat_id, token_address):
         liquidity = float(token_data.get('liquidity', 0))
         market_cap = float(token_data.get('mc', 0))
         supply = float(token_data.get('supply', 0))
-        buy_tx_per_min, sell_tx_per_min = get_real_tx_per_min_solana(token_address)
-        
-        # Vérification du ratio achats/ventes
-        if sell_tx_per_min > 0:
-            buy_sell_ratio = buy_tx_per_min / sell_tx_per_min
-            if buy_sell_ratio < BUY_SELL_RATIO_THRESHOLD:
-                logger.info(f"{token_address}: ratio achats/ventes {buy_sell_ratio:.2f} < {BUY_SELL_RATIO_THRESHOLD}")
-                bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achats/ventes {buy_sell_ratio:.2f} < {BUY_SELL_RATIO_THRESHOLD}')
-                return
-        elif buy_tx_per_min == 0:
-            logger.info(f"{token_address}: aucune transaction d'achat détectée")
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : aucune transaction d\'achat détectée')
-            return
-
-        if not (MIN_POSITIVE_TX_PER_MIN_SOL <= buy_tx_per_min <= MAX_TX_PER_MIN_SOL):
-            logger.info(f"{token_address}: tx d'achat/min {buy_tx_per_min} hors plage [{MIN_POSITIVE_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]")
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : tx d\'achat/min {buy_tx_per_min} hors plage [{MIN_POSITIVE_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]')
+        tx_per_min = get_real_tx_per_min_solana(token_address)
+        if not (MIN_POSITIVE_TX_PER_MIN_SOL <= tx_per_min <= MAX_TX_PER_MIN_SOL):
+            logger.info(f"{token_address}: tx d'achat/min {tx_per_min} hors plage [{MIN_POSITIVE_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]")
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : tx d\'achat/min {tx_per_min} hors plage [{MIN_POSITIVE_TX_PER_MIN_SOL}, {MAX_TX_PER_MIN_SOL}]')
             return
         if not (MIN_VOLUME_SOL <= volume_24h <= MAX_VOLUME_SOL):
             logger.info(f"{token_address}: volume {volume_24h} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]")
@@ -588,16 +531,17 @@ def check_solana_token(chat_id, token_address):
             logger.info(f"{token_address}: non sécurisé")
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : possible rug ou liquidité insuffisante')
             return
-        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (Solana) - Tx d\'achat/min: {buy_tx_per_min}, Tx vente/min: {sell_tx_per_min}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
+        bot.send_message(chat_id, f'🔍 Token détecté : {token_address} (Solana) - Tx d\'achat/min: {tx_per_min}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
         detected_tokens[token_address] = {
-            'address': token_address, 'volume': volume_24h, 'tx_per_min': buy_tx_per_min,
+            'address': token_address, 'volume': volume_24h, 'tx_per_min': tx_per_min,
             'liquidity': liquidity, 'market_cap': market_cap, 'supply': supply
         }
         buy_token_solana(chat_id, token_address, mise_depart_sol)
     except Exception as e:
         logger.error(f"Erreur vérification Solana {token_address}: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vérification Solana {token_address}: {str(e)}')
-        @app.route("/webhook", methods=['POST'])
+
+@app.route("/webhook", methods=['POST'])
 def webhook():
     logger.info("Webhook reçu")
     try:
@@ -655,7 +599,6 @@ def callback_query(call):
     global mise_depart_bsc, mise_depart_sol, trade_active, slippage, gas_fee, stop_loss_threshold, take_profit_steps
     global MIN_VOLUME_BSC, MAX_VOLUME_BSC, MIN_LIQUIDITY, MIN_MARKET_CAP_BSC, MAX_MARKET_CAP_BSC
     global MIN_VOLUME_SOL, MAX_VOLUME_SOL, MIN_MARKET_CAP_SOL, MAX_MARKET_CAP_SOL
-    global MIN_POSITIVE_TX_PER_MIN_BSC, MIN_POSITIVE_TX_PER_MIN_SOL
     chat_id = call.message.chat.id
     logger.info(f"Callback reçu: {call.data}")
     try:
@@ -737,12 +680,6 @@ def callback_query(call):
         elif call.data == "adjust_max_market_cap_sol":
             bot.send_message(chat_id, "Entrez le nouveau seuil max de market cap Solana (en $, ex. : 1500000) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_max_market_cap_sol)
-        elif call.data == "adjust_min_positive_tx_bsc":
-            bot.send_message(chat_id, "Entrez le nouveau seuil min de tx d'achat/min BSC (ex. : 2) :")
-            bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_positive_tx_bsc)
-        elif call.data == "adjust_min_positive_tx_sol":
-            bot.send_message(chat_id, "Entrez le nouveau seuil min de tx d'achat/min Solana (ex. : 5) :")
-            bot.register_next_step_handler_by_chat_id(chat_id, adjust_min_positive_tx_sol)
         elif call.data.startswith("refresh_"):
             token = call.data.split("_")[1]
             refresh_token(chat_id, token)
@@ -757,7 +694,8 @@ def trading_cycle(chat_id):
     global trade_active
     cycle_count = 0
     threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
-    threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True).start()
+    twitter_thread = threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True)
+    twitter_thread.start()
     while trade_active:
         try:
             cycle_count += 1
@@ -765,11 +703,11 @@ def trading_cycle(chat_id):
             logger.info(f"Cycle {cycle_count} démarré")
             detect_new_tokens_bsc(chat_id)
             detect_new_tokens_solana(chat_id)
-            time.sleep(60)
+            time.sleep(10)
         except Exception as e:
             logger.error(f"Erreur dans trading_cycle: {str(e)}")
-            bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}. Reprise dans 60s...')
-            time.sleep(60)
+            bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}. Reprise dans 10s...')
+            time.sleep(10)
     logger.info("Trading_cycle arrêté.")
     bot.send_message(chat_id, "ℹ️ Cycle de trading terminé.")
 
@@ -822,9 +760,7 @@ def show_threshold_menu(chat_id):
         InlineKeyboardButton("📊 Min Volume Solana", callback_data="adjust_min_volume_sol"),
         InlineKeyboardButton("📊 Max Volume Solana", callback_data="adjust_max_volume_sol"),
         InlineKeyboardButton("📊 Min Market Cap Solana", callback_data="adjust_min_market_cap_sol"),
-        InlineKeyboardButton("📊 Max Market Cap Solana", callback_data="adjust_max_market_cap_sol"),
-        InlineKeyboardButton("📊 Min Tx Achat BSC", callback_data="adjust_min_positive_tx_bsc"),
-        InlineKeyboardButton("📊 Min Tx Achat Solana", callback_data="adjust_min_positive_tx_sol")
+        InlineKeyboardButton("📊 Max Market Cap Solana", callback_data="adjust_max_market_cap_sol")
     )
     try:
         bot.send_message(chat_id, (
@@ -1034,32 +970,6 @@ def adjust_max_market_cap_sol(message):
     except ValueError:
         bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 1500000)")
 
-def adjust_min_positive_tx_bsc(message):
-    global MIN_POSITIVE_TX_PER_MIN_BSC
-    chat_id = message.chat.id
-    try:
-        new_value = float(message.text)
-        if new_value >= 0:
-            MIN_POSITIVE_TX_PER_MIN_BSC = new_value
-            bot.send_message(chat_id, f'✅ Min Tx d\'achat/min BSC mis à jour à {MIN_POSITIVE_TX_PER_MIN_BSC}')
-        else:
-            bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
-    except ValueError:
-        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 2)")
-
-def adjust_min_positive_tx_sol(message):
-    global MIN_POSITIVE_TX_PER_MIN_SOL
-    chat_id = message.chat.id
-    try:
-        new_value = float(message.text)
-        if new_value >= 0:
-            MIN_POSITIVE_TX_PER_MIN_SOL = new_value
-            bot.send_message(chat_id, f'✅ Min Tx d\'achat/min Solana mis à jour à {MIN_POSITIVE_TX_PER_MIN_SOL}')
-        else:
-            bot.send_message(chat_id, "⚠️ La valeur doit être positive!")
-    except ValueError:
-        bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 5)")
-
 def buy_token_bsc(chat_id, contract_address, amount):
     try:
         router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
@@ -1114,18 +1024,80 @@ def buy_token_solana(chat_id, contract_address, amount):
         tx.sign(solana_keypair)
         tx_hash = session.post(SOLANA_RPC, json={
             "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
-                        "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
+            "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
         }, timeout=5).json()['result']
-        bot.send_message(chat_id, f'⏳ Vente en cours de {amount} BNB de {contract_address}, TX: {tx_hash.hex()}')
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
-        if receipt.status == 1:
-            del portfolio[contract_address]
-            bot.send_message(chat_id, f'✅ Vente effectuée : {amount} BNB de {contract_address}')
-        else:
-            bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}, TX: {tx_hash.hex()}')
+        bot.send_message(chat_id, f'⏳ Achat en cours de {amount} SOL de {contract_address}, TX: {tx_hash}')
+        time.sleep(2)
+        entry_price = amount / (detected_tokens[contract_address]['supply'] * get_current_market_cap(contract_address) / detected_tokens[contract_address]['supply'])
+        portfolio[contract_address] = {
+            'amount': amount, 'chain': 'solana', 'entry_price': entry_price,
+            'market_cap_at_buy': detected_tokens[contract_address]['market_cap'],
+            'current_market_cap': detected_tokens[contract_address]['market_cap']
+        }
+        bot.send_message(chat_id, f'✅ Achat effectué : {amount} SOL de {contract_address}')
     except Exception as e:
-        logger.error(f"Erreur vente BSC: {str(e)}")
-        bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
+        logger.error(f"Erreur achat Solana: {str(e)}")
+        bot.send_message(chat_id, f'⚠️ Échec achat {contract_address}: {str(e)}')
+
+def sell_token(chat_id, contract_address, amount, chain, current_price):
+    if chain == "solana":
+        try:
+            amount_out = int(amount * 10**9)
+            response = session.post(SOLANA_RPC, json={
+                "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
+            }, timeout=5)
+            blockhash = response.json()['result']['value']['blockhash']
+            tx = Transaction()
+            instruction = Instruction(
+                program_id=RAYDIUM_PROGRAM_ID,
+                accounts=[
+                    {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
+                    {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
+                    {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
+                ],
+                data=bytes([3]) + amount_out.to_bytes(8, 'little')
+            )
+            tx.add(instruction)
+            tx.recent_blockhash = Pubkey.from_string(blockhash)
+            tx.sign(solana_keypair)
+            tx_hash = session.post(SOLANA_RPC, json={
+                "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+                "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
+            }, timeout=5).json()['result']
+            bot.send_message(chat_id, f'⏳ Vente en cours de {amount} SOL de {contract_address}, TX: {tx_hash}')
+            time.sleep(2)
+            del portfolio[contract_address]
+            bot.send_message(chat_id, f'✅ Vente effectuée : {amount} SOL de {contract_address}')
+        except Exception as e:
+            logger.error(f"Erreur vente Solana: {str(e)}")
+            bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
+    else:
+        try:
+            router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
+            token_amount = w3.to_wei(amount, 'ether')
+            amount_in_max = int(token_amount * (1 + slippage / 100))
+            tx = router.functions.swapExactTokensForETH(
+                token_amount,
+                amount_in_max,
+                [w3.to_checksum_address(contract_address), w3.to_checksum_address('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c')],
+                w3.to_checksum_address(WALLET_ADDRESS),
+                int(time.time()) + 60
+            ).build_transaction({
+                'from': WALLET_ADDRESS, 'gas': 200000,
+                'gasPrice': w3.to_wei(gas_fee * 2, 'gwei'), 'nonce': w3.eth.get_transaction_count(WALLET_ADDRESS)
+            })
+            signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            bot.send_message(chat_id, f'⏳ Vente en cours de {amount} BNB de {contract_address}, TX: {tx_hash.hex()}')
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+            if receipt.status == 1:
+                del portfolio[contract_address]
+                bot.send_message(chat_id, f'✅ Vente effectuée : {amount} BNB de {contract_address}')
+            else:
+                bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}, TX: {tx_hash.hex()}')
+        except Exception as e:
+            logger.error(f"Erreur vente BSC: {str(e)}")
+            bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
 
 def monitor_and_sell(chat_id):
     while trade_active:
@@ -1224,7 +1196,7 @@ def refresh_token(chat_id, token):
         msg = (
             f"Token: {token} ({portfolio[token]['chain']})\nContrat: {token}\n"
             f"MC Achat: ${portfolio[token]['market_cap_at_buy']:.2f}\nMC Actuel: ${current_mc:.2f}\n"
-            f"Profit: {profit:.2f}%\nTake-Profit: x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}\n"
+                        f"Profit: {profit:.2f}%\nTake-Profit: x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}\n"
             f"Stop-Loss: -{stop_loss_threshold} %"
         )
         bot.send_message(chat_id, f'🔍 Portefeuille rafraîchi pour {token}:\n{msg}', reply_markup=markup)
@@ -1257,16 +1229,18 @@ def set_webhook():
         raise
 
 def run_bot():
-    logger.info("Démarrage du bot dans un thread séparé...")
+    logger.info("Démarrage du bot...")
     try:
         initialize_bot()
         set_webhook()
+        logger.info("Bot initialisé avec succès.")
     except Exception as e:
         logger.error(f"Erreur lors du démarrage du bot: {str(e)}")
         raise
 
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
-    threading.Thread(target=run_bot, daemon=True).start()
+    run_bot()  # Appel direct pour garantir que Flask démarre après l'initialisation
     logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    
