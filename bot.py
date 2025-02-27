@@ -22,6 +22,8 @@ from datetime import datetime, timedelta
 import re
 import asyncio
 import websockets
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Finalized
 
 # Configuration des logs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -49,19 +51,16 @@ WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
-BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 
-BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
 missing_vars = [var for var, val in {
     "TELEGRAM_TOKEN": TELEGRAM_TOKEN, "WALLET_ADDRESS": WALLET_ADDRESS, "PRIVATE_KEY": PRIVATE_KEY,
-    "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "WEBHOOK_URL": WEBHOOK_URL, "BIRDEYE_API_KEY": BIRDEYE_API_KEY,
-    "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN
+    "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "WEBHOOK_URL": WEBHOOK_URL, "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN
 }.items() if not val]
 if missing_vars:
     logger.critical(f"Variables manquantes: {missing_vars}")
@@ -106,6 +105,7 @@ MIN_RECENT_TXNS = 3
 MAX_TOKEN_AGE_HOURS = 72
 REJECT_EXPIRATION_HOURS = 24
 RETRY_DELAY_MINUTES = 5
+GRACE_PERIOD_HOURS = 6  # Fenêtre de grâce pour les nouveaux tokens
 
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
@@ -144,9 +144,9 @@ def is_safe_token_bsc(token_address: str) -> bool:
 
 def is_safe_token_solana(token_address: str) -> bool:
     try:
-        response = session.get(f"https://public-api.birdeye.so/v1/token/token_security?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-        data = response.json()['data']
-        return data.get('is_open_source', False) and not data.get('is_honeypot', True)
+        response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=10)
+        data = response.json()['pairs'][0] if response.json()['pairs'] else {}
+        return 'is_open_source' in data and data.get('is_open_source', False) and not data.get('is_honeypot', True)
     except Exception as e:
         logger.error(f"Erreur vérification sécurité Solana: {str(e)}")
         return False
@@ -178,10 +178,10 @@ def get_token_data(token_address: str, chain: str) -> Dict[str, float]:
         sell_count_5m = float(data.get('txns', {}).get('m5', {}).get('sells', 0))
         buy_sell_ratio_5m = buy_count_5m / max(sell_count_5m, 1)
         recent_buy_count = buy_count_5m
-        pair_created_at = data.get('pairCreatedAt', 0) / 1000 if data.get('pairCreatedAt') else time.time() - 3600
+        pair_created_at = data.get('pairCreatedAt', 0) / 1000 if data.get('pairCreatedAt') else time.time()
         
         if chain == 'solana':
-            top_holder_pct = get_holder_distribution(token_address, chain)
+            top_holder_pct = 0  # Placeholder, à implémenter si nécessaire
         else:
             top_holder_pct = 0
         
@@ -193,19 +193,6 @@ def get_token_data(token_address: str, chain: str) -> Dict[str, float]:
     except Exception as e:
         logger.error(f"Erreur récupération données DexScreener {token_address} ({chain}): {str(e)}")
         return {'volume_24h': 0, 'liquidity': 0, 'market_cap': 0, 'price': 0, 'buy_sell_ratio': 0, 'recent_buy_count': 0, 'pair_created_at': time.time()}
-
-def get_holder_distribution(token_address: str, chain: str) -> float:
-    if chain == 'solana':
-        try:
-            response = session.get(f"https://public-api.birdeye.so/v1/token/token_security?address={token_address}", headers=BIRDEYE_HEADERS, timeout=10)
-            response.raise_for_status()
-            data = response.json()['data']
-            top_holder = max(data.get('top_10_holder_percent', 0), data.get('top_20_holder_percent', 0))
-            return top_holder
-        except Exception as e:
-            logger.error(f"Erreur récupération distribution holders {token_address}: {str(e)}")
-            return 100
-    return 0
 
 def monitor_twitter(chat_id: int) -> None:
     global twitter_requests_remaining, twitter_last_reset, last_twitter_call
@@ -314,42 +301,35 @@ def snipe_new_pairs_bsc(chat_id: int) -> None:
         time.sleep(10)
 
 async def snipe_new_pairs_solana(chat_id: int):
-    uri = "wss://api.mainnet-beta.solana.com"
-    while True:
-        try:
-            async with websockets.connect(uri) as websocket:
-                subscription = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "logsSubscribe",
-                    "params": [{"mentions": [str(RAYDIUM_PROGRAM_ID)]}, {"commitment": "finalized"}]
-                }
-                await websocket.send(json.dumps(subscription))
-                logger.info("Sniping Solana démarré via WebSocket...")
+    async with AsyncClient(SOLANA_RPC, commitment=Finalized) as client:
+        while True:
+            try:
+                logger.info("Sniping Solana démarré via RPC...")
                 bot.send_message(chat_id, "🔫 Sniping Solana activé...")
-                while trade_active:
-                    response = await websocket.recv()
-                    data = json.loads(response)
-                    if 'result' in data and 'value' in data['result']:
-                        logs = data['result']['value']['logs']
-                        for log in logs:
-                            if "create" in log.lower():  # Simplifié, à affiner avec les signatures Raydium
-                                token_address = log.split()[-1]  # Extraction simplifiée, à adapter
-                                if validate_address(token_address, 'solana') and token_address not in portfolio:
-                                    if token_address in rejected_tokens:
-                                        age_reject = (time.time() - rejected_tokens[token_address]) / 3600
-                                        if age_reject > REJECT_EXPIRATION_HOURS:
-                                            del rejected_tokens[token_address]
-                                        elif age_reject < (RETRY_DELAY_MINUTES / 60):
-                                            continue
-                                    bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Solana) via Raydium')
-                                    check_token(chat_id, token_address, 'solana')
-        except Exception as e:
-            logger.error(f"Erreur sniping Solana: {str(e)}")
-            bot.send_message(chat_id, f'⚠️ Erreur sniping Solana: {str(e)}. Reprise dans 10s...')
+                subscription_id = await client.logs_subscribe(
+                    {"mentions": [str(RAYDIUM_PROGRAM_ID)]},
+                    Finalized
+                )
+                async for response in client.logs_subscribe_ws(subscription_id):
+                    logs = response.value.logs
+                    for log in logs:
+                        if "create" in log.lower():  # Simplifié, à affiner avec les signatures Raydium
+                            token_address = log.split()[-1]  # Extraction simplifiée, à adapter
+                            if validate_address(token_address, 'solana') and token_address not in portfolio:
+                                if token_address in rejected_tokens:
+                                    age_reject = (time.time() - rejected_tokens[token_address]) / 3600
+                                    if age_reject > REJECT_EXPIRATION_HOURS:
+                                        del rejected_tokens[token_address]
+                                    elif age_reject < (RETRY_DELAY_MINUTES / 60):
+                                        continue
+                                bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Solana) via Raydium')
+                                check_token(chat_id, token_address, 'solana')
+            except Exception as e:
+                logger.error(f"Erreur sniping Solana: {str(e)}")
+                bot.send_message(chat_id, f'⚠️ Erreur sniping Solana: {str(e)}. Reprise dans 10s...')
+                await asyncio.sleep(10)
+            logger.info("Redémarrage sniping Solana après erreur...")
             await asyncio.sleep(10)
-        logger.info("Redémarrage sniping Solana après erreur...")
-        await asyncio.sleep(10)
 
 def start_solana_sniper(chat_id: int):
     asyncio.run(snipe_new_pairs_solana(chat_id))
@@ -359,6 +339,16 @@ def check_token(chat_id: int, token_address: str, chain: str) -> bool:
         if len(portfolio) >= max_positions:
             bot.send_message(chat_id, f'⚠️ Limite de {max_positions} positions atteinte, token {token_address} ignoré.')
             return False
+
+        block_time = datetime.now() - timedelta(hours=GRACE_PERIOD_HOURS)  # Estimation initiale
+        if chain == 'bsc':
+            latest_block = w3.eth.block_number
+            events = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI).events.PairCreated.get_logs(fromBlock=latest_block - 200, toBlock=latest_block)
+            for event in events:
+                if event['args']['token0'] == token_address or event['args']['token1'] == token_address:
+                    block = w3.eth.get_block(event['blockNumber'])
+                    block_time = datetime.fromtimestamp(block['timestamp'])
+                    break
 
         data = get_token_data(token_address, chain)
         volume_24h = data['volume_24h']
@@ -370,24 +360,20 @@ def check_token(chat_id: int, token_address: str, chain: str) -> bool:
         pair_created_at = data['pair_created_at']
         top_holder_pct = data.get('top_holder_pct', 0)
 
-        age_hours = (time.time() - pair_created_at) / 3600
-        if chain == 'bsc':
-            min_ratio = MIN_BUY_SELL_RATIO_BSC
-            min_volume = MIN_VOLUME_BSC
-            max_volume = MAX_VOLUME_BSC
-            min_market_cap = MIN_MARKET_CAP_BSC
-            max_market_cap = MAX_MARKET_CAP_BSC
-        else:
-            min_ratio = MIN_BUY_SELL_RATIO_SOL
-            min_volume = MIN_VOLUME_SOL
-            max_volume = MAX_VOLUME_SOL
-            min_market_cap = MIN_MARKET_CAP_SOL
-            max_market_cap = MAX_MARKET_CAP_SOL
-
+        age_hours = (time.time() - pair_created_at) / 3600 if pair_created_at else (datetime.now() - block_time).total_seconds() / 3600
         if age_hours > MAX_TOKEN_AGE_HOURS or age_hours < 0:
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : âge {age_hours:.2f}h > {MAX_TOKEN_AGE_HOURS}h ou invalide')
             rejected_tokens[token_address] = time.time()
             return False
+        
+        # Fenêtre de grâce : assouplir les critères pour les tokens récents
+        is_new_token = age_hours <= GRACE_PERIOD_HOURS
+        min_volume = 0 if is_new_token else (MIN_VOLUME_BSC if chain == 'bsc' else MIN_VOLUME_SOL)
+        min_ratio = MIN_BUY_SELL_RATIO_BSC if chain == 'bsc' else MIN_BUY_SELL_RATIO_SOL
+        max_volume = MAX_VOLUME_BSC if chain == 'bsc' else MAX_VOLUME_SOL
+        min_market_cap = MIN_MARKET_CAP_BSC if chain == 'bsc' else MIN_MARKET_CAP_SOL
+        max_market_cap = MAX_MARKET_CAP_BSC if chain == 'bsc' else MAX_MARKET_CAP_SOL
+
         if buy_sell_ratio < min_ratio:
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente 5min {buy_sell_ratio:.2f} < {min_ratio}')
             rejected_tokens[token_address] = time.time()
@@ -396,7 +382,7 @@ def check_token(chat_id: int, token_address: str, chain: str) -> bool:
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : volume ${volume_24h} hors plage [{min_volume}, {max_volume}]')
             rejected_tokens[token_address] = time.time()
             return False
-        if liquidity < MIN_LIQUIDITY:
+        if liquidity < MIN_LIQUIDITY and not is_new_token:
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : liquidité ${liquidity} < ${MIN_LIQUIDITY}')
             rejected_tokens[token_address] = time.time()
             return False
@@ -404,7 +390,7 @@ def check_token(chat_id: int, token_address: str, chain: str) -> bool:
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : market cap ${market_cap} hors plage [{min_market_cap}, {max_market_cap}]')
             rejected_tokens[token_address] = time.time()
             return False
-        if recent_buy_count < MIN_RECENT_TXNS:
+        if recent_buy_count < MIN_RECENT_TXNS and not is_new_token:
             bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : {recent_buy_count} achats récents < {MIN_RECENT_TXNS} en 5 min')
             rejected_tokens[token_address] = time.time()
             return False
@@ -498,38 +484,27 @@ def detect_new_tokens_bsc(chat_id: int) -> None:
 def detect_new_tokens_solana(chat_id: int) -> None:
     bot.send_message(chat_id, "🔍 Début détection Solana...")
     try:
-        # Utilisation principale de Birdeye
-        response = session.get("https://public-api.birdeye.so/v1/pairs/list?sort_by=time&sort_type=desc&limit=50", headers=BIRDEYE_HEADERS, timeout=10)
+        response = session.post(SOLANA_RPC, json={
+            "jsonrpc": "2.0", "id": 1, "method": "getProgramAccounts", "params": [str(RAYDIUM_PROGRAM_ID)]
+        }, timeout=10)
         response.raise_for_status()
-        json_response = response.json()
-        tokens = json_response.get('data', {}).get('pairs', [])
-        logger.info(f"Birdeye: {len(tokens)} paires détectées sur Solana")
-
-        # Fallback DexScreener si Birdeye échoue
-        if not tokens:
-            response = session.get("https://api.dexscreener.com/latest/dex/pairs", timeout=10)
-            response.raise_for_status()
-            json_response = response.json()
-            tokens = [token for token in json_response.get('pairs', []) if token.get('chainId') == 'solana']
-            logger.info(f"DexScreener: {len(tokens)} paires détectées sur Solana")
+        accounts = response.json().get('result', [])
+        logger.info(f"RPC Solana: {len(accounts)} comptes détectés sur Raydium")
+        tokens = [account['pubkey'] for account in accounts[-50:]]  # Derniers 50 comptes pour performance
 
         bot.send_message(chat_id, f"⬇️ {len(tokens)} paires détectées sur Solana")
-        tokens.sort(key=lambda x: x.get('created_at', x.get('pairCreatedAt', 0)), reverse=True)
-        
-        for token in tokens[:50]:
-            token_address = token['address'] if 'address' in token else token['baseToken']['address']
+        for token_address in tokens:
             if token_address in rejected_tokens:
                 age_reject = (time.time() - rejected_tokens[token_address]) / 3600
                 if age_reject > REJECT_EXPIRATION_HOURS:
                     del rejected_tokens[token_address]
                 elif age_reject < (RETRY_DELAY_MINUTES / 60):
                     continue
-            volume_24h = float(token.get('volume_24h', token.get('volume', {}).get('h24', 0)))
-            pair_created_at = token.get('created_at', token.get('pairCreatedAt', 0)) / 1000 if token.get('created_at') or token.get('pairCreatedAt') else time.time() - 3600
+            data = get_token_data(token_address, 'solana')
+            pair_created_at = data['pair_created_at']
             age_hours = (time.time() - pair_created_at) / 3600
-            
-            if age_hours <= MAX_TOKEN_AGE_HOURS and volume_24h > MIN_VOLUME_SOL:
-                bot.send_message(chat_id, f'🆕 Token Solana détecté : {token_address} (Vol: ${volume_24h:.2f}, Âge: {age_hours:.2f}h)')
+            if age_hours <= MAX_TOKEN_AGE_HOURS:
+                bot.send_message(chat_id, f'🆕 Token Solana détecté : {token_address} (Âge: {age_hours:.2f}h)')
                 check_token(chat_id, token_address, 'solana')
     except Exception as e:
         logger.error(f"Erreur détection Solana: {str(e)}")
