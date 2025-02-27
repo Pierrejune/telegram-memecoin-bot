@@ -175,7 +175,7 @@ def get_token_data(token_address: str, chain: str) -> Dict[str, float]:
         sell_count_5m = float(data.get('txns', {}).get('m5', {}).get('sells', 0))
         buy_sell_ratio_5m = buy_count_5m / max(sell_count_5m, 1)
         recent_buy_count = buy_count_5m
-        pair_created_at = data.get('pairCreatedAt', 0) / 1000 if data.get('pairCreatedAt') else time.time() - 3600  # Par défaut : 1h
+        pair_created_at = data.get('pairCreatedAt', 0) / 1000 if data.get('pairCreatedAt') else time.time() - 3600
         
         if chain == 'solana':
             top_holder_pct = get_holder_distribution(token_address, chain)
@@ -210,7 +210,7 @@ def monitor_twitter(chat_id: int) -> None:
         try:
             logger.info("Surveillance Twitter démarrée...")
             bot.send_message(chat_id, "📡 Surveillance Twitter activée...")
-            base_delay = 60.0
+            base_delay = 30.0  # Augmenté pour capturer plus de CA rapidement
             error_count = 0
             max_errors = 10
             query_general = '("contract address" OR CA) -is:retweet'
@@ -231,7 +231,7 @@ def monitor_twitter(chat_id: int) -> None:
 
                 time.sleep(base_delay)
                 response = session.get(
-                    f"https://api.twitter.com/2/tweets/search/recent?query={query_general}&max_results=10&expansions=author_id&user.fields=public_metrics",
+                    f"https://api.twitter.com/2/tweets/search/recent?query={query_general}&max_results=100&expansions=author_id&user.fields=public_metrics",
                     headers=TWITTER_HEADERS, timeout=10
                 )
                 response.raise_for_status()
@@ -244,7 +244,7 @@ def monitor_twitter(chat_id: int) -> None:
                 for tweet in tweets:
                     user = users.get(tweet['author_id'])
                     followers = user.get('public_metrics', {}).get('followers_count', 0) if user else 0
-                    if followers >= 10000:
+                    if followers >= 5000:  # Réduit pour plus de signaux
                         text = tweet['text'].lower()
                         words = text.split()
                         for word in words:
@@ -440,24 +440,33 @@ def detect_new_tokens_bsc(chat_id: int) -> None:
 def detect_new_tokens_solana(chat_id: int) -> None:
     bot.send_message(chat_id, "🔍 Début détection Solana...")
     try:
+        # Tentative DexScreener
         response = session.get("https://api.dexscreener.com/latest/dex/pairs", timeout=10)
         response.raise_for_status()
         json_response = response.json()
         tokens = [token for token in json_response.get('pairs', []) if token.get('chainId') == 'solana']
-        bot.send_message(chat_id, f"⬇️ {len(tokens)} paires détectées sur Solana")
+        logger.info(f"DexScreener: {len(tokens)} paires détectées sur Solana")
         
-        # Trier par date de création et limiter aux plus récents
-        tokens.sort(key=lambda x: x.get('pairCreatedAt', 0), reverse=True)
-        for token in tokens[:50]:  # Limite à 50 pour éviter surcharge
-            token_address = token['baseToken']['address']
+        # Fallback Birdeye si DexScreener échoue ou manque de données
+        if not tokens:
+            response = session.get("https://public-api.birdeye.so/v1/pairs/list?sort_by=time&sort_type=desc&limit=50", headers=BIRDEYE_HEADERS, timeout=10)
+            response.raise_for_status()
+            tokens = response.json().get('data', {}).get('pairs', [])
+            logger.info(f"Birdeye: {len(tokens)} paires détectées sur Solana")
+
+        bot.send_message(chat_id, f"⬇️ {len(tokens)} paires détectées sur Solana")
+        tokens.sort(key=lambda x: x.get('pairCreatedAt', 0) if 'pairCreatedAt' in x else x.get('created_at', 0), reverse=True)
+        
+        for token in tokens[:50]:  # Limite à 50 pour performance
+            token_address = token['baseToken']['address'] if 'baseToken' in token else token['address']
             if token_address in rejected_tokens:
                 age_reject = (time.time() - rejected_tokens[token_address]) / 3600
                 if age_reject > REJECT_EXPIRATION_HOURS:
                     del rejected_tokens[token_address]
                 elif age_reject < (RETRY_DELAY_MINUTES / 60):
                     continue
-            volume_24h = float(token.get('volume', {}).get('h24', 0))
-            pair_created_at = token.get('pairCreatedAt', 0) / 1000 if token.get('pairCreatedAt') else time.time() - 3600
+            volume_24h = float(token.get('volume', {}).get('h24', 0) if 'volume' in token else token.get('volume_24h', 0))
+            pair_created_at = token.get('pairCreatedAt', 0) / 1000 if token.get('pairCreatedAt') else token.get('created_at', time.time() - 3600) / 1000
             age_hours = (time.time() - pair_created_at) / 3600
             
             if age_hours <= MAX_TOKEN_AGE_HOURS and volume_24h > MIN_VOLUME_SOL:
@@ -465,7 +474,8 @@ def detect_new_tokens_solana(chat_id: int) -> None:
                 check_token(chat_id, token_address, 'solana')
     except Exception as e:
         logger.error(f"Erreur détection Solana: {str(e)}")
-        bot.send_message(chat_id, f'⚠️ Erreur détection Solana: {str(e)}')
+        bot.send_message(chat_id, f'⚠️ Erreur détection Solana: {str(e)}. Tentative de récupération...')
+        time.sleep(10)
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
@@ -541,6 +551,7 @@ def callback_query(call):
                 threading.Thread(target=trading_cycle, args=(chat_id,), daemon=True).start()
                 threading.Thread(target=snipe_new_pairs_bsc, args=(chat_id,), daemon=True).start()
                 threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True).start()
+                threading.Thread(target=watchdog, args=(chat_id,), daemon=True).start()
             else:
                 bot.send_message(chat_id, "⚠️ Trading déjà en cours.")
         elif call.data == "stop":
@@ -644,6 +655,33 @@ def trading_cycle(chat_id: int) -> None:
             logger.error(f"Erreur dans trading_cycle: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur dans le cycle: {str(e)}. Reprise dans 30s...')
             time.sleep(30)
+
+def watchdog(chat_id: int) -> None:
+    logger.info("Watchdog démarré...")
+    while True:
+        try:
+            if not trade_active:
+                time.sleep(60)
+                continue
+            # Vérifier si les threads principaux sont actifs
+            threads = threading.enumerate()
+            required_threads = ['trading_cycle', 'snipe_new_pairs_bsc', 'monitor_twitter']
+            active_threads = [t.name for t in threads]
+            for thread_name in required_threads:
+                if thread_name not in active_threads:
+                    logger.warning(f"Thread {thread_name} inactif, redémarrage...")
+                    bot.send_message(chat_id, f'⚠️ Thread {thread_name} inactif, redémarrage...')
+                    if thread_name == 'trading_cycle':
+                        threading.Thread(target=trading_cycle, args=(chat_id,), daemon=True, name='trading_cycle').start()
+                    elif thread_name == 'snipe_new_pairs_bsc':
+                        threading.Thread(target=snipe_new_pairs_bsc, args=(chat_id,), daemon=True, name='snipe_new_pairs_bsc').start()
+                    elif thread_name == 'monitor_twitter':
+                        threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True, name='monitor_twitter').start()
+            time.sleep(60)
+        except Exception as e:
+            logger.error(f"Erreur dans watchdog: {str(e)}")
+            bot.send_message(chat_id, f'⚠️ Erreur watchdog: {str(e)}. Reprise dans 60s...')
+            time.sleep(60)
 
 def show_config_menu(chat_id: int) -> None:
     markup = InlineKeyboardMarkup()
@@ -1257,7 +1295,7 @@ def set_webhook() -> None:
 
 def run_bot() -> None:
     logger.info("Démarrage du bot...")
-    while True:  # Boucle infinie pour redémarrer en cas de crash
+    while True:
         try:
             logger.info("Appel de initialize_bot...")
             initialize_bot()
@@ -1271,11 +1309,10 @@ def run_bot() -> None:
 
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
-    while True:  # Boucle externe pour garantir la stabilité
+    while True:
         try:
             run_bot()
         except Exception as e:
             logger.error(f"Crash système critique: {str(e)}. Redémarrage dans 30s...")
             time.sleep(30)
             
-        
