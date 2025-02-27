@@ -108,22 +108,19 @@ solana_keypair = None
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
-def initialize_bot(chat_id):
+def initialize_bot():
     global w3, solana_keypair
     logger.info("Initialisation différée du bot...")
     try:
         w3 = Web3(Web3.HTTPProvider(BSC_RPC))
         if not w3.is_connected():
             logger.error(f"Connexion BSC échouée sur {BSC_RPC}")
-            bot.send_message(chat_id, f"⚠️ Connexion BSC échouée sur {BSC_RPC}")
             raise ConnectionError("Connexion BSC échouée")
         logger.info(f"Connexion BSC réussie sur {BSC_RPC}. Bloc actuel : {w3.eth.block_number}")
         solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
         logger.info("Clé Solana initialisée.")
-        bot.send_message(chat_id, "✅ Bot initialisé avec succès.")
     except Exception as e:
         logger.error(f"Erreur dans l'initialisation différée: {str(e)}")
-        bot.send_message(chat_id, f'⚠️ Erreur initialisation bot: {str(e)}')
         raise
 
 def is_safe_token_bsc(token_address):
@@ -157,7 +154,8 @@ def is_valid_token_bsc(token_address):
     except Exception as e:
         logger.error(f"Erreur validation token BSC {token_address}: {str(e)}")
         return False
-        def get_real_tx_per_min_bsc(token_address):
+
+def get_real_tx_per_min_bsc(token_address):
     try:
         latest_block = w3.eth.block_number
         buy_tx_count = 0
@@ -304,6 +302,7 @@ def check_twitter_token(chat_id, token_address):
             market_cap = volume_24h * supply
             buy_tx_per_min, sell_tx_per_min = get_real_tx_per_min_bsc(token_address)
             
+            # Vérification du ratio achats/ventes
             if sell_tx_per_min > 0:
                 buy_sell_ratio = buy_tx_per_min / sell_tx_per_min
                 if buy_sell_ratio < BUY_SELL_RATIO_THRESHOLD:
@@ -349,6 +348,7 @@ def check_twitter_token(chat_id, token_address):
             supply = float(token_data.get('supply', 0))
             buy_tx_per_min, sell_tx_per_min = get_real_tx_per_min_solana(token_address)
             
+            # Vérification du ratio achats/ventes
             if sell_tx_per_min > 0:
                 buy_sell_ratio = buy_tx_per_min / sell_tx_per_min
                 if buy_sell_ratio < BUY_SELL_RATIO_THRESHOLD:
@@ -451,6 +451,7 @@ def check_bsc_token(chat_id, token_address, loose_mode):
         market_cap = volume_24h * supply
         buy_tx_per_min, sell_tx_per_min = get_real_tx_per_min_bsc(token_address)
 
+        # Vérification du ratio achats/ventes
         if sell_tx_per_min > 0:
             buy_sell_ratio = buy_tx_per_min / sell_tx_per_min
             if buy_sell_ratio < BUY_SELL_RATIO_THRESHOLD:
@@ -555,6 +556,7 @@ def check_solana_token(chat_id, token_address):
         supply = float(token_data.get('supply', 0))
         buy_tx_per_min, sell_tx_per_min = get_real_tx_per_min_solana(token_address)
         
+        # Vérification du ratio achats/ventes
         if sell_tx_per_min > 0:
             buy_sell_ratio = buy_tx_per_min / sell_tx_per_min
             if buy_sell_ratio < BUY_SELL_RATIO_THRESHOLD:
@@ -595,8 +597,7 @@ def check_solana_token(chat_id, token_address):
     except Exception as e:
         logger.error(f"Erreur vérification Solana {token_address}: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vérification Solana {token_address}: {str(e)}')
-
-@app.route("/webhook", methods=['POST'])
+        @app.route("/webhook", methods=['POST'])
 def webhook():
     logger.info("Webhook reçu")
     try:
@@ -614,14 +615,12 @@ def webhook():
 @bot.message_handler(commands=['start'])
 def start_message(message):
     logger.info("Commande /start reçue")
-    chat_id = message.chat.id
     try:
-        bot.send_message(chat_id, "✅ Bot démarré!")
-        threading.Thread(target=run_bot, args=(chat_id,), daemon=True).start()
-        show_main_menu(chat_id)
+        bot.send_message(message.chat.id, "✅ Bot démarré!")
+        show_main_menu(message.chat.id)
     except Exception as e:
         logger.error(f"Erreur dans start_message: {str(e)}")
-        bot.send_message(chat_id, f'⚠️ Erreur au démarrage: {str(e)}')
+        bot.send_message(message.chat.id, f'⚠️ Erreur au démarrage: {str(e)}')
 
 @bot.message_handler(commands=['menu'])
 def menu_message(message):
@@ -1115,80 +1114,18 @@ def buy_token_solana(chat_id, contract_address, amount):
         tx.sign(solana_keypair)
         tx_hash = session.post(SOLANA_RPC, json={
             "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
-            "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
+                        "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
         }, timeout=5).json()['result']
-        bot.send_message(chat_id, f'⏳ Achat en cours de {amount} SOL de {contract_address}, TX: {tx_hash}')
-        time.sleep(2)
-        entry_price = amount / (detected_tokens[contract_address]['supply'] * get_current_market_cap(contract_address) / detected_tokens[contract_address]['supply'])
-        portfolio[contract_address] = {
-            'amount': amount, 'chain': 'solana', 'entry_price': entry_price,
-            'market_cap_at_buy': detected_tokens[contract_address]['market_cap'],
-            'current_market_cap': detected_tokens[contract_address]['market_cap']
-        }
-        bot.send_message(chat_id, f'✅ Achat effectué : {amount} SOL de {contract_address}')
-    except Exception as e:
-        logger.error(f"Erreur achat Solana: {str(e)}")
-        bot.send_message(chat_id, f'⚠️ Échec achat {contract_address}: {str(e)}')
-
-def sell_token(chat_id, contract_address, amount, chain, current_price):
-    if chain == "solana":
-        try:
-            amount_out = int(amount * 10**9)
-            response = session.post(SOLANA_RPC, json={
-                "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
-            }, timeout=5)
-            blockhash = response.json()['result']['value']['blockhash']
-            tx = Transaction()
-            instruction = Instruction(
-                program_id=RAYDIUM_PROGRAM_ID,
-                accounts=[
-                    {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
-                    {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
-                    {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
-                ],
-                data=bytes([3]) + amount_out.to_bytes(8, 'little')
-            )
-            tx.add(instruction)
-            tx.recent_blockhash = Pubkey.from_string(blockhash)
-            tx.sign(solana_keypair)
-            tx_hash = session.post(SOLANA_RPC, json={
-                "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
-                "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
-            }, timeout=5).json()['result']
-            bot.send_message(chat_id, f'⏳ Vente en cours de {amount} SOL de {contract_address}, TX: {tx_hash}')
-            time.sleep(2)
+        bot.send_message(chat_id, f'⏳ Vente en cours de {amount} BNB de {contract_address}, TX: {tx_hash.hex()}')
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+        if receipt.status == 1:
             del portfolio[contract_address]
-            bot.send_message(chat_id, f'✅ Vente effectuée : {amount} SOL de {contract_address}')
-        except Exception as e:
-            logger.error(f"Erreur vente Solana: {str(e)}")
-            bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
-    else:
-        try:
-            router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
-            token_amount = w3.to_wei(amount, 'ether')
-            amount_in_max = int(token_amount * (1 + slippage / 100))
-            tx = router.functions.swapExactTokensForETH(
-                token_amount,
-                amount_in_max,
-                [w3.to_checksum_address(contract_address), w3.to_checksum_address('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c')],
-                w3.to_checksum_address(WALLET_ADDRESS),
-                int(time.time()) + 60
-            ).build_transaction({
-                'from': WALLET_ADDRESS, 'gas': 200000,
-                'gasPrice': w3.to_wei(gas_fee * 2, 'gwei'), 'nonce': w3.eth.get_transaction_count(WALLET_ADDRESS)
-            })
-            signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
-            bot.send_message(chat_id, f'⏳ Vente en cours de {amount} BNB de {contract_address}, TX: {tx_hash.hex()}')
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
-            if receipt.status == 1:
-                del portfolio[contract_address]
-                bot.send_message(chat_id, f'✅ Vente effectuée : {amount} BNB de {contract_address}')
-            else:
-                bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}, TX: {tx_hash.hex()}')
-        except Exception as e:
-            logger.error(f"Erreur vente BSC: {str(e)}")
-            bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
+            bot.send_message(chat_id, f'✅ Vente effectuée : {amount} BNB de {contract_address}')
+        else:
+            bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}, TX: {tx_hash.hex()}')
+    except Exception as e:
+        logger.error(f"Erreur vente BSC: {str(e)}")
+        bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
 
 def monitor_and_sell(chat_id):
     while trade_active:
@@ -1308,30 +1245,28 @@ def sell_token_immediate(chat_id, token):
         logger.error(f"Erreur vente immédiate: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vente immédiate {token}: {str(e)}')
 
-def set_webhook(chat_id):
+def set_webhook():
     logger.info("Configuration du webhook...")
     try:
         bot.remove_webhook()
         time.sleep(1)
         bot.set_webhook(url=WEBHOOK_URL)
         logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
-        bot.send_message(chat_id, f"✅ Webhook configuré sur {WEBHOOK_URL}")
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
-        bot.send_message(chat_id, f'⚠️ Erreur configuration webhook: {str(e)}')
+        raise
 
-def run_bot(chat_id):
-    logger.info("Démarrage du bot dans un thread...")
+def run_bot():
+    logger.info("Démarrage du bot dans un thread séparé...")
     try:
-        initialize_bot(chat_id)
-        set_webhook(chat_id)
-        logger.info("Bot initialisé avec succès dans le thread.")
+        initialize_bot()
+        set_webhook()
     except Exception as e:
-        logger.error(f"Erreur lors du démarrage du bot dans le thread: {str(e)}")
-        bot.send_message(chat_id, f'⚠️ Erreur démarrage bot: {str(e)}')
+        logger.error(f"Erreur lors du démarrage du bot: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
+    threading.Thread(target=run_bot, daemon=True).start()
+    logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
-    logger.info(f"Flask démarré sur 0.0.0.0:{PORT}")
-    
