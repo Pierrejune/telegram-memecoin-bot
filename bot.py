@@ -20,6 +20,8 @@ from statistics import mean
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 import re
+import asyncio
+import websockets
 
 # Configuration des logs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -39,6 +41,7 @@ twitter_last_reset = time.time()
 twitter_requests_remaining = 450
 daily_trades = {'buys': [], 'sells': []}
 rejected_tokens = {}  # {token_address: timestamp_rejet}
+thread_lock = threading.Lock()
 
 logger.info("Chargement des variables d’environnement...")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -208,9 +211,10 @@ def monitor_twitter(chat_id: int) -> None:
     global twitter_requests_remaining, twitter_last_reset, last_twitter_call
     while True:
         try:
-            logger.info("Surveillance Twitter démarrée...")
-            bot.send_message(chat_id, "📡 Surveillance Twitter activée...")
-            base_delay = 30.0  # Augmenté pour capturer plus de CA rapidement
+            with thread_lock:
+                logger.info("Surveillance Twitter démarrée...")
+                bot.send_message(chat_id, "📡 Surveillance Twitter activée...")
+            base_delay = 30.0
             error_count = 0
             max_errors = 10
             query_general = '("contract address" OR CA) -is:retweet'
@@ -244,7 +248,7 @@ def monitor_twitter(chat_id: int) -> None:
                 for tweet in tweets:
                     user = users.get(tweet['author_id'])
                     followers = user.get('public_metrics', {}).get('followers_count', 0) if user else 0
-                    if followers >= 5000:  # Réduit pour plus de signaux
+                    if followers >= 5000:
                         text = tweet['text'].lower()
                         words = text.split()
                         for word in words:
@@ -278,14 +282,20 @@ def monitor_twitter(chat_id: int) -> None:
 def snipe_new_pairs_bsc(chat_id: int) -> None:
     while True:
         try:
-            logger.info("Sniping BSC démarré...")
-            bot.send_message(chat_id, "🔫 Sniping BSC activé...")
+            with thread_lock:
+                logger.info("Sniping BSC démarré...")
+                bot.send_message(chat_id, "🔫 Sniping BSC activé...")
             factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
             while trade_active:
                 latest_block = w3.eth.block_number
                 events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 10, toBlock=latest_block)
                 for event in events:
                     token_address = event['args']['token0'] if event['args']['token0'] != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else event['args']['token1']
+                    block = w3.eth.get_block(event['blockNumber'])
+                    block_time = datetime.fromtimestamp(block['timestamp'])
+                    age_hours = (datetime.now() - block_time).total_seconds() / 3600
+                    if age_hours > MAX_TOKEN_AGE_HOURS:
+                        continue
                     if token_address not in portfolio:
                         if token_address in rejected_tokens:
                             age_reject = (time.time() - rejected_tokens[token_address]) / 3600
@@ -293,7 +303,7 @@ def snipe_new_pairs_bsc(chat_id: int) -> None:
                                 del rejected_tokens[token_address]
                             elif age_reject < (RETRY_DELAY_MINUTES / 60):
                                 continue
-                        bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (BSC) dans les 10 derniers blocs')
+                        bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (BSC) dans les 10 derniers blocs, Âge: {age_hours:.2f}h')
                         check_token(chat_id, token_address, 'bsc')
                 time.sleep(1)
         except Exception as e:
@@ -302,6 +312,47 @@ def snipe_new_pairs_bsc(chat_id: int) -> None:
             time.sleep(5)
         logger.info("Redémarrage sniping BSC après erreur...")
         time.sleep(10)
+
+async def snipe_new_pairs_solana(chat_id: int):
+    uri = "wss://api.mainnet-beta.solana.com"
+    while True:
+        try:
+            async with websockets.connect(uri) as websocket:
+                subscription = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "logsSubscribe",
+                    "params": [{"mentions": [str(RAYDIUM_PROGRAM_ID)]}, {"commitment": "finalized"}]
+                }
+                await websocket.send(json.dumps(subscription))
+                logger.info("Sniping Solana démarré via WebSocket...")
+                bot.send_message(chat_id, "🔫 Sniping Solana activé...")
+                while trade_active:
+                    response = await websocket.recv()
+                    data = json.loads(response)
+                    if 'result' in data and 'value' in data['result']:
+                        logs = data['result']['value']['logs']
+                        for log in logs:
+                            if "create" in log.lower():  # Simplifié, à affiner avec les signatures Raydium
+                                token_address = log.split()[-1]  # Extraction simplifiée, à adapter
+                                if validate_address(token_address, 'solana') and token_address not in portfolio:
+                                    if token_address in rejected_tokens:
+                                        age_reject = (time.time() - rejected_tokens[token_address]) / 3600
+                                        if age_reject > REJECT_EXPIRATION_HOURS:
+                                            del rejected_tokens[token_address]
+                                        elif age_reject < (RETRY_DELAY_MINUTES / 60):
+                                            continue
+                                    bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Solana) via Raydium')
+                                    check_token(chat_id, token_address, 'solana')
+        except Exception as e:
+            logger.error(f"Erreur sniping Solana: {str(e)}")
+            bot.send_message(chat_id, f'⚠️ Erreur sniping Solana: {str(e)}. Reprise dans 10s...')
+            await asyncio.sleep(10)
+        logger.info("Redémarrage sniping Solana après erreur...")
+        await asyncio.sleep(10)
+
+def start_solana_sniper(chat_id: int):
+    asyncio.run(snipe_new_pairs_solana(chat_id))
 
 def check_token(chat_id: int, token_address: str, chain: str) -> bool:
     try:
@@ -411,6 +462,13 @@ def detect_new_tokens_bsc(chat_id: int) -> None:
 
         for event in events:
             token_address = event['args']['token0'] if event['args']['token0'] != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else event['args']['token1']
+            block = w3.eth.get_block(event['blockNumber'])
+            block_time = datetime.fromtimestamp(block['timestamp'])
+            age_hours = (datetime.now() - block_time).total_seconds() / 3600
+            if age_hours > MAX_TOKEN_AGE_HOURS:
+                rejection_reasons.append(f"{token_address}: âge {age_hours:.2f}h > {MAX_TOKEN_AGE_HOURS}h")
+                rejected_count += 1
+                continue
             if token_address in rejected_tokens:
                 age_reject = (time.time() - rejected_tokens[token_address]) / 3600
                 if age_reject > REJECT_EXPIRATION_HOURS:
@@ -440,33 +498,34 @@ def detect_new_tokens_bsc(chat_id: int) -> None:
 def detect_new_tokens_solana(chat_id: int) -> None:
     bot.send_message(chat_id, "🔍 Début détection Solana...")
     try:
-        # Tentative DexScreener
-        response = session.get("https://api.dexscreener.com/latest/dex/pairs", timeout=10)
+        # Utilisation principale de Birdeye
+        response = session.get("https://public-api.birdeye.so/v1/pairs/list?sort_by=time&sort_type=desc&limit=50", headers=BIRDEYE_HEADERS, timeout=10)
         response.raise_for_status()
         json_response = response.json()
-        tokens = [token for token in json_response.get('pairs', []) if token.get('chainId') == 'solana']
-        logger.info(f"DexScreener: {len(tokens)} paires détectées sur Solana")
-        
-        # Fallback Birdeye si DexScreener échoue ou manque de données
+        tokens = json_response.get('data', {}).get('pairs', [])
+        logger.info(f"Birdeye: {len(tokens)} paires détectées sur Solana")
+
+        # Fallback DexScreener si Birdeye échoue
         if not tokens:
-            response = session.get("https://public-api.birdeye.so/v1/pairs/list?sort_by=time&sort_type=desc&limit=50", headers=BIRDEYE_HEADERS, timeout=10)
+            response = session.get("https://api.dexscreener.com/latest/dex/pairs", timeout=10)
             response.raise_for_status()
-            tokens = response.json().get('data', {}).get('pairs', [])
-            logger.info(f"Birdeye: {len(tokens)} paires détectées sur Solana")
+            json_response = response.json()
+            tokens = [token for token in json_response.get('pairs', []) if token.get('chainId') == 'solana']
+            logger.info(f"DexScreener: {len(tokens)} paires détectées sur Solana")
 
         bot.send_message(chat_id, f"⬇️ {len(tokens)} paires détectées sur Solana")
-        tokens.sort(key=lambda x: x.get('pairCreatedAt', 0) if 'pairCreatedAt' in x else x.get('created_at', 0), reverse=True)
+        tokens.sort(key=lambda x: x.get('created_at', x.get('pairCreatedAt', 0)), reverse=True)
         
-        for token in tokens[:50]:  # Limite à 50 pour performance
-            token_address = token['baseToken']['address'] if 'baseToken' in token else token['address']
+        for token in tokens[:50]:
+            token_address = token['address'] if 'address' in token else token['baseToken']['address']
             if token_address in rejected_tokens:
                 age_reject = (time.time() - rejected_tokens[token_address]) / 3600
                 if age_reject > REJECT_EXPIRATION_HOURS:
                     del rejected_tokens[token_address]
                 elif age_reject < (RETRY_DELAY_MINUTES / 60):
                     continue
-            volume_24h = float(token.get('volume', {}).get('h24', 0) if 'volume' in token else token.get('volume_24h', 0))
-            pair_created_at = token.get('pairCreatedAt', 0) / 1000 if token.get('pairCreatedAt') else token.get('created_at', time.time() - 3600) / 1000
+            volume_24h = float(token.get('volume_24h', token.get('volume', {}).get('h24', 0)))
+            pair_created_at = token.get('created_at', token.get('pairCreatedAt', 0)) / 1000 if token.get('created_at') or token.get('pairCreatedAt') else time.time() - 3600
             age_hours = (time.time() - pair_created_at) / 3600
             
             if age_hours <= MAX_TOKEN_AGE_HOURS and volume_24h > MIN_VOLUME_SOL:
@@ -548,10 +607,11 @@ def callback_query(call):
             if not trade_active:
                 trade_active = True
                 bot.send_message(chat_id, "▶️ Trading lancé avec succès!")
-                threading.Thread(target=trading_cycle, args=(chat_id,), daemon=True).start()
-                threading.Thread(target=snipe_new_pairs_bsc, args=(chat_id,), daemon=True).start()
-                threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True).start()
-                threading.Thread(target=watchdog, args=(chat_id,), daemon=True).start()
+                threading.Thread(target=trading_cycle, args=(chat_id,), daemon=True, name='trading_cycle').start()
+                threading.Thread(target=snipe_new_pairs_bsc, args=(chat_id,), daemon=True, name='snipe_new_pairs_bsc').start()
+                threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True, name='monitor_twitter').start()
+                threading.Thread(target=start_solana_sniper, args=(chat_id,), daemon=True, name='snipe_new_pairs_solana').start()
+                threading.Thread(target=watchdog, args=(chat_id,), daemon=True, name='watchdog').start()
             else:
                 bot.send_message(chat_id, "⚠️ Trading déjà en cours.")
         elif call.data == "stop":
@@ -639,15 +699,16 @@ def callback_query(call):
 def trading_cycle(chat_id: int) -> None:
     global trade_active
     cycle_count = 0
-    threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
+    threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True, name='monitor_and_sell').start()
     while True:
         try:
-            if not trade_active:
-                time.sleep(10)
-                continue
-            cycle_count += 1
-            bot.send_message(chat_id, f'🔍 Début du cycle de détection #{cycle_count}...')
-            logger.info(f"Cycle {cycle_count} démarré")
+            with thread_lock:
+                if not trade_active:
+                    time.sleep(10)
+                    continue
+                cycle_count += 1
+                bot.send_message(chat_id, f'🔍 Début du cycle de détection #{cycle_count}...')
+                logger.info(f"Cycle {cycle_count} démarré")
             detect_new_tokens_bsc(chat_id)
             detect_new_tokens_solana(chat_id)
             time.sleep(30)
@@ -663,20 +724,24 @@ def watchdog(chat_id: int) -> None:
             if not trade_active:
                 time.sleep(60)
                 continue
-            # Vérifier si les threads principaux sont actifs
             threads = threading.enumerate()
-            required_threads = ['trading_cycle', 'snipe_new_pairs_bsc', 'monitor_twitter']
+            required_threads = ['trading_cycle', 'snipe_new_pairs_bsc', 'monitor_twitter', 'snipe_new_pairs_solana', 'monitor_and_sell']
             active_threads = [t.name for t in threads]
             for thread_name in required_threads:
                 if thread_name not in active_threads:
-                    logger.warning(f"Thread {thread_name} inactif, redémarrage...")
-                    bot.send_message(chat_id, f'⚠️ Thread {thread_name} inactif, redémarrage...')
-                    if thread_name == 'trading_cycle':
-                        threading.Thread(target=trading_cycle, args=(chat_id,), daemon=True, name='trading_cycle').start()
-                    elif thread_name == 'snipe_new_pairs_bsc':
-                        threading.Thread(target=snipe_new_pairs_bsc, args=(chat_id,), daemon=True, name='snipe_new_pairs_bsc').start()
-                    elif thread_name == 'monitor_twitter':
-                        threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True, name='monitor_twitter').start()
+                    with thread_lock:
+                        logger.warning(f"Thread {thread_name} inactif, redémarrage...")
+                        bot.send_message(chat_id, f'⚠️ Thread {thread_name} inactif, redémarrage...')
+                        if thread_name == 'trading_cycle':
+                            threading.Thread(target=trading_cycle, args=(chat_id,), daemon=True, name='trading_cycle').start()
+                        elif thread_name == 'snipe_new_pairs_bsc':
+                            threading.Thread(target=snipe_new_pairs_bsc, args=(chat_id,), daemon=True, name='snipe_new_pairs_bsc').start()
+                        elif thread_name == 'monitor_twitter':
+                            threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True, name='monitor_twitter').start()
+                        elif thread_name == 'snipe_new_pairs_solana':
+                            threading.Thread(target=start_solana_sniper, args=(chat_id,), daemon=True, name='snipe_new_pairs_solana').start()
+                        elif thread_name == 'monitor_and_sell':
+                            threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True, name='monitor_and_sell').start()
             time.sleep(60)
         except Exception as e:
             logger.error(f"Erreur dans watchdog: {str(e)}")
