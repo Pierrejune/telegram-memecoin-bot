@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Variables globales
+# Variables globales pour les requêtes HTTP
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124", "Accept": "application/json"}
 session = requests.Session()
 session.headers.update(HEADERS)
@@ -30,6 +30,7 @@ retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 
+# Variables globales pour Twitter
 last_twitter_call = 0
 loose_mode_bsc = False
 last_valid_token_time = time.time()
@@ -96,6 +97,7 @@ MIN_POSITIVE_TX_PER_MIN_SOL = 5
 MAX_TX_PER_MIN_SOL = 150
 BUY_SELL_RATIO_THRESHOLD = 2  # Achats doivent être 2x supérieurs aux ventes
 
+# Constantes pour les contrats
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
@@ -108,7 +110,11 @@ solana_keypair = None
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
-def initialize_bot(chat_id):
+if __name__ == "__main__":
+    logger.info("Démarrage principal...")
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    logger.info(f"Flask démarré sur 0.0.0.0:{PORT}")
+    def initialize_bot(chat_id):
     global w3, solana_keypair
     logger.info("Initialisation différée du bot...")
     try:
@@ -1192,7 +1198,7 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
             bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
 
 def monitor_and_sell(chat_id):
-        while trade_active:
+    while trade_active:
         try:
             if not portfolio:
                 time.sleep(1)
@@ -1320,20 +1326,4 @@ def set_webhook(chat_id):
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur configuration webhook: {str(e)}')
-
-def run_bot(chat_id):
-    logger.info("Démarrage du bot dans un thread...")
-    try:
-        initialize_bot(chat_id)
-        set_webhook(chat_id)
-        logger.info("Bot initialisé avec succès dans le thread.")
-    except Exception as e:
-        logger.error(f"Erreur lors du démarrage du bot dans le thread: {str(e)}")
-        bot.send_message(chat_id, f'⚠️ Erreur démarrage bot: {str(e)}')
-
-if __name__ == "__main__":
-    logger.info("Démarrage principal...")
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
-    logger.info(f"Flask démarré sur 0.0.0.0:{PORT}")
-    # Note: run_bot est déclenché via la commande /start pour éviter un blocage au démarrage
-    
+        
