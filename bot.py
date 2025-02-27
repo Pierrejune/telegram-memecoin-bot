@@ -39,10 +39,8 @@ last_twitter_call = 0
 loose_mode_bsc = False
 last_valid_token_time = time.time()
 twitter_last_reset = time.time()
-twitter_requests_remaining = 450  # Limite conservatrice
+twitter_requests_remaining = 450
 
-# Chargement des variables d’environnement
-load_dotenv()
 logger.info("Chargement des variables d’environnement...")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
@@ -54,7 +52,7 @@ TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 PORT = int(os.getenv("PORT", 8080))
-BSC_RPC = os.getenv("BSC_RPC", "wss://bsc-ws-node.nariox.org:443")  # WebSocket pour sniping
+BSC_RPC = os.getenv("BSC_RPC", "wss://bsc-ws-node.nariox.org:443")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 
 BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
@@ -63,24 +61,28 @@ TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 missing_vars = [var for var, val in {
     "TELEGRAM_TOKEN": TELEGRAM_TOKEN, "WALLET_ADDRESS": WALLET_ADDRESS, "PRIVATE_KEY": PRIVATE_KEY,
     "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "WEBHOOK_URL": WEBHOOK_URL, "BIRDEYE_API_KEY": BIRDEYE_API_KEY,
-    "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN, "TELEGRAM_API_ID": TELEGRAM_API_ID, "TELEGRAM_API_HASH": TELEGRAM_API_HASH
+    "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN
 }.items() if not val]
 if missing_vars:
     logger.critical(f"Variables manquantes: {missing_vars}")
     raise ValueError(f"Variables manquantes: {missing_vars}")
-logger.info("Variables chargées.")
+logger.info("Variables principales chargées.")
 
-# Initialisation de Flask et Telegram
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+# Initialisation globale
 app = Flask(__name__)
-telegram_client = TelegramClient('bot_session', TELEGRAM_API_ID, TELEGRAM_API_HASH)
+logger.info("Flask initialisé.")
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+logger.info("Bot Telegram initialisé.")
+telegram_client = None  # Initialisation différée dans monitor_telegram
+w3 = None
+solana_keypair = None
 
 # Variables globales pour le trading
 mise_depart_bsc = 0.02
 mise_depart_sol = 0.37
 gas_fee = 5
 stop_loss_threshold = 30
-trailing_stop_percentage = 5  # 5% sous le pic pour trailing stop
+trailing_stop_percentage = 5
 take_profit_steps = [2, 3, 5]
 detected_tokens = {}
 trade_active = False
@@ -89,7 +91,7 @@ portfolio: Dict[str, dict] = {}
 twitter_tokens = []
 telegram_tokens = []
 max_positions = 3
-profit_reinvestment_ratio = 0.5  # 50% des profits réinvestis
+profit_reinvestment_ratio = 0.5
 
 MIN_VOLUME_SOL = 25000
 MAX_VOLUME_SOL = 750000
@@ -110,22 +112,24 @@ PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
 PANCAKE_FACTORY_ABI = [json.loads('{"anonymous": false, "inputs": [{"indexed": true, "internalType": "address", "name": "token0", "type": "address"}, {"indexed": true, "internalType": "address", "name": "token1", "type": "address"}, {"indexed": false, "internalType": "address", "name": "pair", "type": "address"}, {"indexed": false, "internalType": "uint256", "name": "type", "type": "uint256"}], "name": "PairCreated", "type": "event"}')]
 PANCAKE_ROUTER_ABI = json.loads('[{"inputs": [{"internalType": "uint256", "name": "amountIn", "type": "uint256"}, {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactETHForTokens", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "payable", "type": "function"}, {"inputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}, {"internalType": "uint256", "name": "amountInMax", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactTokensForETH", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "nonpayable", "type": "function"}]')
-
-w3 = None
-solana_keypair = None
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
 def initialize_bot():
     global w3, solana_keypair
-    logger.info("Initialisation différée du bot...")
+    logger.info("Initialisation différée du bot commencée...")
     try:
+        logger.info("Tentative de connexion WebSocket BSC...")
         w3 = Web3(WebsocketProvider(BSC_RPC))
-        w3.middleware_onion.inject(geth_poa_middleware, layer=0)  # Support pour BSC
+        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
         if not w3.is_connected():
-            logger.error(f"Connexion BSC échouée sur {BSC_RPC}")
-            raise ConnectionError("Connexion BSC échouée")
-        logger.info(f"Connexion BSC réussie sur {BSC_RPC}. Bloc actuel : {w3.eth.block_number}")
+            logger.warning(f"Connexion WebSocket BSC échouée sur {BSC_RPC}, passage à HTTP fallback")
+            w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org/"))
+            if not w3.is_connected():
+                logger.error("Connexion BSC échouée même en HTTP")
+                raise ConnectionError("Connexion BSC échouée même en HTTP")
+        logger.info(f"Connexion BSC réussie. Bloc actuel : {w3.eth.block_number}")
+        logger.info("Initialisation de la clé Solana...")
         solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
         logger.info("Clé Solana initialisée.")
     except Exception as e:
@@ -300,20 +304,31 @@ def monitor_twitter(chat_id: int) -> None:
         bot.send_message(chat_id, "⚠️ Surveillance Twitter désactivée après trop d'erreurs.")
 
 async def monitor_telegram(chat_id: int) -> None:
+    global telegram_client
     logger.info("Surveillance Telegram démarrée...")
     bot.send_message(chat_id, "📡 Surveillance Telegram activée...")
-    async with telegram_client:
-        @telegram_client.on(events.NewMessage(chats=['memecoin_group']))  # Remplacez par le nom ou ID du groupe
-        async def handler(event):
-            text = event.message.text.lower()
-            words = text.split()
-            for word in words:
-                if (len(word) == 42 and word.startswith("0x")) or len(word) == 44:
-                    if word not in telegram_tokens:
-                        telegram_tokens.append(word)
-                        bot.send_message(chat_id, f'🔍 Token détecté via Telegram: {word}')
-                        check_twitter_token(chat_id, word)  # Réutilisation pour Telegram
-        await telegram_client.run_until_disconnected()
+    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
+        logger.warning("TELEGRAM_API_ID ou TELEGRAM_API_HASH manquant, surveillance Telegram désactivée.")
+        bot.send_message(chat_id, "⚠️ Surveillance Telegram désactivée : clés API manquantes.")
+        return
+    try:
+        telegram_client = TelegramClient('bot_session', int(TELEGRAM_API_ID), TELEGRAM_API_HASH)
+        async with telegram_client:
+            @telegram_client.on(events.NewMessage(chats=['memecoin_group']))  # Remplacez par un vrai groupe
+            async def handler(event):
+                text = event.message.text.lower()
+                words = text.split()
+                for word in words:
+                    if (len(word) == 42 and word.startswith("0x")) or len(word) == 44:
+                        if word not in telegram_tokens:
+                            telegram_tokens.append(word)
+                            bot.send_message(chat_id, f'🔍 Token détecté via Telegram: {word}')
+                            check_twitter_token(chat_id, word)
+            logger.info("Surveillance Telegram active.")
+            await telegram_client.run_until_disconnected()
+    except Exception as e:
+        logger.error(f"Erreur dans monitor_telegram: {str(e)}")
+        bot.send_message(chat_id, f'⚠️ Erreur surveillance Telegram: {str(e)}')
 
 def check_twitter_token(chat_id: int, token_address: str) -> bool:
     try:
@@ -420,7 +435,7 @@ def snipe_new_pairs_bsc(chat_id: int) -> None:
                 if token_address not in detected_tokens:
                     bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (BSC) dans les 10 derniers blocs')
                     check_bsc_token(chat_id, token_address, loose_mode_bsc)
-            time.sleep(1)  # Vérification rapide pour sniping
+            time.sleep(1)
         except Exception as e:
             logger.error(f"Erreur sniping BSC: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur sniping BSC: {str(e)}. Reprise dans 5s...')
@@ -750,10 +765,10 @@ def callback_query(call):
 def trading_cycle(chat_id: int) -> None:
     global trade_active
     cycle_count = 0
-    threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
     threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True).start()
-    threading.Thread(target=lambda: asyncio.run(monitor_telegram(chat_id)), daemon=True).start()
+    threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
     threading.Thread(target=snipe_new_pairs_bsc, args=(chat_id,), daemon=True).start()
+    threading.Thread(target=lambda: asyncio.run(monitor_telegram(chat_id)), daemon=True).start()
     while trade_active:
         try:
             cycle_count += 1
@@ -1279,19 +1294,23 @@ def set_webhook() -> None:
         logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
-        raise
+        # Ne pas lever d'exception ici pour permettre à Flask de démarrer
+        logger.warning("Webhook non configuré, poursuite du démarrage...")
 
 def run_bot() -> None:
     logger.info("Démarrage du bot...")
-    while True:  # Boucle infinie pour redémarrer en cas d'échec
-        try:
-            initialize_bot()
-            set_webhook()
-            logger.info("Bot initialisé avec succès.")
-            app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
-        except Exception as e:
-            logger.error(f"Erreur fatale lors du démarrage du bot: {str(e)}. Redémarrage dans 30s...")
-            time.sleep(30)  # Attente avant redémarrage
+    try:
+        logger.info("Appel de initialize_bot...")
+        initialize_bot()
+        logger.info("Configuration du webhook...")
+        set_webhook()
+        logger.info("Bot initialisé avec succès.")
+        logger.info(f"Démarrage de Flask sur 0.0.0.0:{PORT}...")
+        app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    except Exception as e:
+        logger.error(f"Erreur fatale lors du démarrage du bot: {str(e)}")
+        logger.warning("Démarrage de Flask malgré l'erreur pour répondre aux sondes Cloud Run...")
+        app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
 
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
