@@ -107,6 +107,7 @@ w3 = None
 solana_keypair = None
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+
 def initialize_bot(chat_id):
     global w3, solana_keypair
     logger.info("Initialisation différée du bot...")
@@ -194,8 +195,7 @@ def get_real_tx_per_min_solana(token_address):
     except Exception as e:
         logger.error(f"Erreur calcul tx/min Solana pour {token_address}: {str(e)}")
         return 0, 0
-
-def monitor_twitter(chat_id):
+        def monitor_twitter(chat_id):
     global twitter_requests_remaining, twitter_last_reset, last_twitter_call
     logger.info("Surveillance Twitter démarrée...")
     bot.send_message(chat_id, "📡 Surveillance Twitter activée...")
@@ -595,7 +595,8 @@ def check_solana_token(chat_id, token_address):
     except Exception as e:
         logger.error(f"Erreur vérification Solana {token_address}: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur vérification Solana {token_address}: {str(e)}')
-        @app.route("/webhook", methods=['POST'])
+
+@app.route("/webhook", methods=['POST'])
 def webhook():
     logger.info("Webhook reçu")
     try:
@@ -615,8 +616,9 @@ def start_message(message):
     logger.info("Commande /start reçue")
     chat_id = message.chat.id
     try:
-        bot.send_message(chat_id, "✅ Bot démarré!")
-        threading.Thread(target=run_bot, args=(chat_id,), daemon=True).start()  # Initialisation différée
+        bot.send_message(chat_id, "✅ Bot démarré! Initialisation en cours...")
+        threading.Thread(target=initialize_bot, args=(chat_id,), daemon=True).start()
+        threading.Thread(target=set_webhook, args=(chat_id,), daemon=True).start()
         show_main_menu(chat_id)
     except Exception as e:
         logger.error(f"Erreur dans start_message: {str(e)}")
@@ -1319,19 +1321,8 @@ def set_webhook(chat_id):
         logger.error(f"Erreur configuration webhook: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur configuration webhook: {str(e)}')
 
-def run_bot(chat_id):
-    logger.info("Démarrage du bot dans un thread...")
-    try:
-        initialize_bot(chat_id)
-        set_webhook(chat_id)
-        logger.info("Bot initialisé avec succès dans le thread.")
-    except Exception as e:
-        logger.error(f"Erreur lors du démarrage du bot dans le thread: {str(e)}")
-        bot.send_message(chat_id, f'⚠️ Erreur démarrage bot: {str(e)}')
-
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
     logger.info(f"Flask démarré sur 0.0.0.0:{PORT}")
-    # Initialisation différée déclenchée via /start
     
