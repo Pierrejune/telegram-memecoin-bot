@@ -53,7 +53,7 @@ TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-SOLANA_RPC_ALT = os.getenv("SOLANA_RPC_ALT", "https://your-quicknode-endpoint-here")  # Remplacez par votre endpoint QuickNode
+SOLANA_RPC_ALT = os.getenv("SOLANA_RPC_ALT", "https://orbital-fabled-orb.solana-mainnet.quiknode.pro/4d51da5b3e55c817f9abefd30f9855038031b182/")
 
 BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
@@ -575,7 +575,7 @@ def webhook():
         if request.method == "POST" and request.headers.get("content-type") == "application/json":
             update = telebot.types.Update.de_json(request.get_json())
             bot.process_new_updates([update])
-            if not trade_active:  # Lancer les threads uniquement au premier webhook si pas encore actif
+            if not trade_active:
                 global trade_active
                 trade_active = True
                 threading.Thread(target=initialize_and_run_threads, args=(update.message.chat.id,), daemon=True).start()
@@ -586,6 +586,10 @@ def webhook():
     except Exception as e:
         logger.error(f"Erreur dans webhook: {str(e)}")
         return abort(500)
+
+@app.route("/")
+def health_check():
+    return "Bot is running", 200
 
 @bot.message_handler(commands=['start'])
 def start_message(message):
@@ -1233,7 +1237,7 @@ def monitor_and_sell(chat_id: int) -> None:
                     sell_token(chat_id, contract_address, sell_amount, chain, current_price)
                 elif profit_pct >= take_profit_steps[0] * 100 and trend < 1.02:
                     sell_amount = amount / 3
-                    sell_token(chat_id, contract_address, sell_amount, chain, current_price)
+                                        sell_token(chat_id, contract_address, sell_amount, chain, current_price)
                 elif current_price <= trailing_stop_price:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
                 elif loss_pct >= stop_loss_threshold:
@@ -1277,7 +1281,7 @@ def get_solana_balance(wallet_address: str) -> float:
         result = response.json().get('result', {})
         return result.get('value', 0) / 10**9
     except Exception as e:
-                logger.error(f"Erreur solde Solana: {str(e)}")
+        logger.error(f"Erreur solde Solana: {str(e)}")
         return 0
 
 def get_current_market_cap(contract_address: str) -> float:
