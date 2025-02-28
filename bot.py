@@ -275,11 +275,12 @@ def snipe_new_pairs_bsc(chat_id: int) -> None:
         bot.send_message(chat_id, "🔫 Sniping BSC activé...")
     factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
     retry_delay = 5
-    last_block = w3.eth.block_number - 1000  # Étendre la fenêtre initiale
+    last_block = max(w3.eth.block_number - 100, 0)  # Fenêtre initiale de 100 blocs
     while trade_active:
         try:
             latest_block = w3.eth.block_number
-            events = factory.events.PairCreated.get_logs(fromBlock=last_block, toBlock=latest_block)
+            from_block = max(latest_block - 100, last_block)
+            events = factory.events.PairCreated.get_logs(fromBlock=from_block, toBlock=latest_block)
             last_block = latest_block + 1
             for event in events:
                 token_address = event['args']['token0'] if event['args']['token0'] != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else event['args']['token1']
@@ -336,7 +337,7 @@ def extract_token_address(msg) -> str:
         return None
 
 def pre_validate_token(chat_id: int, token_address: str, chain: str) -> None:
-    for _ in range(30):  # 5 min
+    for _ in range(30):
         if not trade_active:
             break
         data = get_token_data(token_address, chain)
@@ -432,10 +433,11 @@ def check_token(chat_id: int, token_address: str, chain: str) -> bool:
             'buy_sell_ratio': buy_sell_ratio, 'recent_buy_count': recent_buy_count
         }
         if chain == 'bsc':
+            logger.info(f"Tentative d'achat BSC pour {token_address}")
             buy_token_bsc(chat_id, token_address, mise_depart_bsc)
         else:
+            logger.info(f"Tentative d'achat Solana pour {token_address}")
             buy_token_solana(chat_id, token_address, mise_depart_sol)
-        daily_trades['buys'].append({'token': token_address, 'chain': chain, 'amount': mise_depart_bsc if chain == 'bsc' else mise_depart_sol, 'timestamp': datetime.now().strftime('%H:%M:%S')})
         return True
     except Exception as e:
         logger.error(f"Erreur vérification token {token_address}: {str(e)}")
@@ -452,7 +454,7 @@ def detect_new_tokens_bsc(chat_id: int) -> None:
             raise ConnectionError("Connexion au nœud BSC perdue")
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
-        events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 1000, toBlock=latest_block)
+        events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 2000, toBlock=latest_block)
         if trade_active:
             bot.send_message(chat_id, f"⬇️ {len(events)} nouvelles paires détectées sur BSC")
         if not events:
@@ -503,29 +505,21 @@ def detect_new_tokens_solana(chat_id: int) -> None:
         if not trade_active:
             break
         try:
-            sources = [
-                ("Birdeye", "https://public-api.birdeye.so/v1/pairs/list?sort_by=time&sort_type=desc&limit=100", BIRDEYE_HEADERS),
-                ("DexScreener", "https://api.dexscreener.com/latest/dex/pairs/solana", HEADERS)
-            ]
-            tokens = []
-            for source_name, url, headers in sources:
-                response = session.get(url, headers=headers, timeout=10)
-                response.raise_for_status()
-                data = response.json()
-                if source_name == "Birdeye":
-                    if 'data' in data and 'pairs' in data['data']:
-                        tokens.extend(data['data']['pairs'])
-                elif source_name == "DexScreener":
-                    if 'pairs' in data:
-                        tokens.extend([p for p in data['pairs'] if p.get('chainId') == 'solana'])
+            url = "https://api.dexscreener.com/latest/dex/pairs/solana"
+            response = session.get(url, headers=HEADERS, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            if 'pairs' not in data:
+                raise ValueError("Réponse DexScreener invalide")
+            tokens = [p for p in data['pairs'] if p.get('chainId') == 'solana']
             if not tokens:
-                raise ValueError("Aucune donnée valide des sources")
+                raise ValueError("Aucune donnée valide de DexScreener")
             if trade_active:
                 bot.send_message(chat_id, f"⬇️ {len(tokens)} paires détectées sur Solana")
-            tokens.sort(key=lambda x: x.get('created_at', x.get('pairCreatedAt', 0)), reverse=True)
+            tokens.sort(key=lambda x: x.get('pairCreatedAt', 0), reverse=True)
             
             for token in tokens[:100]:
-                token_address = token.get('address', token.get('baseToken', {}).get('address'))
+                token_address = token.get('baseToken', {}).get('address')
                 if not token_address:
                     continue
                 if token_address in rejected_tokens:
@@ -534,8 +528,8 @@ def detect_new_tokens_solana(chat_id: int) -> None:
                         del rejected_tokens[token_address]
                     elif age_reject < (RETRY_DELAY_MINUTES / 60):
                         continue
-                volume_24h = float(token.get('volume_24h', token.get('volume', {}).get('h24', 0)))
-                pair_created_at = token.get('created_at', token.get('pairCreatedAt', time.time() * 1000 - 3600)) / 1000
+                volume_24h = float(token.get('volume', {}).get('h24', 0))
+                pair_created_at = token.get('pairCreatedAt', time.time() * 1000 - 3600) / 1000
                 age_hours = (time.time() - pair_created_at) / 3600
                 
                 if age_hours <= MAX_TOKEN_AGE_HOURS and volume_24h >= MIN_VOLUME_SOL:
@@ -1003,6 +997,7 @@ def adjust_buy_sell_ratio_sol(message):
 
 def buy_token_bsc(chat_id: int, contract_address: str, amount: float) -> None:
     try:
+        logger.info(f"Début achat BSC: {contract_address}, montant: {amount} BNB")
         dynamic_slippage = 10
         router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
         amount_in = w3.to_wei(amount, 'ether')
@@ -1029,8 +1024,10 @@ def buy_token_bsc(chat_id: int, contract_address: str, amount: float) -> None:
                 'price_history': [entry_price], 'highest_price': entry_price, 'profit': 0.0,
                 'buy_time': time.time()
             }
+            logger.info(f"Achat BSC réussi: {contract_address}")
             bot.send_message(chat_id, f'✅ Achat effectué : {amount} BNB de {contract_address}')
         else:
+            logger.error(f"Échec achat BSC: Transaction {tx_hash.hex()} échouée")
             bot.send_message(chat_id, f'⚠️ Échec achat {contract_address}, TX: {tx_hash.hex()}')
             daily_trades['buys'][-1]['error'] = "Transaction échouée"
     except Exception as e:
@@ -1041,6 +1038,7 @@ def buy_token_bsc(chat_id: int, contract_address: str, amount: float) -> None:
 
 def buy_token_solana(chat_id: int, contract_address: str, amount: float) -> None:
     try:
+        logger.info(f"Début achat Solana: {contract_address}, montant: {amount} SOL")
         dynamic_slippage = 10
         amount_in = int(amount * 10**9)
         response = session.post(SOLANA_RPC, json={
@@ -1073,6 +1071,7 @@ def buy_token_solana(chat_id: int, contract_address: str, amount: float) -> None
             'price_history': [entry_price], 'highest_price': entry_price, 'profit': 0.0,
             'buy_time': time.time()
         }
+        logger.info(f"Achat Solana réussi: {contract_address}")
         bot.send_message(chat_id, f'✅ Achat effectué : {amount} SOL de {contract_address}')
     except Exception as e:
         logger.error(f"Erreur achat Solana: {str(e)}")
@@ -1272,8 +1271,8 @@ def refresh_token(chat_id: int, token: str) -> None:
             f"Token: {token} ({portfolio[token]['chain']})\nContrat: {token}\n"
             f"MC Achat: ${portfolio[token]['market_cap_at_buy']:.2f}\nMC Actuel: ${current_mc:.2f}\n"
             f"Profit: {profit:.2f}%\nProfit cumulé: ${portfolio[token]['profit']:.4f} {portfolio[token]['chain'].upper()}\n"
-                        f"Take-Profit: x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}\n"
-            f"Trailing Stop: -{trailing_stop_percentage}% sous pic\nStop-Loss: -{stop_loss_threshold} %"
+            f"Take-Profit: x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}\n"
+                        f"Trailing Stop: -{trailing_stop_percentage}% sous pic\nStop-Loss: -{stop_loss_threshold} %"
         )
         bot.send_message(chat_id, f'🔍 Portefeuille rafraîchi pour {token}:\n{msg}', reply_markup=markup)
     except Exception as e:
@@ -1377,4 +1376,3 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Crash système critique: {str(e)}. Redémarrage dans 30s...")
             time.sleep(30)
-            
