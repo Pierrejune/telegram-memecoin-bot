@@ -575,6 +575,10 @@ def webhook():
         if request.method == "POST" and request.headers.get("content-type") == "application/json":
             update = telebot.types.Update.de_json(request.get_json())
             bot.process_new_updates([update])
+            if not trade_active:  # Lancer les threads uniquement au premier webhook si pas encore actif
+                global trade_active
+                trade_active = True
+                threading.Thread(target=initialize_and_run_threads, args=(update.message.chat.id,), daemon=True).start()
             logger.info("Update traité avec succès")
             return 'OK', 200
         logger.warning("Requête webhook invalide")
@@ -1234,7 +1238,7 @@ def monitor_and_sell(chat_id: int) -> None:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
                 elif loss_pct >= stop_loss_threshold:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
-                        time.sleep(2)
+            time.sleep(2)
         except Exception as e:
             logger.error(f"Erreur surveillance globale: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur surveillance: {str(e)}. Reprise dans 10s...')
@@ -1273,7 +1277,7 @@ def get_solana_balance(wallet_address: str) -> float:
         result = response.json().get('result', {})
         return result.get('value', 0) / 10**9
     except Exception as e:
-        logger.error(f"Erreur solde Solana: {str(e)}")
+                logger.error(f"Erreur solde Solana: {str(e)}")
         return 0
 
 def get_current_market_cap(contract_address: str) -> float:
@@ -1382,20 +1386,22 @@ def set_webhook() -> None:
 
 def run_bot() -> None:
     logger.info("Démarrage du bot...")
-    threading.Thread(target=app.run, args=("0.0.0.0", PORT), kwargs={'debug': False, 'threaded': True}, daemon=True).start()
-    logger.info("Serveur Flask démarré sur le port 8080")
-    while True:
-        try:
-            logger.info("Appel de initialize_bot...")
-            initialize_bot()
-            logger.info("Configuration du webhook...")
-            set_webhook()
-            logger.info("Bot initialisé avec succès.")
-            while True:
-                time.sleep(60)  # Garder le main thread actif
-        except Exception as e:
-            logger.error(f"Erreur critique lors du démarrage: {str(e)}. Redémarrage dans 10s...")
-            time.sleep(10)
+    logger.info("Démarrage du serveur Flask sur le port {}".format(PORT))
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+
+def initialize_and_run_threads(chat_id: int) -> None:
+    logger.info("Initialisation et lancement des threads...")
+    try:
+        initialize_bot()
+        logger.info("Bot initialisé avec succès.")
+        threading.Thread(target=trading_cycle, args=(chat_id,), daemon=True).start()
+        threading.Thread(target=snipe_new_pairs_bsc, args=(chat_id,), daemon=True).start()
+        threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True).start()
+        threading.Thread(target=snipe_solana_pools, args=(chat_id,), daemon=True).start()
+        threading.Thread(target=watchdog, args=(chat_id,), daemon=True).start()
+        set_webhook()
+    except Exception as e:
+        logger.error(f"Erreur dans l'initialisation ou les threads: {str(e)}")
 
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
