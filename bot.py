@@ -24,6 +24,9 @@ import re
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Initialisation Flask
+app = Flask(__name__)
+
 # Variables globales
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124", "Accept": "application/json"}
 session = requests.Session()
@@ -41,34 +44,31 @@ rejected_tokens = {}
 
 # Chargement des variables d’environnement
 logger.info("Chargement des variables d’environnement...")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
-TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "default_token")
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "default_address")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "default_key")
+SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "default_solana_key")
+TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "default_twitter_token")
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
-WEBHOOK_URL = "https://memecoin-bot-245322619314.us-central1.run.app/webhook"  # À ajuster si différent
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://memecoin-bot-245322619314.us-central1.run.app/webhook")
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
 missing_vars = [var for var, val in {
     "TELEGRAM_TOKEN": TELEGRAM_TOKEN, "WALLET_ADDRESS": WALLET_ADDRESS, "PRIVATE_KEY": PRIVATE_KEY,
     "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN
-}.items() if not val]
+}.items() if val == "default_" + var.lower()]
 if missing_vars:
-    logger.critical(f"Variables manquantes: {missing_vars}")
-    raise ValueError(f"Variables manquantes: {missing_vars}")
-logger.info("Variables principales chargées.")
+    logger.warning(f"Variables par défaut utilisées pour: {missing_vars}")
 
-# Initialisation Flask et Telegram
-app = Flask(__name__)
+# Initialisation Telegram et autres
 bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 w3 = None
 solana_keypair = None
 trade_active = False
-last_chat_id = None  # Stocke dynamiquement le dernier chat_id
+last_chat_id = None
 
-# Variables globales pour le trading
+# Variables de trading
 mise_depart_bsc = 0.02
 mise_depart_sol = 0.37
 gas_fee = 5
@@ -114,22 +114,18 @@ def initialize_bot():
         w3 = Web3(HTTPProvider(BSC_RPC))
         w3.middleware_onion.inject(geth_poa_middleware, layer=0)
         if not w3.is_connected():
-            logger.error("Échec de connexion à BSC")
-            raise ConnectionError("Connexion BSC échouée")
-        logger.info(f"Connexion BSC réussie. Bloc actuel : {w3.eth.block_number}")
+            logger.warning("Connexion BSC échouée, poursuite sans BSC")
+        else:
+            logger.info(f"Connexion BSC réussie. Bloc actuel : {w3.eth.block_number}")
 
         logger.info("Initialisation de la clé Solana...")
         try:
             solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
-            logger.info("Clé Solana initialisée avec succès.")
+            logger.info("Clé Solana initialisée.")
         except Exception as e:
-            logger.error(f"Clé Solana invalide: {str(e)}")
-            raise ValueError("Clé Solana invalide ou mal formée")
+            logger.warning(f"Clé Solana invalide: {str(e)}, poursuite sans Solana")
     except Exception as e:
-        logger.error(f"Erreur lors de l'initialisation: {str(e)}")
-        if last_chat_id:
-            bot.send_message(last_chat_id, f'⚠️ Erreur lors de l’initialisation: {str(e)}')
-        raise
+        logger.error(f"Erreur dans initialize_bot: {str(e)}", exc_info=True)
 
 def is_safe_token_bsc(token_address: str) -> bool:
     try:
@@ -181,7 +177,7 @@ def get_token_data(token_address: str, chain: str) -> Dict[str, float]:
         return {
             'volume_24h': volume_24h, 'liquidity': liquidity, 'market_cap': market_cap,
             'price': price, 'buy_sell_ratio': buy_sell_ratio_5m, 'recent_buy_count': recent_buy_count,
-            'pair_created_at': pair_created_at, 'top_holder_pct': 0
+            'pair_created_at': pair_created_at
         }
     except Exception as e:
         logger.error(f"Erreur récupération données DexScreener {token_address} ({chain}): {str(e)}")
@@ -194,7 +190,7 @@ def check_token(chat_id: int, token_address: str, chain: str) -> bool:
             return False
 
         block_time = datetime.now() - timedelta(hours=GRACE_PERIOD_HOURS)
-        if chain == 'bsc':
+        if chain == 'bsc' and w3:
             latest_block = w3.eth.block_number
             events = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI).events.PairCreated.get_logs(fromBlock=latest_block - 200, toBlock=latest_block)
             for event in events:
@@ -226,7 +222,7 @@ def check_token(chat_id: int, token_address: str, chain: str) -> bool:
         max_market_cap = MAX_MARKET_CAP_BSC if chain == 'bsc' else MAX_MARKET_CAP_SOL
 
         if buy_sell_ratio < min_ratio:
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio achat/vente 5min {buy_sell_ratio:.2f} < {min_ratio}')
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : ratio A/V 5min {buy_sell_ratio:.2f} < {min_ratio}')
             rejected_tokens[token_address] = time.time()
             return False
         if volume_24h < min_volume or volume_24h > max_volume:
@@ -277,8 +273,9 @@ def detect_new_tokens_bsc(chat_id: int) -> None:
     global last_valid_token_time
     try:
         bot.send_message(chat_id, "🔍 Début détection BSC...")
-        if not w3.is_connected():
-            raise ConnectionError("Connexion au nœud BSC perdue")
+        if not w3 or not w3.is_connected():
+            bot.send_message(chat_id, "⚠️ Connexion BSC non disponible")
+            return
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
         events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 200, toBlock=latest_block)
@@ -308,10 +305,10 @@ def detect_new_tokens_bsc(chat_id: int) -> None:
                     continue
             bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (BSC), Âge: {age_hours:.2f}h')
             result = check_token(chat_id, token_address, 'bsc')
-            if isinstance(result, Exception) or result is False:
+            if isinstance(result, Exception) or not result:
                 rejection_reasons.append(f"{token_address}: critères non remplis ou erreur")
                 rejected_count += 1
-            elif result:
+            else:
                 valid_token_found = True
                 last_valid_token_time = time.time()
 
@@ -327,6 +324,9 @@ def detect_new_tokens_bsc(chat_id: int) -> None:
 def detect_new_tokens_solana(chat_id: int) -> None:
     try:
         bot.send_message(chat_id, "🔍 Début détection Solana...")
+        if not solana_keypair:
+            bot.send_message(chat_id, "⚠️ Clé Solana non disponible")
+            return
         for attempt in range(3):
             response = session.post(SOLANA_RPC, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getRecentProgramAccounts",
@@ -363,10 +363,10 @@ def detect_new_tokens_solana(chat_id: int) -> None:
                 continue
             bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Solana), Âge: {age_hours:.2f}h')
             result = check_token(chat_id, token_address, 'solana')
-            if isinstance(result, Exception) or result is False:
+            if isinstance(result, Exception) or not result:
                 rejection_reasons.append(f"{token_address}: critères non remplis ou erreur")
                 rejected_count += 1
-            elif result:
+            else:
                 valid_token_found = True
                 last_valid_token_time = time.time()
 
@@ -439,12 +439,16 @@ def cron_task():
         logger.warning("Aucun chat_id défini, en attente de /start")
         return 'Aucun chat_id actif', 200
     logger.info(f"Exécution des tâches cron pour chat_id={last_chat_id}")
-    detect_new_tokens_bsc(last_chat_id)
-    detect_new_tokens_solana(last_chat_id)
-    monitor_twitter(last_chat_id)
-    monitor_and_sell(last_chat_id)
-    logger.info("Tâches cron terminées avec succès")
-    return 'Cycle exécuté', 200
+    try:
+        detect_new_tokens_bsc(last_chat_id)
+        detect_new_tokens_solana(last_chat_id)
+        monitor_twitter(last_chat_id)
+        monitor_and_sell(last_chat_id)
+        logger.info("Tâches cron terminées avec succès")
+        return 'Cycle exécuté', 200
+    except Exception as e:
+        logger.error(f"Erreur dans cron_task: {str(e)}")
+        return 'Erreur dans cron', 500
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
@@ -472,16 +476,12 @@ def start_message(message):
             trade_active = True
             last_chat_id = chat_id
             bot.send_message(chat_id, "▶️ Trading lancé avec succès!")
-            logger.info("Message 'Trading lancé' envoyé")
             show_main_menu(chat_id)
-            logger.info("Menu principal affiché")
         else:
             bot.send_message(chat_id, "⚠️ Trading déjà en cours.")
-            logger.info("Trading déjà actif")
     except Exception as e:
         logger.error(f"Erreur dans start_message: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur au démarrage: {str(e)}')
-        raise
 
 @bot.message_handler(commands=['menu'])
 def menu_message(message):
@@ -490,7 +490,6 @@ def menu_message(message):
     try:
         bot.send_message(chat_id, "📋 Menu affiché!")
         show_main_menu(chat_id)
-        logger.info("Menu principal affiché")
     except Exception as e:
         logger.error(f"Erreur dans menu_message: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur affichage menu: {str(e)}')
@@ -511,7 +510,6 @@ def show_main_menu(chat_id: int) -> None:
         InlineKeyboardButton("📊 Seuils", callback_data="threshold_settings")
     )
     bot.send_message(chat_id, "Voici le menu principal:", reply_markup=markup)
-    logger.info("Menu principal envoyé")
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
@@ -876,6 +874,9 @@ def adjust_buy_sell_ratio_sol(message):
         bot.send_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 1.5)")
 
 def buy_token_bsc(chat_id: int, contract_address: str, amount: float) -> None:
+    if not w3 or not w3.is_connected():
+        bot.send_message(chat_id, "⚠️ BSC non disponible pour trading")
+        return
     try:
         dynamic_slippage = 10
         router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
@@ -914,6 +915,9 @@ def buy_token_bsc(chat_id: int, contract_address: str, amount: float) -> None:
             daily_trades['buys'][-1]['error'] = str(e)
 
 def buy_token_solana(chat_id: int, contract_address: str, amount: float) -> None:
+    if not solana_keypair:
+        bot.send_message(chat_id, "⚠️ Solana non disponible pour trading")
+        return
     try:
         dynamic_slippage = 10
         amount_in = int(amount * 10**9)
@@ -957,6 +961,9 @@ def buy_token_solana(chat_id: int, contract_address: str, amount: float) -> None
 def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, current_price: float) -> None:
     global mise_depart_bsc, mise_depart_sol
     if chain == "solana":
+        if not solana_keypair:
+            bot.send_message(chat_id, "⚠️ Solana non disponible pour trading")
+            return
         try:
             dynamic_slippage = 10
             amount_out = int(amount * 10**9)
@@ -998,6 +1005,9 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
             logger.error(f"Erreur vente Solana: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
     else:
+        if not w3 or not w3.is_connected():
+            bot.send_message(chat_id, "⚠️ BSC non disponible pour trading")
+            return
         try:
             dynamic_slippage = 10
             token_amount = w3.to_wei(amount, 'ether')
@@ -1087,8 +1097,8 @@ def monitor_and_sell(chat_id: int) -> None:
 
 def show_portfolio(chat_id: int) -> None:
     try:
-        bnb_balance = w3.eth.get_balance(WALLET_ADDRESS) / 10**18
-        sol_balance = get_solana_balance(WALLET_ADDRESS)
+        bnb_balance = w3.eth.get_balance(WALLET_ADDRESS) / 10**18 if w3 and w3.is_connected() else 0
+        sol_balance = get_solana_balance(WALLET_ADDRESS) if solana_keypair else 0
         msg = f'💰 Portefeuille:\nBNB : {bnb_balance:.4f}\nSOL : {sol_balance:.4f}\n\n'
         markup = InlineKeyboardMarkup()
         for ca, data in portfolio.items():
@@ -1218,7 +1228,7 @@ def set_webhook():
         bot.remove_webhook()
         time.sleep(1)
         bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
+                logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
         if last_chat_id:
@@ -1226,16 +1236,16 @@ def set_webhook():
 
 if __name__ == "__main__":
     try:
-        logger.info("Démarrage du bot...")
+        logger.info("Démarrage de l'application...")
         initialize_bot()
         logger.info("Initialisation terminée")
         set_webhook()
         logger.info("Webhook configuré, lancement de Flask...")
         app.run(host="0.0.0.0", port=8080)
     except Exception as e:
-        logger.error(f"Erreur au démarrage: {str(e)}")
-                if last_chat_id:
+        logger.error(f"Erreur au démarrage: {str(e)}", exc_info=True)
+        if last_chat_id:
             bot.send_message(last_chat_id, f'⚠️ Erreur critique au démarrage: {str(e)}')
         else:
             logger.warning("Aucun chat_id disponible pour envoyer l'erreur, échec silencieux")
-        raise  # Relance l'erreur pour apparaître dans les logs Cloud Run
+        raise
