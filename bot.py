@@ -52,8 +52,8 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
-SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")  # Remplacer par un RPC privé si nécessaire
-SOLANA_RPC_ALT = os.getenv("SOLANA_RPC_ALT", "https://your-quicknode-endpoint-here")  # À configurer avec votre clé
+SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+SOLANA_RPC_ALT = os.getenv("SOLANA_RPC_ALT", "https://your-quicknode-endpoint-here")  # Remplacez par votre endpoint QuickNode
 
 BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
@@ -100,7 +100,7 @@ MAX_MARKET_CAP_BSC = 1000000
 MIN_BUY_SELL_RATIO_BSC = 1.5
 MIN_BUY_SELL_RATIO_SOL = 1.5
 MAX_HOLDER_PERCENTAGE = 30.0
-MIN_RECENT_TXNS = 1  # Réduit pour nouveaux lancements
+MIN_RECENT_TXNS = 1
 MAX_TOKEN_AGE_HOURS = 72
 REJECT_EXPIRATION_HOURS = 24
 RETRY_DELAY_MINUTES = 5
@@ -115,20 +115,24 @@ TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5
 
 def initialize_bot():
     global w3, solana_keypair
-    logger.info("Initialisation différée du bot commencée...")
+    logger.info("Tentative de connexion BSC...")
     try:
-        logger.info("Tentative de connexion BSC...")
         w3 = Web3(HTTPProvider(BSC_RPC))
         w3.middleware_onion.inject(geth_poa_middleware, layer=0)
         if not w3.is_connected():
             logger.error("Connexion BSC échouée")
             raise ConnectionError("Connexion BSC échouée")
         logger.info(f"Connexion BSC réussie. Bloc actuel : {w3.eth.block_number}")
-        logger.info("Initialisation de la clé Solana...")
+    except Exception as e:
+        logger.error(f"Erreur connexion BSC: {str(e)}")
+        raise
+
+    logger.info("Initialisation de la clé Solana...")
+    try:
         solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
         logger.info("Clé Solana initialisée.")
     except Exception as e:
-        logger.error(f"Erreur dans l'initialisation différée: {str(e)}")
+        logger.error(f"Erreur initialisation Solana: {str(e)}")
         raise
 
 def is_safe_token_bsc(token_address: str) -> bool:
@@ -254,7 +258,7 @@ def monitor_twitter(chat_id: int) -> None:
                             if trade_active:
                                 bot.send_message(chat_id, f'🔍 Token détecté via Twitter (@{user["username"]}, {followers} abonnés): {word} ({chain})')
                             pre_validate_token(chat_id, word, chain)
-            time.sleep(900)  # 15 minutes
+            time.sleep(900)
         except requests.exceptions.RequestException as e:
             if getattr(e.response, 'status_code', None) == 429:
                 wait_time = 900
@@ -1230,7 +1234,7 @@ def monitor_and_sell(chat_id: int) -> None:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
                 elif loss_pct >= stop_loss_threshold:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
-            time.sleep(2)
+                        time.sleep(2)
         except Exception as e:
             logger.error(f"Erreur surveillance globale: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur surveillance: {str(e)}. Reprise dans 10s...')
@@ -1274,7 +1278,7 @@ def get_solana_balance(wallet_address: str) -> float:
 
 def get_current_market_cap(contract_address: str) -> float:
     try:
-                chain = portfolio[contract_address]['chain'] if contract_address in portfolio else ('bsc' if contract_address.startswith("0x") else 'solana')
+        chain = portfolio[contract_address]['chain'] if contract_address in portfolio else ('bsc' if contract_address.startswith("0x") else 'solana')
         return get_token_data(contract_address, chain)['market_cap']
     except Exception as e:
         logger.error(f"Erreur market cap: {str(e)}")
@@ -1378,6 +1382,8 @@ def set_webhook() -> None:
 
 def run_bot() -> None:
     logger.info("Démarrage du bot...")
+    threading.Thread(target=app.run, args=("0.0.0.0", PORT), kwargs={'debug': False, 'threaded': True}, daemon=True).start()
+    logger.info("Serveur Flask démarré sur le port 8080")
     while True:
         try:
             logger.info("Appel de initialize_bot...")
@@ -1385,16 +1391,16 @@ def run_bot() -> None:
             logger.info("Configuration du webhook...")
             set_webhook()
             logger.info("Bot initialisé avec succès.")
-            app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+            while True:
+                time.sleep(60)  # Garder le main thread actif
         except Exception as e:
             logger.error(f"Erreur critique lors du démarrage: {str(e)}. Redémarrage dans 10s...")
             time.sleep(10)
 
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
-    while True:
-        try:
-            run_bot()
-        except Exception as e:
-            logger.error(f"Crash système critique: {str(e)}. Redémarrage dans 30s...")
-            time.sleep(30)
+    try:
+        run_bot()
+    except Exception as e:
+        logger.error(f"Crash système critique: {str(e)}. Redémarrage dans 30s...")
+        time.sleep(30)
