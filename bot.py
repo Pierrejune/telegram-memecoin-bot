@@ -1233,7 +1233,9 @@ if __name__ == "__main__":
         logger.info("Webhook configuré, lancement de Flask...")
         app.run(host="0.0.0.0", port=8080)
     except Exception as e:
-                logger.error(f"Erreur au démarrage: {str(e)}")
-        if last_chat_id:
+        logger.error(f"Erreur au démarrage: {str(e)}")
+                if last_chat_id:
             bot.send_message(last_chat_id, f'⚠️ Erreur critique au démarrage: {str(e)}')
-        raise  # Relance l'exception pour que Cloud Run signale l'erreur dans les logs
+        else:
+            logger.warning("Aucun chat_id disponible pour envoyer l'erreur, échec silencieux")
+        raise  # Relance l'erreur pour apparaître dans les logs Cloud Run
