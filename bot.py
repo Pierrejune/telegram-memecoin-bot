@@ -50,7 +50,7 @@ TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"  # Codé en dur comme dans l'historique
-CHAT_ID = os.getenv("CHAT_ID")  # Optionnel, sera déterminé dynamiquement si absent
+CHAT_ID = os.getenv("CHAT_ID")  # Optionnel, déterminé dynamiquement si absent
 
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
@@ -112,15 +112,25 @@ def initialize_bot():
     global w3, solana_keypair
     logger.info("Initialisation du bot...")
     try:
+        logger.info("Connexion à BSC...")
         w3 = Web3(HTTPProvider(BSC_RPC))
         w3.middleware_onion.inject(geth_poa_middleware, layer=0)
         if not w3.is_connected():
+            logger.error("Échec de connexion à BSC")
             raise ConnectionError("Connexion BSC échouée")
         logger.info(f"Connexion BSC réussie. Bloc actuel : {w3.eth.block_number}")
-        solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
-        logger.info("Clé Solana initialisée.")
+
+        logger.info("Initialisation de la clé Solana...")
+        try:
+            solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
+            logger.info("Clé Solana initialisée avec succès.")
+        except Exception as e:
+            logger.error(f"Clé Solana invalide: {str(e)}")
+            raise ValueError("Clé Solana invalide ou mal formée")
     except Exception as e:
-        logger.error(f"Erreur initialisation: {str(e)}")
+        logger.error(f"Erreur lors de l'initialisation: {str(e)}")
+        if CHAT_ID:
+            bot.send_message(CHAT_ID, f'⚠️ Erreur lors de l’initialisation: {str(e)}')
         raise
 
 def is_safe_token_bsc(token_address: str) -> bool:
@@ -427,6 +437,7 @@ def webhook():
         if request.method == "POST" and request.headers.get("content-type") == "application/json":
             update = telebot.types.Update.de_json(request.get_json())
             bot.process_new_updates([update])
+            logger.info("Webhook traité avec succès")
             return 'OK', 200
         logger.warning("Requête webhook invalide")
         return abort(403)
@@ -437,16 +448,19 @@ def webhook():
 @app.route("/cron", methods=['GET'])
 def cron_task():
     global trade_active
+    logger.info("Tâche cron déclenchée")
     if not trade_active:
+        logger.info("Trading inactif, fin de la tâche cron")
         return 'Trading inactif', 200
     chat_id = CHAT_ID if CHAT_ID else None
     if not chat_id:
-        logger.warning("CHAT_ID non défini, utilisation par défaut annulée")
+        logger.warning("CHAT_ID non défini, tâche cron annulée")
         return 'CHAT_ID manquant', 400
     detect_new_tokens_bsc(chat_id)
     detect_new_tokens_solana(chat_id)
     monitor_twitter(chat_id)
     monitor_and_sell(chat_id)
+    logger.info("Tâche cron exécutée avec succès")
     return 'Cycle exécuté', 200
 
 @bot.message_handler(commands=['start'])
@@ -455,11 +469,12 @@ def start_message(message):
     try:
         global trade_active
         trade_active = True
-        bot.send_message(message.chat.id, "✅ Bot démarré et trading activé!")
+        bot.send_message(message.chat.id, "▶️ Trading lancé avec succès!")
         show_main_menu(message.chat.id)
     except Exception as e:
         logger.error(f"Erreur dans start_message: {str(e)}")
         bot.send_message(message.chat.id, f'⚠️ Erreur au démarrage: {str(e)}')
+        raise  # Relancer l’exception pour voir l’erreur dans les logs
 
 @bot.message_handler(commands=['menu'])
 def menu_message(message):
@@ -1197,9 +1212,12 @@ def set_webhook():
         logger.error(f"Erreur configuration webhook: {str(e)}")
         if CHAT_ID:
             bot.send_message(CHAT_ID, f'⚠️ Erreur configuration webhook: {str(e)}')
+        else:
+            logger.warning("CHAT_ID non défini, impossible d'envoyer une alerte Telegram")
 
 if __name__ == "__main__":
     try:
+        logger.info("Démarrage du bot...")
         initialize_bot()
         set_webhook()
         logger.info(f"Démarrage de Flask sur le port {PORT}")
@@ -1208,4 +1226,6 @@ if __name__ == "__main__":
         logger.error(f"Erreur au démarrage: {str(e)}")
         if CHAT_ID:
             bot.send_message(CHAT_ID, f'⚠️ Erreur critique au démarrage: {str(e)}')
-            
+        else:
+            logger.warning("CHAT_ID non défini, impossible d'envoyer une alerte Telegram")
+        raise  # Relancer l’exception pour voir l’erreur dans les logs
