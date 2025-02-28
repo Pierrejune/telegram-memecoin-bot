@@ -41,6 +41,7 @@ twitter_last_reset = time.time()
 twitter_requests_remaining = 450
 daily_trades = {'buys': [], 'sells': []}
 rejected_tokens = {}
+trade_active = False
 
 logger.info("Chargement des variables d’environnement...")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -82,7 +83,6 @@ stop_loss_threshold = 15
 trailing_stop_percentage = 5
 take_profit_steps = [1.5, 2, 5]
 detected_tokens = {}
-trade_active = False
 portfolio: Dict[str, dict] = {}
 twitter_tokens = []
 max_positions = 3
@@ -133,6 +133,17 @@ def initialize_bot():
         logger.info("Clé Solana initialisée.")
     except Exception as e:
         logger.error(f"Erreur initialisation Solana: {str(e)}")
+        raise
+
+def set_webhook():
+    logger.info("Configuration du webhook...")
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+        bot.set_webhook(url=WEBHOOK_URL)
+        logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
+    except Exception as e:
+        logger.error(f"Erreur configuration webhook: {str(e)}")
         raise
 
 def is_safe_token_bsc(token_address: str) -> bool:
@@ -575,11 +586,11 @@ def webhook():
         if request.method == "POST" and request.headers.get("content-type") == "application/json":
             update = telebot.types.Update.de_json(request.get_json())
             bot.process_new_updates([update])
+            logger.info("Update traité avec succès")
             if not trade_active:
                 global trade_active
                 trade_active = True
                 threading.Thread(target=initialize_and_run_threads, args=(update.message.chat.id,), daemon=True).start()
-            logger.info("Update traité avec succès")
             return 'OK', 200
         logger.warning("Requête webhook invalide")
         return abort(403)
@@ -589,6 +600,7 @@ def webhook():
 
 @app.route("/")
 def health_check():
+    logger.info("Health check appelé")
     return "Bot is running", 200
 
 @bot.message_handler(commands=['start'])
@@ -1228,7 +1240,7 @@ def monitor_and_sell(chat_id: int) -> None:
                 loss_pct = -profit_pct if profit_pct < 0 else 0
                 trend = mean(data['price_history'][-3:]) / data['entry_price'] if len(data['price_history']) >= 3 else profit_pct / 100
                 data['highest_price'] = max(data['highest_price'], current_price)
-                trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
+                                trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
 
                 if profit_pct >= take_profit_steps[2] * 100:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
@@ -1237,7 +1249,7 @@ def monitor_and_sell(chat_id: int) -> None:
                     sell_token(chat_id, contract_address, sell_amount, chain, current_price)
                 elif profit_pct >= take_profit_steps[0] * 100 and trend < 1.02:
                     sell_amount = amount / 3
-                                        sell_token(chat_id, contract_address, sell_amount, chain, current_price)
+                    sell_token(chat_id, contract_address, sell_amount, chain, current_price)
                 elif current_price <= trailing_stop_price:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
                 elif loss_pct >= stop_loss_threshold:
@@ -1377,22 +1389,6 @@ def show_token_management(chat_id: int) -> None:
         logger.error(f"Erreur gestion tokens: {str(e)}")
         bot.send_message(chat_id, f'⚠️ Erreur gestion tokens: {str(e)}')
 
-def set_webhook() -> None:
-    logger.info("Configuration du webhook...")
-    try:
-        bot.remove_webhook()
-        time.sleep(1)
-        bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
-    except Exception as e:
-        logger.error(f"Erreur configuration webhook: {str(e)}")
-        logger.warning("Webhook non configuré, poursuite du démarrage...")
-
-def run_bot() -> None:
-    logger.info("Démarrage du bot...")
-    logger.info("Démarrage du serveur Flask sur le port {}".format(PORT))
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
-
 def initialize_and_run_threads(chat_id: int) -> None:
     logger.info("Initialisation et lancement des threads...")
     try:
@@ -1403,14 +1399,14 @@ def initialize_and_run_threads(chat_id: int) -> None:
         threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True).start()
         threading.Thread(target=snipe_solana_pools, args=(chat_id,), daemon=True).start()
         threading.Thread(target=watchdog, args=(chat_id,), daemon=True).start()
-        set_webhook()
     except Exception as e:
         logger.error(f"Erreur dans l'initialisation ou les threads: {str(e)}")
 
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
     try:
-        run_bot()
+        set_webhook()  # Configurer le webhook au démarrage
+        app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
     except Exception as e:
         logger.error(f"Crash système critique: {str(e)}. Redémarrage dans 30s...")
         time.sleep(30)
