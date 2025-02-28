@@ -23,8 +23,8 @@ import re
 from solana.rpc.websocket_api import connect
 import asyncio
 
-# Configuration des logs
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Configuration des logs avec niveau DEBUG pour plus de détails
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # Variables globales
@@ -115,7 +115,7 @@ TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5
 
 def initialize_bot():
     global w3, solana_keypair
-    logger.info("Tentative de connexion BSC...")
+    logger.debug("Tentative de connexion BSC...")
     try:
         w3 = Web3(HTTPProvider(BSC_RPC))
         w3.middleware_onion.inject(geth_poa_middleware, layer=0)
@@ -127,7 +127,7 @@ def initialize_bot():
         logger.error(f"Erreur connexion BSC: {str(e)}")
         raise
 
-    logger.info("Initialisation de la clé Solana...")
+    logger.debug("Initialisation de la clé Solana...")
     try:
         solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
         logger.info("Clé Solana initialisée.")
@@ -136,12 +136,15 @@ def initialize_bot():
         raise
 
 def set_webhook():
-    logger.info("Configuration du webhook...")
+    logger.debug("Configuration du webhook...")
     try:
         bot.remove_webhook()
         time.sleep(1)
-        bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
+        response = bot.set_webhook(url=WEBHOOK_URL)
+        logger.info(f"Webhook configuré sur {WEBHOOK_URL}, réponse: {response}")
+        if not response:
+            logger.error("Échec de la configuration du webhook")
+            raise Exception("Webhook non configuré")
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
         raise
@@ -581,10 +584,11 @@ def detect_new_tokens_solana(chat_id: int) -> None:
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
-    logger.info("Webhook reçu")
+    logger.debug("Webhook reçu")
     try:
         if request.method == "POST" and request.headers.get("content-type") == "application/json":
             update = telebot.types.Update.de_json(request.get_json())
+            logger.debug(f"Update reçu: {update}")
             bot.process_new_updates([update])
             logger.info("Update traité avec succès")
             if not trade_active:
@@ -600,12 +604,12 @@ def webhook():
 
 @app.route("/")
 def health_check():
-    logger.info("Health check appelé")
+    logger.debug("Health check appelé")
     return "Bot is running", 200
 
 @bot.message_handler(commands=['start'])
 def start_message(message):
-    logger.info("Commande /start reçue")
+    logger.info(f"Commande /start reçue de {message.chat.id}")
     try:
         bot.send_message(message.chat.id, "✅ Bot démarré!")
         show_main_menu(message.chat.id)
@@ -615,7 +619,7 @@ def start_message(message):
 
 @bot.message_handler(commands=['menu'])
 def menu_message(message):
-    logger.info("Commande /menu reçue")
+    logger.info(f"Commande /menu reçue de {message.chat.id}")
     try:
         bot.send_message(message.chat.id, "📋 Menu affiché!")
         show_main_menu(message.chat.id)
@@ -1240,7 +1244,7 @@ def monitor_and_sell(chat_id: int) -> None:
                 loss_pct = -profit_pct if profit_pct < 0 else 0
                 trend = mean(data['price_history'][-3:]) / data['entry_price'] if len(data['price_history']) >= 3 else profit_pct / 100
                 data['highest_price'] = max(data['highest_price'], current_price)
-                                trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
+                trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
 
                 if profit_pct >= take_profit_steps[2] * 100:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
@@ -1252,7 +1256,7 @@ def monitor_and_sell(chat_id: int) -> None:
                     sell_token(chat_id, contract_address, sell_amount, chain, current_price)
                 elif current_price <= trailing_stop_price:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
-                elif loss_pct >= stop_loss_threshold:
+                                elif loss_pct >= stop_loss_threshold:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
             time.sleep(2)
         except Exception as e:
@@ -1390,7 +1394,7 @@ def show_token_management(chat_id: int) -> None:
         bot.send_message(chat_id, f'⚠️ Erreur gestion tokens: {str(e)}')
 
 def initialize_and_run_threads(chat_id: int) -> None:
-    logger.info("Initialisation et lancement des threads...")
+    logger.debug("Initialisation et lancement des threads...")
     try:
         initialize_bot()
         logger.info("Bot initialisé avec succès.")
