@@ -49,15 +49,14 @@ SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
-SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-CHAT_ID = os.getenv("CHAT_ID")
+SOLANA_RPC = "https://api.mainnet-beta.solana.com"  # Codé en dur comme dans l'historique
+CHAT_ID = os.getenv("CHAT_ID")  # Optionnel, sera déterminé dynamiquement si absent
 
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
 missing_vars = [var for var, val in {
     "TELEGRAM_TOKEN": TELEGRAM_TOKEN, "WALLET_ADDRESS": WALLET_ADDRESS, "PRIVATE_KEY": PRIVATE_KEY,
-    "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "WEBHOOK_URL": WEBHOOK_URL, "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN,
-    "CHAT_ID": CHAT_ID
+    "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "WEBHOOK_URL": WEBHOOK_URL, "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN
 }.items() if not val]
 if missing_vars:
     logger.critical(f"Variables manquantes: {missing_vars}")
@@ -440,7 +439,10 @@ def cron_task():
     global trade_active
     if not trade_active:
         return 'Trading inactif', 200
-    chat_id = CHAT_ID
+    chat_id = CHAT_ID if CHAT_ID else None
+    if not chat_id:
+        logger.warning("CHAT_ID non défini, utilisation par défaut annulée")
+        return 'CHAT_ID manquant', 400
     detect_new_tokens_bsc(chat_id)
     detect_new_tokens_solana(chat_id)
     monitor_twitter(chat_id)
@@ -1193,7 +1195,8 @@ def set_webhook():
         logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
-        bot.send_message(CHAT_ID, f'⚠️ Erreur configuration webhook: {str(e)}')
+        if CHAT_ID:
+            bot.send_message(CHAT_ID, f'⚠️ Erreur configuration webhook: {str(e)}')
 
 if __name__ == "__main__":
     try:
@@ -1203,5 +1206,6 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=PORT, debug=False)
     except Exception as e:
         logger.error(f"Erreur au démarrage: {str(e)}")
-        bot.send_message(CHAT_ID, f'⚠️ Erreur critique au démarrage: {str(e)}')
-        
+        if CHAT_ID:
+            bot.send_message(CHAT_ID, f'⚠️ Erreur critique au démarrage: {str(e)}')
+            
