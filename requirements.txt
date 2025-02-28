@@ -3,9 +3,9 @@ flask==2.3.2
 cachetools==5.3.1
 python-dotenv==1.0.0
 web3==6.11.0
-solders==0.21.0  # Ajout nécessaire pour Solana
+solders==0.21.0
 base58==2.1.1
 aiohttp==3.8.0
 telethon==1.36.0
-websockets==12.0
+websockets==10.4  # Réduit pour éviter les conflits
 solana==0.34.3
