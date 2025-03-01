@@ -1210,7 +1210,7 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
                 bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}, TX: {tx_hash.hex()}')
         except Exception as e:
             logger.error(f"Erreur vente BSC: {str(e)}")
-            bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
+                        bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
 
 def sell_token_percentage(chat_id: int, token: str, percentage: float) -> None:
     try:
@@ -1249,7 +1249,7 @@ def monitor_and_sell(chat_id: int) -> None:
 
                 if profit_pct >= take_profit_steps[2] * 100:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
-                                elif profit_pct >= take_profit_steps[1] * 100 and trend < 1.05:
+                elif profit_pct >= take_profit_steps[1] * 100 and trend < 1.05:
                     sell_amount = amount / 2
                     sell_token(chat_id, contract_address, sell_amount, chain, current_price)
                 elif profit_pct >= take_profit_steps[0] * 100 and trend < 1.02:
