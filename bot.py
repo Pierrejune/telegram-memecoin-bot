@@ -77,8 +77,8 @@ app = Flask(__name__)
 logger.info("Flask initialisé.")
 bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 logger.info("Bot Telegram initialisé.")
-w3 = None
-solana_keypair = None
+w3 = None  # Initialisation retardée
+solana_keypair = None  # Initialisation retardée
 
 mise_depart_bsc = 0.02
 mise_depart_sol = 0.37
@@ -116,8 +116,6 @@ PANCAKE_FACTORY_ABI = [json.loads('{"anonymous": false, "inputs": [{"indexed": t
 PANCAKE_ROUTER_ABI = json.loads('[{"inputs": [{"internalType": "uint256", "name": "amountIn", "type": "uint256"}, {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactETHForTokens", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "payable", "type": "function"}, {"inputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}, {"internalType": "uint256", "name": "amountInMax", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactTokensForETH", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "nonpayable", "type": "function"}]')
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-
-logger.info("Définitions globales terminées")
 
 def initialize_bot():
     global w3, solana_keypair
@@ -1229,7 +1227,7 @@ def monitor_and_sell(chat_id: int) -> None:
                 if len(data['price_history']) > 10:
                     data['price_history'].pop(0)
                 portfolio[contract_address]['current_market_cap'] = current_mc
-                                profit_pct = (current_price - data['entry_price']) / data['entry_price'] * 100
+                profit_pct = (current_price - data['entry_price']) / data['entry_price'] * 100
                 loss_pct = -profit_pct if profit_pct < 0 else 0
                 trend = mean(data['price_history'][-3:]) / data['entry_price'] if len(data['price_history']) >= 3 else profit_pct / 100
                 data['highest_price'] = max(data['highest_price'], current_price)
@@ -1243,7 +1241,7 @@ def monitor_and_sell(chat_id: int) -> None:
                 elif profit_pct >= take_profit_steps[0] * 100 and trend < 1.02:
                     sell_amount = amount / 3
                     sell_token(chat_id, contract_address, sell_amount, chain, current_price)
-                elif current_price <= trailing_stop_price:
+                                elif current_price <= trailing_stop_price:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
                 elif loss_pct >= stop_loss_threshold:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
