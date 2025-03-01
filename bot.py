@@ -23,7 +23,7 @@ import re
 from solana.rpc.websocket_api import connect
 import asyncio
 
-# Configuration des logs avec niveau DEBUG pour plus de détails
+# Configuration des logs avec niveau DEBUG
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ daily_trades = {'buys': [], 'sells': []}
 rejected_tokens = {}
 trade_active = False
 
-logger.info("Chargement des variables d’environnement...")
+logger.debug("Chargement des variables d’environnement...")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
@@ -147,7 +147,8 @@ def set_webhook():
             raise Exception("Webhook non configuré")
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
-        raise
+        return False
+    return True
 
 def is_safe_token_bsc(token_address: str) -> bool:
     try:
@@ -1248,7 +1249,7 @@ def monitor_and_sell(chat_id: int) -> None:
 
                 if profit_pct >= take_profit_steps[2] * 100:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
-                elif profit_pct >= take_profit_steps[1] * 100 and trend < 1.05:
+                                elif profit_pct >= take_profit_steps[1] * 100 and trend < 1.05:
                     sell_amount = amount / 2
                     sell_token(chat_id, contract_address, sell_amount, chain, current_price)
                 elif profit_pct >= take_profit_steps[0] * 100 and trend < 1.02:
@@ -1256,7 +1257,7 @@ def monitor_and_sell(chat_id: int) -> None:
                     sell_token(chat_id, contract_address, sell_amount, chain, current_price)
                 elif current_price <= trailing_stop_price:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
-                                elif loss_pct >= stop_loss_threshold:
+                elif loss_pct >= stop_loss_threshold:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
             time.sleep(2)
         except Exception as e:
@@ -1406,10 +1407,17 @@ def initialize_and_run_threads(chat_id: int) -> None:
     except Exception as e:
         logger.error(f"Erreur dans l'initialisation ou les threads: {str(e)}")
 
+@app.route("/setup-webhook", methods=['GET'])
+def setup_webhook_endpoint():
+    logger.debug("Tentative de configuration du webhook via endpoint")
+    success = set_webhook()
+    return "Webhook configuré avec succès" if success else "Échec de la configuration du webhook", 200 if success else 500
+
 if __name__ == "__main__":
     logger.info("Démarrage principal...")
     try:
-        set_webhook()  # Configurer le webhook au démarrage
+        # Ne pas configurer le webhook au démarrage pour éviter un crash initial
+        logger.info(f"Lancement de Flask sur le port {PORT}")
         app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
     except Exception as e:
         logger.error(f"Crash système critique: {str(e)}. Redémarrage dans 30s...")
