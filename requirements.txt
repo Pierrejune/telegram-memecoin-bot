@@ -1,20 +1,17 @@
-# Dépendances principales
-pyTelegramBotAPI==4.14.0        # Pour le bot Telegram
-flask==2.3.2                   # Serveur web pour Cloud Run
-waitress==2.1.2                # Serveur WSGI léger remplaçant Gunicorn
-requests==2.31.0               # Requêtes HTTP synchrones
-web3==6.11.0                   # Interaction avec BSC
-solders==0.21.0                # Bibliothèque Solana moderne
-base58==2.1.1                  # Décodage des clés Solana
-websockets==10.4               # WebSocket pour sniping Solana
-
-# Dépendances pour optimisation et fonctionnalités
-asyncio==3.4.3                 # Gestion explicite d'asyncio
-statistics==1.0.3.5            # Pour la fonction mean dans monitor_and_sell
-urllib3==1.26.18               # Dépendance pour requests
-werkzeug==2.3.7                # Dépendance Flask
-jinja2==3.1.2                  # Dépendance Flask
-markupsafe==2.1.3              # Dépendance Jinja2
-eth-account==0.11.0            # Gestion des signatures Ethereum/BSC
-hexbytes==0.3.1                # Gestion des hexadécimaux dans web3
-protobuf==4.25.3               # Dépendance pour web3
+pyTelegramBotAPI==4.14.0
+flask==2.3.2
+waitress==2.1.2
+requests==2.31.0
+web3==6.11.0
+solders==0.21.0
+base58==2.1.1
+websockets==10.4
+asyncio==3.4.3
+statistics==1.0.3.5
+urllib3==1.26.18
+werkzeug==2.3.7
+jinja2==3.1.2
+markupsafe==2.1.3
+eth-account==0.11.0
+hexbytes==0.3.1
+protobuf==4.25.3
