@@ -28,6 +28,8 @@ import asyncio
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+logger.info("Début du chargement du module bot.py")
+
 # Variables globales
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124", "Accept": "application/json"}
 session = requests.Session()
@@ -43,7 +45,7 @@ twitter_requests_remaining = 450
 daily_trades = {'buys': [], 'sells': []}
 rejected_tokens = {}
 trade_active = False
-cross_chain_data = {}  # Stockage pour traitements croisés
+cross_chain_data = {}
 
 logger.debug("Chargement des variables d’environnement...")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -55,7 +57,7 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
-SOLANA_RPC = os.getenv("SOLANA_RPC", "https://orbital-fabled-orb.solana-mainnet.quiknode.pro/4d51da5b3e55c817f9abefd30f9855038031b182/")  # RPC alternatif
+SOLANA_RPC = os.getenv("SOLANA_RPC", "https://orbital-fabled-orb.solana-mainnet.quiknode.pro/4d51da5b3e55c817f9abefd30f9855038031b182/")
 SOLANA_RPC_ALT = os.getenv("SOLANA_RPC_ALT", "https://orbital-fabled-orb.solana-mainnet.quiknode.pro/4d51da5b3e55c817f9abefd30f9855038031b182/")
 
 BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
@@ -94,7 +96,7 @@ MIN_VOLUME_SOL = 5000
 MAX_VOLUME_SOL = 500000
 MIN_VOLUME_BSC = 5000
 MAX_VOLUME_BSC = 500000
-MIN_LIQUIDITY = 5000  # Ajusté pour BSC
+MIN_LIQUIDITY = 5000
 MIN_MARKET_CAP_SOL = 50000
 MAX_MARKET_CAP_SOL = 1000000
 MIN_MARKET_CAP_BSC = 50000
@@ -102,7 +104,7 @@ MAX_MARKET_CAP_BSC = 1000000
 MIN_BUY_SELL_RATIO_BSC = 1.5
 MIN_BUY_SELL_RATIO_SOL = 1.5
 MAX_HOLDER_PERCENTAGE = 30.0
-MIN_RECENT_TXNS = 1  # Réduit pour nouveaux lancements
+MIN_RECENT_TXNS = 1
 MAX_TOKEN_AGE_HOURS = 72
 REJECT_EXPIRATION_HOURS = 24
 RETRY_DELAY_MINUTES = 5
@@ -114,6 +116,8 @@ PANCAKE_FACTORY_ABI = [json.loads('{"anonymous": false, "inputs": [{"indexed": t
 PANCAKE_ROUTER_ABI = json.loads('[{"inputs": [{"internalType": "uint256", "name": "amountIn", "type": "uint256"}, {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactETHForTokens", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "payable", "type": "function"}, {"inputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}, {"internalType": "uint256", "name": "amountInMax", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactTokensForETH", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "nonpayable", "type": "function"}]')
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+
+logger.info("Définitions globales terminées")
 
 def initialize_bot():
     global w3, solana_keypair
@@ -210,7 +214,6 @@ def get_token_data(token_address: str, chain: str) -> Dict[str, float]:
             'pair_created_at': pair_created_at, 'top_holder_pct': top_holder_pct
         }
         
-        # Stockage pour traitements croisés
         if token_address not in cross_chain_data:
             cross_chain_data[token_address] = {}
         cross_chain_data[token_address][chain] = token_data
@@ -239,7 +242,7 @@ def monitor_twitter(chat_id: int) -> None:
     while trade_active:
         try:
             current_time = time.time()
-            if current_time - twitter_last_reset >= 900:  # 15 min
+            if current_time - twitter_last_reset >= 900:
                 twitter_requests_remaining = 450
                 twitter_last_reset = current_time
                 logger.info("Quota Twitter réinitialisé : 450 requêtes.")
@@ -278,7 +281,7 @@ def monitor_twitter(chat_id: int) -> None:
                                 continue
                             bot.send_message(chat_id, f'🔍 Token détecté via Twitter (@{user["username"]}, {followers} abonnés): {word} ({chain})')
                             threading.Thread(target=pre_validate_token, args=(chat_id, word, chain)).start()
-            time.sleep(900)  # 15 min
+            time.sleep(900)
         except requests.exceptions.RequestException as e:
             if getattr(e.response, 'status_code', None) == 429:
                 wait_time = 900
@@ -306,7 +309,7 @@ def snipe_new_pairs_bsc(chat_id: int) -> None:
     while trade_active:
         try:
             latest_block = w3.eth.block_number
-            from_block = max(latest_block - 500, last_block)  # Limité à 500 blocs
+            from_block = max(latest_block - 500, last_block)
             events = factory.events.PairCreated.get_logs(fromBlock=from_block, toBlock=latest_block)
             last_block = latest_block + 1
             for event in events:
@@ -362,7 +365,7 @@ def pre_validate_token(chat_id: int, token_address: str, chain: str) -> None:
             rejected_tokens[token_address] = time.time()
             return
         
-        time.sleep(1)  # Vérification initiale en 1s
+        time.sleep(1)
         data_after = get_token_data(token_address, chain)
         growth = (data_after['volume_24h'] - volume) / max(volume, 1) * 100
         if liquidity >= 1000 and (growth > 100 or (data_after['volume_24h'] >= (MIN_VOLUME_BSC if chain == 'bsc' else MIN_VOLUME_SOL) and data_after['buy_sell_ratio'] >= 1.0)):
@@ -370,7 +373,7 @@ def pre_validate_token(chat_id: int, token_address: str, chain: str) -> None:
             check_token(chat_id, token_address, chain)
             return
         
-        time.sleep(10)  # Validation secondaire rapide en 10s
+        time.sleep(10)
         data_final = get_token_data(token_address, chain)
         final_growth = (data_final['volume_24h'] - volume) / max(volume, 1) * 100
         if final_growth > 50 and data_final['liquidity'] >= 5000:
@@ -399,7 +402,6 @@ def check_token(chat_id: int, token_address: str, chain: str) -> bool:
         pair_created_at = data['pair_created_at']
         top_holder_pct = data.get('top_holder_pct', 0)
 
-        # Croisement rapide avec l'autre chaîne
         other_chain = 'solana' if chain == 'bsc' else 'bsc'
         cross_data = cross_chain_data.get(token_address, {}).get(other_chain, None)
         cross_boost = False
@@ -503,7 +505,6 @@ def detect_new_tokens_bsc(chat_id: int) -> None:
                 continue
             token_batch.append(token_address)
 
-        # Analyse groupée avec ThreadPoolExecutor
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(pre_validate_token, chat_id, token, 'bsc'): token for token in token_batch}
             for future in concurrent.futures.as_completed(futures):
@@ -550,7 +551,6 @@ def detect_new_tokens_solana(chat_id: int) -> None:
                     tokens.append({'address': pubkey, 'created_at': time.time() * 1000, 'volume_24h': 0})
             bot.send_message(chat_id, f"⬇️ {len(tokens)} paires détectées sur Solana via RPC")
 
-            # Analyse groupée avec ThreadPoolExecutor
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 futures = {executor.submit(pre_validate_token, chat_id, token['address'], 'solana'): token for token in tokens}
                 for future in concurrent.futures.as_completed(futures):
@@ -1229,7 +1229,7 @@ def monitor_and_sell(chat_id: int) -> None:
                 if len(data['price_history']) > 10:
                     data['price_history'].pop(0)
                 portfolio[contract_address]['current_market_cap'] = current_mc
-                profit_pct = (current_price - data['entry_price']) / data['entry_price'] * 100
+                                profit_pct = (current_price - data['entry_price']) / data['entry_price'] * 100
                 loss_pct = -profit_pct if profit_pct < 0 else 0
                 trend = mean(data['price_history'][-3:]) / data['entry_price'] if len(data['price_history']) >= 3 else profit_pct / 100
                 data['highest_price'] = max(data['highest_price'], current_price)
@@ -1257,12 +1257,14 @@ def monitor_and_sell(chat_id: int) -> None:
 
 def show_portfolio(chat_id: int) -> None:
     try:
+        if w3 is None or solana_keypair is None:
+            initialize_bot()  # Initialisation retardée des connexions
         bnb_balance = w3.eth.get_balance(WALLET_ADDRESS) / 10**18
         sol_balance = get_solana_balance(WALLET_ADDRESS)
         msg = f'💰 Portefeuille:\nBNB : {bnb_balance:.4f}\nSOL : {sol_balance:.4f}\n\n'
         markup = InlineKeyboardMarkup()
         for ca, data in portfolio.items():
-                        chain = data['chain']
+            chain = data['chain']
             current_mc = get_token_data(ca, chain)['market_cap']
             profit = (current_mc - data['market_cap_at_buy']) / data['market_cap_at_buy'] * 100
             markup.add(
@@ -1409,4 +1411,5 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Crash système critique: {str(e)}. Redémarrage dans 30s...")
         time.sleep(30)
-           
+
+logger.info("Fin du chargement du module bot.py")
