@@ -17,9 +17,9 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir -r requirements.txt \
-    && pip uninstall -y gunicorn  # S'assurer que Gunicorn est supprimé
+    && pip uninstall -y gunicorn || true  # Supprimer Gunicorn s'il est présent, ignorer s'il n'est pas là
 
-# Exposer le port (8080 par défaut pour Cloud Run)
+# Exposer le port (8080 pour Cloud Run)
 EXPOSE 8080
 
 # Commande pour lancer le bot avec Waitress
