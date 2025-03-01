@@ -1152,7 +1152,7 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
             instruction = Instruction(
                 program_id=RAYDIUM_PROGRAM_ID,
                 accounts=[
-                    {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
+                    {"pubkey": sol<|control704|>_keypair.pubkey(), "is_signer": True, "is_writable": True},
                     {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
                     {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
                 ],
@@ -1214,7 +1214,7 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
                 bot.send_message(chat_id, f'✅ Vente effectuée : {amount} BNB de {contract_address}, Profit: {profit:.4f} BNB, Réinvesti: {reinvest_amount:.4f} BNB')
                 daily_trades['sells'].append({
                     'token': contract_address, 'chain': 'bsc', 'amount': amount,
-                    'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')
+                                        'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')
                 })
             else:
                 bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}, TX: {tx_hash.hex()}')
@@ -1257,7 +1257,7 @@ def monitor_and_sell(chat_id: int) -> None:
                 data['highest_price'] = max(data['highest_price'], current_price)
                 trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
 
-                                if profit_pct >= take_profit_steps[2] * 100:
+                if profit_pct >= take_profit_steps[2] * 100:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
                 elif profit_pct >= take_profit_steps[1] * 100 and trend < 1.05:
                     sell_amount = amount / 2
