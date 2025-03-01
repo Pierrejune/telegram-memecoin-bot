@@ -1,9 +1,9 @@
 steps:
 - name: 'gcr.io/cloud-builders/docker'
-  args: ['build', '-t', 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/telegram-memecoin-bot/memecoin-bot', '.']
+  args: ['build', '-t', 'us-central1-docker.pkg.dev/tbot-451318/cloud-run-source-deploy/telegram-memecoin-bot/memecoin-bot', '.']
 - name: 'gcr.io/cloud-builders/docker'
-  args: ['push', 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/telegram-memecoin-bot/memecoin-bot']
+  args: ['push', 'us-central1-docker.pkg.dev/tbot-451318/cloud-run-source-deploy/telegram-memecoin-bot/memecoin-bot']
 options:
   logging: CLOUD_LOGGING_ONLY
 images:
-- 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/telegram-memecoin-bot/memecoin-bot'
+- 'us-central1-docker.pkg.dev/tbot-451318/cloud-run-source-deploy/telegram-memecoin-bot/memecoin-bot'
