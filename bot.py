@@ -25,8 +25,8 @@ from solana.rpc.websocket_api import connect
 import asyncio
 from waitress import serve
 
-# Configuration des logs avec niveau DEBUG
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
+# Configuration des logs avec niveau INFO pour éviter surcharge
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 logger.info("Début du chargement du module bot.py")
@@ -591,7 +591,7 @@ def webhook():
             logger.debug(f"Update reçu: {update}")
             bot.process_new_updates([update])
             logger.info("Update traité avec succès")
-            if not trade_active:
+            if not trade_active and update.message:
                 global trade_active
                 trade_active = True
                 threading.Thread(target=initialize_and_run_threads, args=(update.message.chat.id,), daemon=True).start()
@@ -1152,7 +1152,7 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
             instruction = Instruction(
                 program_id=RAYDIUM_PROGRAM_ID,
                 accounts=[
-                    {"pubkey": sol<|control704|>_keypair.pubkey(), "is_signer": True, "is_writable": True},
+                    {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
                     {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
                     {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
                 ],
@@ -1214,7 +1214,7 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
                 bot.send_message(chat_id, f'✅ Vente effectuée : {amount} BNB de {contract_address}, Profit: {profit:.4f} BNB, Réinvesti: {reinvest_amount:.4f} BNB')
                 daily_trades['sells'].append({
                     'token': contract_address, 'chain': 'bsc', 'amount': amount,
-                                        'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')
+                    'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')
                 })
             else:
                 bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}, TX: {tx_hash.hex()}')
@@ -1279,7 +1279,7 @@ def monitor_and_sell(chat_id: int) -> None:
 
 def show_portfolio(chat_id: int) -> None:
     try:
-        if w3 is None or solana_keypair is None:
+                if w3 is None or solana_keypair is None:
             initialize_bot()
         bnb_balance = w3.eth.get_balance(WALLET_ADDRESS) / 10**18
         sol_balance = get_solana_balance(WALLET_ADDRESS)
