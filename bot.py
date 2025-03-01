@@ -1,4 +1,3 @@
-logger.info("Script bot.py démarré")
 import os
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
