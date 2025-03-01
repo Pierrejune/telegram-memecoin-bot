@@ -1288,7 +1288,7 @@ def show_portfolio(chat_id: int) -> None:
         for ca, data in portfolio.items():
             chain = data['chain']
             current_mc = get_token_data(ca, chain)['market_cap']
-            profit = (current_mc - data['market_cap_at_buy']) / data['market_cap_at_buy'] * 100
+                        profit = (current_mc - data['market_cap_at_buy']) / data['market_cap_at_buy'] * 100
             markup.add(
                 InlineKeyboardButton(f"🔄 Refresh {ca[:6]}...", callback_data=f"refresh_{ca}"),
                 InlineKeyboardButton(f"💸 Sell {ca[:6]}...", callback_data=f"sell_{ca}")
