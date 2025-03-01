@@ -23,6 +23,7 @@ from datetime import datetime
 import re
 from solana.rpc.websocket_api import connect
 import asyncio
+from waitress import serve
 
 # Configuration des logs avec niveau DEBUG
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -1251,12 +1252,12 @@ def monitor_and_sell(chat_id: int) -> None:
                     data['price_history'].pop(0)
                 portfolio[contract_address]['current_market_cap'] = current_mc
                 profit_pct = (current_price - data['entry_price']) / data['entry_price'] * 100
-                                loss_pct = -profit_pct if profit_pct < 0 else 0
+                loss_pct = -profit_pct if profit_pct < 0 else 0
                 trend = mean(data['price_history'][-3:]) / data['entry_price'] if len(data['price_history']) >= 3 else profit_pct / 100
                 data['highest_price'] = max(data['highest_price'], current_price)
                 trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
 
-                if profit_pct >= take_profit_steps[2] * 100:
+                                if profit_pct >= take_profit_steps[2] * 100:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
                 elif profit_pct >= take_profit_steps[1] * 100 and trend < 1.05:
                     sell_amount = amount / 2
@@ -1427,10 +1428,10 @@ def setup_webhook_endpoint():
     return "Webhook configuré avec succès" if success else "Échec de la configuration du webhook", 200 if success else 500
 
 if __name__ == "__main__":
-    logger.info("Démarrage principal...")
+    logger.info("Démarrage principal avec Waitress...")
     try:
-        logger.info(f"Lancement de Flask sur le port {PORT}")
-        app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+        logger.info(f"Lancement de Waitress sur le port {PORT}")
+        serve(app, host="0.0.0.0", port=PORT, threads=8)
     except Exception as e:
         logger.error(f"Crash système critique: {str(e)}. Redémarrage dans 30s...")
         time.sleep(30)
