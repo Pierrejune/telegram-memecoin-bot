@@ -63,20 +63,29 @@ SOLANA_RPC_ALT = os.getenv("SOLANA_RPC_ALT", "https://orbital-fabled-orb.solana-
 BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
-missing_vars = [var for var, val in {
-    "TELEGRAM_TOKEN": TELEGRAM_TOKEN, "WALLET_ADDRESS": WALLET_ADDRESS, "PRIVATE_KEY": PRIVATE_KEY,
-    "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "WEBHOOK_URL": WEBHOOK_URL, "BIRDEYE_API_KEY": BIRDEYE_API_KEY,
-    "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN
-}.items() if not val]
-if missing_vars:
-    logger.critical(f"Variables manquantes: {missing_vars}")
-    raise ValueError(f"Variables manquantes: {missing_vars}")
-logger.info("Variables principales chargées.")
+try:
+    missing_vars = [var for var, val in {
+        "TELEGRAM_TOKEN": TELEGRAM_TOKEN, "WALLET_ADDRESS": WALLET_ADDRESS, "PRIVATE_KEY": PRIVATE_KEY,
+        "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "WEBHOOK_URL": WEBHOOK_URL, "BIRDEYE_API_KEY": BIRDEYE_API_KEY,
+        "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN
+    }.items() if not val]
+    if missing_vars:
+        logger.critical(f"Variables manquantes: {missing_vars}")
+        raise ValueError(f"Variables manquantes: {missing_vars}")
+    logger.info("Variables principales chargées.")
+except Exception as e:
+    logger.error(f"Erreur lors du chargement des variables: {str(e)}")
+    raise
 
 app = Flask(__name__)
 logger.info("Flask initialisé.")
-bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
-logger.info("Bot Telegram initialisé.")
+try:
+    bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
+    logger.info("Bot Telegram initialisé.")
+except Exception as e:
+    logger.error(f"Erreur lors de l'initialisation du bot Telegram: {str(e)}")
+    raise
+
 w3 = None  # Initialisation retardée
 solana_keypair = None  # Initialisation retardée
 
@@ -149,10 +158,10 @@ def set_webhook():
         if not response:
             logger.error("Échec de la configuration du webhook")
             raise Exception("Webhook non configuré")
+        return True
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
         return False
-    return True
 
 def is_safe_token_bsc(token_address: str) -> bool:
     try:
@@ -301,6 +310,8 @@ def snipe_new_pairs_bsc(chat_id: int) -> None:
     if trade_active:
         logger.info("Sniping BSC démarré...")
         bot.send_message(chat_id, "🔫 Sniping BSC activé...")
+    if w3 is None:
+        initialize_bot()
     factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
     retry_delay = 5
     last_block = max(w3.eth.block_number - 500, 0)
@@ -483,6 +494,8 @@ def detect_new_tokens_bsc(chat_id: int) -> None:
     if trade_active:
         bot.send_message(chat_id, "🔍 Début détection BSC...")
     try:
+        if w3 is None:
+            initialize_bot()
         if not w3.is_connected():
             raise ConnectionError("Connexion au nœud BSC perdue")
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
@@ -533,6 +546,8 @@ def detect_new_tokens_solana(chat_id: int) -> None:
         if not trade_active:
             break
         try:
+            if solana_keypair is None:
+                initialize_bot()
             response = session.post(SOLANA_RPC, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getProgramAccounts",
                 "params": [str(RAYDIUM_PROGRAM_ID), {"encoding": "base64", "filters": [{"dataSize": 320}]}]
@@ -1031,6 +1046,8 @@ def adjust_buy_sell_ratio_sol(message):
 
 def buy_token_bsc(chat_id: int, contract_address: str, amount: float) -> None:
     try:
+        if w3 is None:
+            initialize_bot()
         logger.info(f"Début achat BSC: {contract_address}, montant: {amount} BNB")
         dynamic_slippage = 10
         router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
@@ -1073,6 +1090,8 @@ def buy_token_bsc(chat_id: int, contract_address: str, amount: float) -> None:
 
 def buy_token_solana(chat_id: int, contract_address: str, amount: float) -> None:
     try:
+        if solana_keypair is None:
+            initialize_bot()
         logger.info(f"Début achat Solana: {contract_address}, montant: {amount} SOL")
         dynamic_slippage = 10
         amount_in = int(amount * 10**9)
@@ -1120,6 +1139,8 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
     global mise_depart_bsc, mise_depart_sol
     if chain == "solana":
         try:
+            if solana_keypair is None:
+                initialize_bot()
             dynamic_slippage = 10
             amount_out = int(amount * 10**9)
             response = session.post(SOLANA_RPC_ALT, json={
@@ -1161,6 +1182,8 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
             bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
     else:
         try:
+            if w3 is None:
+                initialize_bot()
             dynamic_slippage = 10
             token_amount = w3.to_wei(amount, 'ether')
             amount_in_max = int(token_amount * (1 + dynamic_slippage / 100))
@@ -1228,7 +1251,7 @@ def monitor_and_sell(chat_id: int) -> None:
                     data['price_history'].pop(0)
                 portfolio[contract_address]['current_market_cap'] = current_mc
                 profit_pct = (current_price - data['entry_price']) / data['entry_price'] * 100
-                loss_pct = -profit_pct if profit_pct < 0 else 0
+                                loss_pct = -profit_pct if profit_pct < 0 else 0
                 trend = mean(data['price_history'][-3:]) / data['entry_price'] if len(data['price_history']) >= 3 else profit_pct / 100
                 data['highest_price'] = max(data['highest_price'], current_price)
                 trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
@@ -1241,7 +1264,7 @@ def monitor_and_sell(chat_id: int) -> None:
                 elif profit_pct >= take_profit_steps[0] * 100 and trend < 1.02:
                     sell_amount = amount / 3
                     sell_token(chat_id, contract_address, sell_amount, chain, current_price)
-                                elif current_price <= trailing_stop_price:
+                elif current_price <= trailing_stop_price:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
                 elif loss_pct >= stop_loss_threshold:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
@@ -1256,7 +1279,7 @@ def monitor_and_sell(chat_id: int) -> None:
 def show_portfolio(chat_id: int) -> None:
     try:
         if w3 is None or solana_keypair is None:
-            initialize_bot()  # Initialisation retardée des connexions
+            initialize_bot()
         bnb_balance = w3.eth.get_balance(WALLET_ADDRESS) / 10**18
         sol_balance = get_solana_balance(WALLET_ADDRESS)
         msg = f'💰 Portefeuille:\nBNB : {bnb_balance:.4f}\nSOL : {sol_balance:.4f}\n\n'
@@ -1280,6 +1303,8 @@ def show_portfolio(chat_id: int) -> None:
 
 def get_solana_balance(wallet_address: str) -> float:
     try:
+        if solana_keypair is None:
+            initialize_bot()
         response = session.post(SOLANA_RPC_ALT, json={
             "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [str(solana_keypair.pubkey())]
         }, timeout=10)
