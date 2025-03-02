@@ -1274,7 +1274,7 @@ def monitor_and_sell(chat_id: int) -> None:
                     sell_token(chat_id, contract_address, amount, chain, current_price)
             time.sleep(2)
         except Exception as e:
-                        logger.error(f"Erreur surveillance globale: {str(e)}")
+            logger.error(f"Erreur surveillance globale: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Erreur surveillance: {str(e)}. Reprise dans 10s...')
             time.sleep(10)
         if not trade_active:
@@ -1430,7 +1430,6 @@ def setup_webhook_endpoint():
     success = set_webhook()
     return "Webhook configuré avec succès" if success else "Échec de la configuration du webhook", 200 if success else 500
 
-# MODIF: Nouvelle fonction pour le polling en fallback
 def run_polling():
     logger.info("Démarrage du mode polling pour Telegram...")
     while True:
@@ -1442,13 +1441,10 @@ def run_polling():
 
 if __name__ == "__main__":
     logger.info("Démarrage principal avec Waitress...")
-    # MODIF: Démarrage robuste avec Waitress immédiat et polling en fallback
     try:
-        # Lancer Waitress dans un thread pour garantir le port 8080
         threading.Thread(target=lambda: serve(app, host="0.0.0.0", port=PORT, threads=8), daemon=True).start()
         logger.info(f"Lancement de Waitress sur le port {PORT}")
 
-        # Initialisation et webhook dans un thread séparé
         def startup_tasks():
             try:
                 if set_webhook():
@@ -1462,7 +1458,6 @@ if __name__ == "__main__":
 
         threading.Thread(target=startup_tasks, daemon=True).start()
 
-        # Boucle principale pour garder le script vivant
         while True:
             time.sleep(60)
             logger.debug("Bot en cours d'exécution...")
