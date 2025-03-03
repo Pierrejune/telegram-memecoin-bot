@@ -25,8 +25,7 @@ from solana.rpc.websocket_api import connect
 import asyncio
 from waitress import serve
 
-# Configuration des logs avec niveau INFO pour éviter surcharge
-# MODIF: Changé à DEBUG pour diagnostics détaillés
+# Configuration des logs avec niveau DEBUG pour diagnostics
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -50,7 +49,6 @@ trade_active = False
 cross_chain_data = {}
 
 logger.debug("Chargement des variables d’environnement...")
-# MODIF: Ajout de valeurs par défaut pour éviter crash si variables manquantes
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "default_token")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "0x0")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "dummy_key")
@@ -59,7 +57,6 @@ SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "dummy_solana_key")
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "dummy_birdeye_key")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "dummy_twitter_token")
 PORT = int(os.getenv("PORT", 8080))
-
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://orbital-fabled-orb.solana-mainnet.quiknode.pro/4d51da5b3e55c817f9abefd30f9855038031b182/")
 SOLANA_RPC_ALT = os.getenv("SOLANA_RPC_ALT", "https://orbital-fabled-orb.solana-mainnet.quiknode.pro/4d51da5b3e55c817f9abefd30f9855038031b182/")
@@ -67,28 +64,23 @@ SOLANA_RPC_ALT = os.getenv("SOLANA_RPC_ALT", "https://orbital-fabled-orb.solana-
 BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
-# MODIF: Remplacement de l’exception par un warning avec fallback
-try:
-    missing_vars = [var for var, val in {
-        "TELEGRAM_TOKEN": TELEGRAM_TOKEN, "WALLET_ADDRESS": WALLET_ADDRESS, "PRIVATE_KEY": PRIVATE_KEY,
-        "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "WEBHOOK_URL": WEBHOOK_URL, "BIRDEYE_API_KEY": BIRDEYE_API_KEY,
-        "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN
-    }.items() if val.startswith("dummy") or not val]  # MODIF: Vérifie aussi les valeurs "dummy"
-    if missing_vars:
-        logger.warning(f"Variables manquantes ou par défaut: {missing_vars}. Certaines fonctionnalités peuvent être limitées.")
-    else:
-        logger.info("Variables principales chargées.")
-except Exception as e:
-    logger.error(f"Erreur lors du chargement des variables: {str(e)}")
+missing_vars = [var for var, val in {
+    "TELEGRAM_TOKEN": TELEGRAM_TOKEN, "WALLET_ADDRESS": WALLET_ADDRESS, "PRIVATE_KEY": PRIVATE_KEY,
+    "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "WEBHOOK_URL": WEBHOOK_URL, "BIRDEYE_API_KEY": BIRDEYE_API_KEY,
+    "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN
+}.items() if val.startswith("dummy") or not val]
+if missing_vars:
+    logger.warning(f"Variables manquantes ou par défaut: {missing_vars}. Certaines fonctionnalités peuvent être limitées.")
+else:
+    logger.info("Variables principales chargées.")
 
 app = Flask(__name__)
 logger.info("Flask initialisé.")
-# MODIF: Suppression du try/except pour bot, utilisation directe avec token par défaut
 bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 logger.info("Bot Telegram initialisé.")
 
-w3 = None  # Initialisation retardée
-solana_keypair = None  # Initialisation retardée
+w3 = None
+solana_keypair = None
 
 mise_depart_bsc = 0.02
 mise_depart_sol = 0.37
@@ -130,17 +122,15 @@ TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5
 def initialize_bot():
     global w3, solana_keypair
     logger.debug("Tentative de connexion BSC...")
-    # MODIF: Gestion sans exception fatale
     try:
         w3 = Web3(HTTPProvider(BSC_RPC))
         w3.middleware_onion.inject(geth_poa_middleware, layer=0)
         if not w3.is_connected():
-            logger.warning("Connexion BSC échouée. Trading BSC désactivé.")
-            w3 = None
+            logger.warning("Connexion BSC échouée")
         else:
             logger.info(f"Connexion BSC réussie. Bloc actuel : {w3.eth.block_number}")
     except Exception as e:
-        logger.error(f"Erreur connexion BSC: {str(e)}. Trading BSC désactivé.")
+        logger.error(f"Erreur connexion BSC: {str(e)}")
         w3 = None
 
     logger.debug("Initialisation de la clé Solana...")
@@ -148,23 +138,19 @@ def initialize_bot():
         solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
         logger.info("Clé Solana initialisée.")
     except Exception as e:
-        logger.error(f"Erreur initialisation Solana: {str(e)}. Trading Solana désactivé.")
+        logger.error(f"Erreur initialisation Solana: {str(e)}")
         solana_keypair = None
 
 def set_webhook():
     logger.debug("Configuration du webhook...")
-    # MODIF: Retour False sans exception si échec
     try:
         bot.remove_webhook()
         time.sleep(1)
         response = bot.set_webhook(url=WEBHOOK_URL)
         logger.info(f"Webhook configuré sur {WEBHOOK_URL}, réponse: {response}")
-        if not response:
-            logger.error("Échec de la configuration du webhook")
-            return False
-        return True
+        return response
     except Exception as e:
-        logger.error(f"Erreur configuration webhook: {str(e)}. Passage en mode polling.")
+        logger.error(f"Erreur configuration webhook: {str(e)}")
         return False
 
 def is_safe_token_bsc(token_address: str) -> bool:
@@ -316,6 +302,9 @@ def snipe_new_pairs_bsc(chat_id: int) -> None:
         bot.send_message(chat_id, "🔫 Sniping BSC activé...")
     if w3 is None:
         initialize_bot()
+    if w3 is None or not w3.is_connected():
+        logger.warning("BSC non connecté, sniping désactivé")
+        return
     factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
     retry_delay = 5
     last_block = max(w3.eth.block_number - 500, 0)
@@ -500,7 +489,7 @@ def detect_new_tokens_bsc(chat_id: int) -> None:
     try:
         if w3 is None:
             initialize_bot()
-        if not w3.is_connected():
+        if not w3 or not w3.is_connected():
             raise ConnectionError("Connexion au nœud BSC perdue")
         factory = w3.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
         latest_block = w3.eth.block_number
@@ -603,12 +592,36 @@ def webhook():
         return abort(403)
     except Exception as e:
         logger.error(f"Erreur dans webhook: {str(e)}")
-        return abort(500)
+        return 'ERROR', 500
 
 @app.route("/")
 def health_check():
     logger.debug("Health check appelé")
     return "Bot is running", 200
+
+@app.route("/setup-webhook", methods=['GET'])
+def setup_webhook_endpoint():
+    logger.debug("Tentative de configuration du webhook via endpoint")
+    success = set_webhook()
+    return "Webhook configuré avec succès" if success else "Échec de la configuration du webhook", 200 if success else 500
+
+@app.route("/cron", methods=['GET', 'POST'])
+def cron_endpoint():
+    logger.info("Requête cron reçue de Cloud Scheduler")
+    try:
+        chat_id = os.getenv("DEFAULT_CHAT_ID", 123456789)  # Chat ID par défaut ou configuré via env
+        if not trade_active:
+            global trade_active
+            trade_active = True
+            threading.Thread(target=initialize_and_run_threads, args=(chat_id,), daemon=True).start()
+            logger.info("Threads de trading lancés via cron")
+            return "Cron exécuté : trading démarré", 200
+        else:
+            logger.info("Trading déjà actif, rien à faire")
+            return "Cron exécuté : trading déjà actif", 200
+    except Exception as e:
+        logger.error(f"Erreur dans cron_endpoint: {str(e)}")
+        return f"Erreur cron : {str(e)}", 500
 
 @bot.message_handler(commands=['start'])
 def start_message(message):
@@ -1052,6 +1065,8 @@ def buy_token_bsc(chat_id: int, contract_address: str, amount: float) -> None:
     try:
         if w3 is None:
             initialize_bot()
+        if not w3 or not w3.is_connected():
+            raise Exception("BSC non connecté")
         logger.info(f"Début achat BSC: {contract_address}, montant: {amount} BNB")
         dynamic_slippage = 10
         router = w3.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
@@ -1096,6 +1111,8 @@ def buy_token_solana(chat_id: int, contract_address: str, amount: float) -> None
     try:
         if solana_keypair is None:
             initialize_bot()
+        if not solana_keypair:
+            raise Exception("Solana non initialisé")
         logger.info(f"Début achat Solana: {contract_address}, montant: {amount} SOL")
         dynamic_slippage = 10
         amount_in = int(amount * 10**9)
@@ -1145,6 +1162,8 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
         try:
             if solana_keypair is None:
                 initialize_bot()
+            if not solana_keypair:
+                raise Exception("Solana non initialisé")
             dynamic_slippage = 10
             amount_out = int(amount * 10**9)
             response = session.post(SOLANA_RPC_ALT, json={
@@ -1188,6 +1207,8 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
         try:
             if w3 is None:
                 initialize_bot()
+            if not w3 or not w3.is_connected():
+                raise Exception("BSC non connecté")
             dynamic_slippage = 10
             token_amount = w3.to_wei(amount, 'ether')
             amount_in_max = int(token_amount * (1 + dynamic_slippage / 100))
@@ -1228,7 +1249,7 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
 def sell_token_percentage(chat_id: int, token: str, percentage: float) -> None:
     try:
         if token not in portfolio:
-            bot.send_message(chat_id, f'⚠️ Vente impossible : {token} n\'est pas dans le portefeuille')
+                        bot.send_message(chat_id, f'⚠️ Vente impossible : {token} n\'est pas dans le portefeuille')
             return
         total_amount = portfolio[token]['amount']
         amount_to_sell = total_amount * (percentage / 100)
@@ -1284,7 +1305,7 @@ def show_portfolio(chat_id: int) -> None:
     try:
         if w3 is None or solana_keypair is None:
             initialize_bot()
-        bnb_balance = w3.eth.get_balance(WALLET_ADDRESS) / 10**18
+        bnb_balance = w3.eth.get_balance(WALLET_ADDRESS) / 10**18 if w3 and w3.is_connected() else 0
         sol_balance = get_solana_balance(WALLET_ADDRESS)
         msg = f'💰 Portefeuille:\nBNB : {bnb_balance:.4f}\nSOL : {sol_balance:.4f}\n\n'
         markup = InlineKeyboardMarkup()
@@ -1309,6 +1330,8 @@ def get_solana_balance(wallet_address: str) -> float:
     try:
         if solana_keypair is None:
             initialize_bot()
+        if not solana_keypair:
+            return 0
         response = session.post(SOLANA_RPC_ALT, json={
             "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [str(solana_keypair.pubkey())]
         }, timeout=10)
@@ -1423,12 +1446,7 @@ def initialize_and_run_threads(chat_id: int) -> None:
         threading.Thread(target=watchdog, args=(chat_id,), daemon=True).start()
     except Exception as e:
         logger.error(f"Erreur dans l'initialisation ou les threads: {str(e)}")
-
-@app.route("/setup-webhook", methods=['GET'])
-def setup_webhook_endpoint():
-    logger.debug("Tentative de configuration du webhook via endpoint")
-    success = set_webhook()
-    return "Webhook configuré avec succès" if success else "Échec de la configuration du webhook", 200 if success else 500
+        bot.send_message(chat_id, f"⚠️ Erreur threads: {str(e)}. Certaines fonctionnalités peuvent être indisponibles.")
 
 def run_polling():
     logger.info("Démarrage du mode polling pour Telegram...")
@@ -1442,9 +1460,11 @@ def run_polling():
 if __name__ == "__main__":
     logger.info("Démarrage principal avec Waitress...")
     try:
+        # Lancer Waitress immédiatement pour garantir la réponse sur le port 8080
         threading.Thread(target=lambda: serve(app, host="0.0.0.0", port=PORT, threads=8), daemon=True).start()
-        logger.info(f"Lancement de Waitress sur le port {PORT}")
+        logger.info(f"Waitress lancé sur le port {PORT}")
 
+        # Initialisation différée dans un thread séparé
         def startup_tasks():
             try:
                 if set_webhook():
@@ -1452,17 +1472,19 @@ if __name__ == "__main__":
                 else:
                     logger.warning("Échec du webhook, démarrage du polling.")
                     threading.Thread(target=run_polling, daemon=True).start()
+                initialize_bot()  # Initialisation après démarrage serveur
             except Exception as e:
-                logger.error(f"Erreur lors de la configuration initiale: {str(e)}. Passage en mode polling.")
+                logger.error(f"Erreur startup: {str(e)}. Bot Telegram en polling.")
                 threading.Thread(target=run_polling, daemon=True).start()
 
         threading.Thread(target=startup_tasks, daemon=True).start()
 
+        # Boucle principale pour garder le script vivant
         while True:
             time.sleep(60)
             logger.debug("Bot en cours d'exécution...")
     except Exception as e:
-        logger.error(f"Crash système critique: {str(e)}. Démarrage en mode polling...")
+        logger.critical(f"Erreur critique au démarrage: {str(e)}. Tentative de survie...")
         threading.Thread(target=run_polling, daemon=True).start()
         while True:
             time.sleep(60)
