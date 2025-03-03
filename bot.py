@@ -25,14 +25,14 @@ from solana.rpc.websocket_api import connect
 import asyncio
 from waitress import serve
 
-# Configuration des logs avec niveau DEBUG pour diagnostics
+# Configuration des logs
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 logger.info("Début du chargement du module bot.py")
 
 # Variables globales
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124", "Accept": "application/json"}
+HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 session = requests.Session()
 session.headers.update(HEADERS)
 retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
@@ -48,7 +48,6 @@ rejected_tokens = {}
 trade_active = False
 cross_chain_data = {}
 
-logger.debug("Chargement des variables d’environnement...")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "default_token")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "0x0")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "dummy_key")
@@ -58,26 +57,14 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "dummy_birdeye_key")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "dummy_twitter_token")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
-SOLANA_RPC = os.getenv("SOLANA_RPC", "https://orbital-fabled-orb.solana-mainnet.quiknode.pro/4d51da5b3e55c817f9abefd30f9855038031b182/")
-SOLANA_RPC_ALT = os.getenv("SOLANA_RPC_ALT", "https://orbital-fabled-orb.solana-mainnet.quiknode.pro/4d51da5b3e55c817f9abefd30f9855038031b182/")
+SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+SOLANA_RPC_ALT = os.getenv("SOLANA_RPC_ALT", "https://api.mainnet-beta.solana.com")
 
 BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
-missing_vars = [var for var, val in {
-    "TELEGRAM_TOKEN": TELEGRAM_TOKEN, "WALLET_ADDRESS": WALLET_ADDRESS, "PRIVATE_KEY": PRIVATE_KEY,
-    "SOLANA_PRIVATE_KEY": SOLANA_PRIVATE_KEY, "WEBHOOK_URL": WEBHOOK_URL, "BIRDEYE_API_KEY": BIRDEYE_API_KEY,
-    "TWITTER_BEARER_TOKEN": TWITTER_BEARER_TOKEN
-}.items() if val.startswith("dummy") or not val]
-if missing_vars:
-    logger.warning(f"Variables manquantes ou par défaut: {missing_vars}. Certaines fonctionnalités peuvent être limitées.")
-else:
-    logger.info("Variables principales chargées.")
-
 app = Flask(__name__)
-logger.info("Flask initialisé.")
 bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
-logger.info("Bot Telegram initialisé.")
 
 w3 = None
 solana_keypair = None
@@ -186,7 +173,7 @@ def get_token_data(token_address: str, chain: str) -> Dict[str, float]:
     try:
         response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=5)
         response.raise_for_status()
-        data = response.json()['pairs'][0] if response.json()['pairs'] else {}
+        data = response.json()['pairs'][0] if response.django()['pairs'] else {}
         if not data or data.get('chainId') != chain:
             return {'volume_24h': 0, 'liquidity': 0, 'market_cap': 0, 'price': 0, 'buy_sell_ratio': 0, 'recent_buy_count': 0, 'pair_created_at': time.time()}
         
@@ -1176,7 +1163,7 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
                 accounts=[
                     {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
                     {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
-                                        {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
+                    {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
                 ],
                 data=bytes([3]) + amount_out.to_bytes(8, 'little')
             )
@@ -1249,18 +1236,18 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
 def sell_token_percentage(chat_id: int, token: str, percentage: float) -> None:
     try:
         if token not in portfolio:
-            bot.send_message(chat_id, f'⚠️ Vente impossible : {token} n\'est pas dans le portefeuille')
-            return
-        total_amount = portfolio[token]['amount']
-        amount_to_sell = total_amount * (percentage / 100)
-        chain = portfolio[token]['chain']
-        market_cap = get_current_market_cap(token)
-        supply = detected_tokens.get(token, {}).get('supply', 0)
-        current_price = market_cap / supply if supply > 0 else 0  # Protection contre division par zéro
-        sell_token(chat_id, token, amount_to_sell, chain, current_price)
-    except Exception as e:
-        logger.error(f"Erreur vente partielle: {str(e)}")
-        bot.send_message(chat_id, f'⚠️ Erreur vente partielle {token}: {str(e)}')
+                          bot.send_message(chat_id, f'⚠️ Vente impossible : {token} n\'est pas dans le portefeuille')
+              return
+          total_amount = portfolio[token]['amount']
+          amount_to_sell = total_amount * (percentage / 100)
+          chain = portfolio[token]['chain']
+          market_cap = get_current_market_cap(token)
+          supply = detected_tokens.get(token, {}).get('supply', 0)
+          current_price = market_cap / supply if supply > 0 else 0  # Protection contre division par zéro
+          sell_token(chat_id, token, amount_to_sell, chain, current_price)
+      except Exception as e:
+          logger.error(f"Erreur vente partielle: {str(e)}")
+          bot.send_message(chat_id, f'⚠️ Erreur vente partielle {token}: {str(e)}')
 
 def monitor_and_sell(chat_id: int) -> None:
     while trade_active:
@@ -1491,3 +1478,4 @@ if __name__ == "__main__":
             time.sleep(60)
 
 logger.info("Fin du chargement du module bot.py")
+           
