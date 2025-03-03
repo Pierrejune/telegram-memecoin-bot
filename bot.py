@@ -20,8 +20,6 @@ import concurrent.futures
 from statistics import mean
 from datetime import datetime
 import re
-from solana.rpc.websocket_api import connect
-import asyncio
 from waitress import serve
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -318,26 +316,29 @@ def snipe_solana_pools(chat_id):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         async def run():
-            async with connect(SOLANA_RPC.replace("https", "wss")) as ws:
-                await ws.program_subscribe(RAYDIUM_PROGRAM_ID, commitment="confirmed")
-                async for msg in ws:
-                    if not trade_active:
-                        break
-                    try:
-                        token_address = None
-                        if hasattr(msg, 'result') and 'value' in msg.result and 'account' in msg.result.value:
-                            data = msg.result.value.account.data
-                            if isinstance(data, bytes):
-                                decoded = data.decode('utf-8', errors='ignore')
-                                match = re.search(r'[A-Za-z0-9]{32,44}', decoded)
-                                if match:
-                                    token_address = match.group(0)
-                        if token_address and validate_address(token_address, 'solana'):
-                            bot.send_message(chat_id, f'🎯 Nouveau pool Solana: {token_address}')
-                            threading.Thread(target=pre_validate_token, args=(chat_id, token_address, 'solana')).start()
-                    except Exception as e:
-                        logger.error(f"Erreur sniping Solana: {str(e)}")
-                        time.sleep(5)
+            try:
+                async with connect(SOLANA_RPC.replace("https", "wss")) as ws:
+                    await ws.program_subscribe(RAYDIUM_PROGRAM_ID, commitment="confirmed")
+                    async for msg in ws:
+                        if not trade_active:
+                            break
+                        try:
+                            token_address = None
+                            if hasattr(msg, 'result') and 'value' in msg.result and 'account' in msg.result.value:
+                                data = msg.result.value.account.data
+                                if isinstance(data, bytes):
+                                    decoded = data.decode('utf-8', errors='ignore')
+                                    match = re.search(r'[A-Za-z0-9]{32,44}', decoded)
+                                    if match:
+                                        token_address = match.group(0)
+                            if token_address and validate_address(token_address, 'solana'):
+                                bot.send_message(chat_id, f'🎯 Nouveau pool Solana: {token_address}')
+                                threading.Thread(target=pre_validate_token, args=(chat_id, token_address, 'solana')).start()
+                        except Exception as e:
+                            logger.error(f"Erreur sniping Solana: {str(e)}")
+                            time.sleep(5)
+            except Exception as e:
+                logger.error(f"Erreur WebSocket Solana: {str(e)}")
         loop.run_until_complete(run())
 
     if trade_active:
@@ -1187,7 +1188,7 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
                 'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')
             })
         except Exception as e:
-                        logger.error(f"Erreur vente Solana: {str(e)}")
+            logger.error(f"Erreur vente Solana: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
     else:
         try:
@@ -1252,7 +1253,7 @@ def monitor_and_sell(chat_id):
     while trade_active:
         try:
             if not trade_active or not portfolio:
-                time.sleep(2)
+                                time.sleep(2)
                 continue
             for contract_address, data in list(portfolio.items()):
                 chain = data['chain']
