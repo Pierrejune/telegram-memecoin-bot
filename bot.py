@@ -466,7 +466,7 @@ def check_token(chat_id: int, token_address: str, chain: str) -> bool:
         bot.send_message(chat_id, f'🔍 Token validé : {token_address} ({chain}) - Ratio A/V: {buy_sell_ratio:.2f}, Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
         detected_tokens[token_address] = {
             'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
-            'market_cap': market_cap, 'supply': market_cap / price, 'price': price,
+            'market_cap': market_cap, 'supply': market_cap / price if price > 0 else 0, 'price': price,
             'buy_sell_ratio': buy_sell_ratio, 'recent_buy_count': recent_buy_count
         }
         if chain == 'bsc':
@@ -609,7 +609,7 @@ def setup_webhook_endpoint():
 def cron_endpoint():
     logger.info("Requête cron reçue de Cloud Scheduler")
     try:
-        chat_id = os.getenv("DEFAULT_CHAT_ID", 123456789)  # Chat ID par défaut ou configuré via env
+        chat_id = int(os.getenv("DEFAULT_CHAT_ID", 123456789))  # Chat ID par défaut ou configuré via env
         if not trade_active:
             global trade_active
             trade_active = True
@@ -1195,6 +1195,15 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
                 del portfolio[contract_address]
             reinvest_amount = profit * profit_reinvestment_ratio
             mise_depart_sol += reinvest_amount
+                        bot.send_message(chat_id, f'⏳ Vente en cours de {amount} SOL de {contract_address}, TX: {tx_hash}')
+            time.sleep(2)
+            profit = (current_price - portfolio[contract_address]['entry_price']) * amount
+            portfolio[contract_address]['profit'] += profit
+            portfolio[contract_address]['amount'] -= amount
+            if portfolio[contract_address]['amount'] <= 0:
+                del portfolio[contract_address]
+            reinvest_amount = profit * profit_reinvestment_ratio
+            mise_depart_sol += reinvest_amount
             bot.send_message(chat_id, f'✅ Vente effectuée : {amount} SOL de {contract_address}, Profit: {profit:.4f} SOL, Réinvesti: {reinvest_amount:.4f} SOL')
             daily_trades['sells'].append({
                 'token': contract_address, 'chain': 'solana', 'amount': amount,
@@ -1249,12 +1258,14 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
 def sell_token_percentage(chat_id: int, token: str, percentage: float) -> None:
     try:
         if token not in portfolio:
-                        bot.send_message(chat_id, f'⚠️ Vente impossible : {token} n\'est pas dans le portefeuille')
+            bot.send_message(chat_id, f'⚠️ Vente impossible : {token} n\'est pas dans le portefeuille')
             return
         total_amount = portfolio[token]['amount']
         amount_to_sell = total_amount * (percentage / 100)
         chain = portfolio[token]['chain']
-        current_price = get_current_market_cap(token) / detected_tokens[token]['supply']
+        market_cap = get_current_market_cap(token)
+        supply = detected_tokens.get(token, {}).get('supply', 0)
+        current_price = market_cap / supply if supply > 0 else 0  # Protection contre division par zéro
         sell_token(chat_id, token, amount_to_sell, chain, current_price)
     except Exception as e:
         logger.error(f"Erreur vente partielle: {str(e)}")
@@ -1270,14 +1281,14 @@ def monitor_and_sell(chat_id: int) -> None:
                 chain = data['chain']
                 amount = data['amount']
                 current_mc = get_token_data(contract_address, chain)['market_cap']
-                current_price = current_mc / data['supply']
+                current_price = current_mc / data['supply'] if data['supply'] > 0 else 0
                 data['price_history'].append(current_price)
                 if len(data['price_history']) > 10:
                     data['price_history'].pop(0)
                 portfolio[contract_address]['current_market_cap'] = current_mc
-                profit_pct = (current_price - data['entry_price']) / data['entry_price'] * 100
+                profit_pct = (current_price - data['entry_price']) / data['entry_price'] * 100 if data['entry_price'] > 0 else 0
                 loss_pct = -profit_pct if profit_pct < 0 else 0
-                trend = mean(data['price_history'][-3:]) / data['entry_price'] if len(data['price_history']) >= 3 else profit_pct / 100
+                trend = mean(data['price_history'][-3:]) / data['entry_price'] if len(data['price_history']) >= 3 and data['entry_price'] > 0 else profit_pct / 100
                 data['highest_price'] = max(data['highest_price'], current_price)
                 trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
 
@@ -1312,7 +1323,7 @@ def show_portfolio(chat_id: int) -> None:
         for ca, data in portfolio.items():
             chain = data['chain']
             current_mc = get_token_data(ca, chain)['market_cap']
-            profit = (current_mc - data['market_cap_at_buy']) / data['market_cap_at_buy'] * 100
+            profit = (current_mc - data['market_cap_at_buy']) / data['market_cap_at_buy'] * 100 if data['market_cap_at_buy'] > 0 else 0
             markup.add(
                 InlineKeyboardButton(f"🔄 Refresh {ca[:6]}...", callback_data=f"refresh_{ca}"),
                 InlineKeyboardButton(f"💸 Sell {ca[:6]}...", callback_data=f"sell_{ca}")
@@ -1352,7 +1363,7 @@ def get_current_market_cap(contract_address: str) -> float:
 def refresh_token(chat_id: int, token: str) -> None:
     try:
         current_mc = get_current_market_cap(token)
-        profit = (current_mc - portfolio[token]['market_cap_at_buy']) / portfolio[token]['market_cap_at_buy'] * 100
+        profit = (current_mc - portfolio[token]['market_cap_at_buy']) / portfolio[token]['market_cap_at_buy'] * 100 if portfolio[token]['market_cap_at_buy'] > 0 else 0
         markup = InlineKeyboardMarkup()
         markup.add(
             InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{token}"),
@@ -1377,7 +1388,7 @@ def sell_token_immediate(chat_id: int, token: str) -> None:
             return
         amount = portfolio[token]["amount"]
         chain = portfolio[token]['chain']
-        current_price = get_current_market_cap(token) / detected_tokens[token]['supply']
+        current_price = get_current_market_cap(token) / detected_tokens.get(token, {}).get('supply', 1)
         sell_token(chat_id, token, amount, chain, current_price)
     except Exception as e:
         logger.error(f"Erreur vente immédiate: {str(e)}")
@@ -1418,7 +1429,7 @@ def show_token_management(chat_id: int) -> None:
         for ca, data in portfolio.items():
             chain = data['chain']
             current_mc = get_token_data(ca, chain)['market_cap']
-            profit = (current_mc - data['market_cap_at_buy']) / data['market_cap_at_buy'] * 100
+            profit = (current_mc - data['market_cap_at_buy']) / data['market_cap_at_buy'] * 100 if data['market_cap_at_buy'] > 0 else 0
             msg += (
                 f"Token: {ca} ({chain})\n"
                 f"Quantité: {data['amount']} {chain.upper()}\n"
@@ -1458,33 +1469,32 @@ def run_polling():
             time.sleep(5)
 
 if __name__ == "__main__":
-    logger.info("Démarrage principal avec Waitress...")
+    logger.info("Démarrage principal...")
     try:
-        # Lancer Waitress immédiatement pour garantir la réponse sur le port 8080
-        threading.Thread(target=lambda: serve(app, host="0.0.0.0", port=PORT, threads=8), daemon=True).start()
-        logger.info(f"Waitress lancé sur le port {PORT}")
+        logger.debug("Lancement de Waitress...")
+        serve(app, host="0.0.0.0", port=PORT, threads=8)  # Lancement direct de Waitress
+        logger.info(f"Waitress démarré sur le port {PORT}")
 
-        # Initialisation différée dans un thread séparé
         def startup_tasks():
+            logger.debug("Début des tâches de démarrage...")
             try:
                 if set_webhook():
                     logger.info("Webhook configuré avec succès.")
                 else:
                     logger.warning("Échec du webhook, démarrage du polling.")
                     threading.Thread(target=run_polling, daemon=True).start()
-                initialize_bot()  # Initialisation après démarrage serveur
+                initialize_bot()
             except Exception as e:
-                logger.error(f"Erreur startup: {str(e)}. Bot Telegram en polling.")
+                logger.error(f"Erreur dans startup_tasks: {str(e)}. Passage en mode polling.")
                 threading.Thread(target=run_polling, daemon=True).start()
 
         threading.Thread(target=startup_tasks, daemon=True).start()
 
-        # Boucle principale pour garder le script vivant
         while True:
             time.sleep(60)
             logger.debug("Bot en cours d'exécution...")
     except Exception as e:
-        logger.critical(f"Erreur critique au démarrage: {str(e)}. Tentative de survie...")
+        logger.critical(f"Erreur critique au démarrage: {str(e)}. Tentative de survie avec polling...")
         threading.Thread(target=run_polling, daemon=True).start()
         while True:
             time.sleep(60)
