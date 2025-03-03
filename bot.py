@@ -1253,7 +1253,7 @@ def monitor_and_sell(chat_id):
     while trade_active:
         try:
             if not trade_active or not portfolio:
-                                time.sleep(2)
+                time.sleep(2)
                 continue
             for contract_address, data in list(portfolio.items()):
                 chain = data['chain']
