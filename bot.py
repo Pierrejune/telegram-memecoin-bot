@@ -1176,7 +1176,7 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
                 accounts=[
                     {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
                     {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
-                    {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
+                                        {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
                 ],
                 data=bytes([3]) + amount_out.to_bytes(8, 'little')
             )
@@ -1187,15 +1187,6 @@ def sell_token(chat_id: int, contract_address: str, amount: float, chain: str, c
                 "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
             }, timeout=5).json()['result']
             bot.send_message(chat_id, f'⏳ Vente en cours de {amount} SOL de {contract_address}, TX: {tx_hash}')
-            time.sleep(2)
-            profit = (current_price - portfolio[contract_address]['entry_price']) * amount
-            portfolio[contract_address]['profit'] += profit
-            portfolio[contract_address]['amount'] -= amount
-            if portfolio[contract_address]['amount'] <= 0:
-                del portfolio[contract_address]
-            reinvest_amount = profit * profit_reinvestment_ratio
-            mise_depart_sol += reinvest_amount
-                        bot.send_message(chat_id, f'⏳ Vente en cours de {amount} SOL de {contract_address}, TX: {tx_hash}')
             time.sleep(2)
             profit = (current_price - portfolio[contract_address]['entry_price']) * amount
             portfolio[contract_address]['profit'] += profit
