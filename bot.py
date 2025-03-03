@@ -573,7 +573,7 @@ def webhook():
             bot.process_new_updates([update])
             logger.info("Update traité avec succès")
             if not trade_active and update.message:
-                global trade_active
+            global trade_active
                 trade_active = True
                 threading.Thread(target=initialize_and_run_threads, args=(update.message.chat.id,), daemon=True).start()
             return 'OK', 200
