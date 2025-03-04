@@ -52,8 +52,7 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "dummy_birdeye_key")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "dummy_twitter_token")
 PORT = int(os.getenv("PORT", 8080))
 BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
-SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-SOLANA_RPC_ALT = os.getenv("SOLANA_RPC_ALT", "https://api.mainnet-beta.solana.com")
+SOLANA_RPC_ALT = os.getenv("SOLANA_RPC_ALT", "https://solana-api.projectserum.com")
 
 BIRDEYE_HEADERS = {"X-API-KEY": BIRDEYE_API_KEY}
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
@@ -97,6 +96,7 @@ ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply",
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
 PANCAKE_ROUTER_ABI = json.loads('[{"inputs": [{"internalType": "uint256", "name": "amountIn", "type": "uint256"}, {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactETHForTokens", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "payable", "type": "function"}, {"inputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}, {"internalType": "uint256", "name": "amountInMax", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactTokensForETH", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "nonpayable", "type": "function"}]')
+PANCAKE_FACTORY_ABI = json.loads('[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token0","type":"address"},{"indexed":true,"internalType":"address","name":"token1","type":"address"},{"indexed":false,"internalType":"address","name":"pair","type":"address"},{"indexed":false,"internalType":"uint256","name":"","type":"uint256"}],"name":"PairCreated","type":"event"}]')
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
@@ -220,16 +220,16 @@ def monitor_twitter(chat_id):
     while trade_active:
         try:
             current_time = time.time()
-            if current_time - twitter_last_reset >= 900:
+            if current_time - twitter_last_reset >= 900:  # Réinitialisation toutes les 15 min
                 twitter_requests_remaining = 450
                 twitter_last_reset = current_time
                 logger.info("Quota Twitter réinitialisé : 450 requêtes.")
                 bot.send_message(chat_id, "ℹ️ Quota Twitter réinitialisé : 450 requêtes restantes")
 
-            if twitter_requests_remaining <= 1:
+            if twitter_requests_remaining <= 10:  # Marge de sécurité
                 wait_time = 900 - (current_time - twitter_last_reset) + 5
-                logger.warning(f"Quota épuisé ({twitter_requests_remaining}), attente de {wait_time:.1f}s...")
-                bot.send_message(chat_id, f"⚠️ Quota Twitter épuisé, pause de {wait_time:.1f}s...")
+                logger.warning(f"Quota faible ({twitter_requests_remaining}), attente de {wait_time:.1f}s...")
+                bot.send_message(chat_id, f"⚠️ Quota Twitter faible ({twitter_requests_remaining}), pause de {wait_time:.1f}s...")
                 time.sleep(wait_time)
                 continue
 
@@ -240,12 +240,14 @@ def monitor_twitter(chat_id):
             response.raise_for_status()
             twitter_requests_remaining -= 1
             last_twitter_call = current_time
+            remaining = response.headers.get('x-rate-limit-remaining', twitter_requests_remaining)
+            twitter_requests_remaining = int(remaining) if remaining else max(twitter_requests_remaining - 1, 0)
             data = response.json()
             tweets = data.get('data', [])
             users = {u['id']: u for u in data.get('includes', {}).get('users', [])}
 
-            logger.info(f"✅ Tweets analysés, {len(tweets)} détectés")
-            bot.send_message(chat_id, f"✅ Tweets analysés, {len(tweets)} détectés")
+            logger.info(f"✅ Tweets analysés, restant: {twitter_requests_remaining}")
+            bot.send_message(chat_id, f"✅ Tweets analysés, {len(tweets)} détectés, restant: {twitter_requests_remaining}")
             for tweet in tweets:
                 user = users.get(tweet['author_id'])
                 followers = user.get('public_metrics', {}).get('followers_count', 0) if user else 0
@@ -266,6 +268,10 @@ def monitor_twitter(chat_id):
                 logger.warning(f"429 détecté, attente de {wait_time}s")
                 bot.send_message(chat_id, f"⚠️ Limite Twitter atteinte, pause de {wait_time}s...")
                 time.sleep(wait_time)
+            elif isinstance(e.__cause__, requests.exceptions.SSLError):
+                logger.warning(f"Erreur SSL Twitter: {str(e)}, reprise dans 60s...")
+                bot.send_message(chat_id, f"⚠️ Erreur réseau Twitter (SSL), reprise dans 60s...")
+                time.sleep(60)
             else:
                 logger.error(f"Erreur Twitter: {str(e)}")
                 bot.send_message(chat_id, f"⚠️ Erreur Twitter: {str(e)}. Reprise dans 60s...")
@@ -318,7 +324,7 @@ def snipe_solana_pools(chat_id):
         asyncio.set_event_loop(loop)
         async def run():
             try:
-                async with connect(SOLANA_RPC.replace("https", "wss")) as ws:
+                async with connect(SOLANA_RPC_ALT.replace("https", "wss")) as ws:
                     await ws.program_subscribe(RAYDIUM_PROGRAM_ID, commitment="confirmed")
                     async for msg in ws:
                         if not trade_active:
@@ -532,7 +538,7 @@ def detect_new_tokens_solana(chat_id):
         try:
             if solana_keypair is None:
                 initialize_bot()
-            response = session.post(SOLANA_RPC, json={
+            response = session.post(SOLANA_RPC_ALT, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getProgramAccounts",
                 "params": [str(RAYDIUM_PROGRAM_ID), {"encoding": "base64", "filters": [{"dataSize": 320}]}]
             }, timeout=10)
@@ -658,7 +664,7 @@ def callback_query(call):
     chat_id = call.message.chat.id
     logger.info(f"Callback reçu: {call.data}")
     try:
-        if call.data == "status":
+                if call.data == "status":
             bot.send_message(chat_id, (
                 f"ℹ️ Statut actuel :\nTrading actif: {'Oui' if trade_active else 'Non'}\n"
                 f"Mise BSC: {mise_depart_bsc} BNB\nMise Solana: {mise_depart_sol} SOL\n"
@@ -837,7 +843,7 @@ def show_threshold_menu(chat_id):
         f'📊 Seuils de détection :\n- BSC Volume: {MIN_VOLUME_BSC} $ - {MAX_VOLUME_BSC} $\n'
         f'- BSC Ratio A/V: {MIN_BUY_SELL_RATIO_BSC}\n- BSC Market Cap : {MIN_MARKET_CAP_BSC} $ - {MAX_MARKET_CAP_BSC} $\n'
         f'- Min Liquidité : {MIN_LIQUIDITY} $\n- Solana Volume: {MIN_VOLUME_SOL} $ - {MAX_VOLUME_SOL} $\n'
-                f'- Solana Ratio A/V: {MIN_BUY_SELL_RATIO_SOL}\n- Solana Market Cap : {MIN_MARKET_CAP_SOL} $ - {MAX_MARKET_CAP_SOL} $\n'
+        f'- Solana Ratio A/V: {MIN_BUY_SELL_RATIO_SOL}\n- Solana Market Cap : {MIN_MARKET_CAP_SOL} $ - {MAX_MARKET_CAP_SOL} $\n'
         f'- Âge max : {MAX_TOKEN_AGE_HOURS}h'
     ), reply_markup=markup)
 
