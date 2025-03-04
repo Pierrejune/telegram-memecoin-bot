@@ -220,13 +220,13 @@ def monitor_twitter(chat_id):
     while trade_active:
         try:
             current_time = time.time()
-            if current_time - twitter_last_reset >= 900:  # Réinitialisation toutes les 15 min
+            if current_time - twitter_last_reset >= 900:
                 twitter_requests_remaining = 450
                 twitter_last_reset = current_time
                 logger.info("Quota Twitter réinitialisé : 450 requêtes.")
                 bot.send_message(chat_id, "ℹ️ Quota Twitter réinitialisé : 450 requêtes restantes")
 
-            if twitter_requests_remaining <= 10:  # Marge de sécurité
+            if twitter_requests_remaining <= 10:
                 wait_time = 900 - (current_time - twitter_last_reset) + 5
                 logger.warning(f"Quota faible ({twitter_requests_remaining}), attente de {wait_time:.1f}s...")
                 bot.send_message(chat_id, f"⚠️ Quota Twitter faible ({twitter_requests_remaining}), pause de {wait_time:.1f}s...")
@@ -664,7 +664,7 @@ def callback_query(call):
     chat_id = call.message.chat.id
     logger.info(f"Callback reçu: {call.data}")
     try:
-                if call.data == "status":
+        if call.data == "status":
             bot.send_message(chat_id, (
                 f"ℹ️ Statut actuel :\nTrading actif: {'Oui' if trade_active else 'Non'}\n"
                 f"Mise BSC: {mise_depart_bsc} BNB\nMise Solana: {mise_depart_sol} SOL\n"
