@@ -313,6 +313,8 @@ def snipe_new_pairs_bsc(chat_id):
 
 def snipe_solana_pools(chat_id):
     def run_solana_websocket():
+        import asyncio
+        from solana.rpc.websocket_api import connect
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         async def run():
@@ -370,6 +372,7 @@ def pre_validate_token(chat_id, token_address, chain):
         if final_growth > 50 and data_final['liquidity'] >= 5000:
             bot.send_message(chat_id, f'✅ Critères secondaires atteints pour {token_address} (Liq: ${data_final["liquidity"]:.2f}, Croissance: {final_growth:.2f}%)')
             check_token(chat_id, token_address, chain)
+            return
         else:
             bot.send_message(chat_id, f'⚠️ {token_address} rejeté : croissance insuffisante ou liquidité < $5000')
             rejected_tokens[token_address] = time.time()
@@ -401,7 +404,7 @@ def check_token(chat_id, token_address, chain):
             bot.send_message(chat_id, f'🚀 Boost croisé détecté pour {token_address} sur {other_chain} (Vol: ${cross_data["volume_24h"]:.2f})')
 
         if liquidity < 1000 and not (cross_boost or (time.time() - pair_created_at < 60 and volume_24h / max(liquidity, 1) > 100)):
-                        bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : liquidité ${liquidity:.2f} < $1000')
+            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : liquidité ${liquidity:.2f} < $1000')
             rejected_tokens[token_address] = time.time()
             return False
 
@@ -1227,7 +1230,7 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
                     'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')
                 })
             else:
-                bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}, TX: {tx_hash.hex()}')
+                                bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}, TX: {tx_hash.hex()}')
         except Exception as e:
             logger.error(f"Erreur vente BSC: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
@@ -1295,7 +1298,7 @@ def show_portfolio(chat_id):
             initialize_bot()
         bnb_balance = w3.eth.get_balance(WALLET_ADDRESS) / 10**18 if w3 and w3.is_connected() else 0
         sol_balance = get_solana_balance(WALLET_ADDRESS)
-                msg = f'💰 Portefeuille:\nBNB : {bnb_balance:.4f}\nSOL : {sol_balance:.4f}\n\n'
+        msg = f'💰 Portefeuille:\nBNB : {bnb_balance:.4f}\nSOL : {sol_balance:.4f}\n\n'
         markup = InlineKeyboardMarkup()
         for ca, data in portfolio.items():
             chain = data['chain']
