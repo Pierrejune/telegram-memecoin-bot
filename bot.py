@@ -401,7 +401,7 @@ def check_token(chat_id, token_address, chain):
             bot.send_message(chat_id, f'🚀 Boost croisé détecté pour {token_address} sur {other_chain} (Vol: ${cross_data["volume_24h"]:.2f})')
 
         if liquidity < 1000 and not (cross_boost or (time.time() - pair_created_at < 60 and volume_24h / max(liquidity, 1) > 100)):
-            bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : liquidité ${liquidity:.2f} < $1000')
+                        bot.send_message(chat_id, f'⚠️ Token {token_address} rejeté : liquidité ${liquidity:.2f} < $1000')
             rejected_tokens[token_address] = time.time()
             return False
 
@@ -565,6 +565,7 @@ def detect_new_tokens_solana(chat_id):
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
+    global trade_active
     logger.debug("Webhook reçu")
     try:
         if request.method == "POST" and request.headers.get("content-type") == "application/json":
@@ -573,7 +574,6 @@ def webhook():
             bot.process_new_updates([update])
             logger.info("Update traité avec succès")
             if not trade_active and update.message:
-                global trade_active
                 trade_active = True
                 threading.Thread(target=initialize_and_run_threads, args=(update.message.chat.id,), daemon=True).start()
             return 'OK', 200
@@ -596,11 +596,11 @@ def setup_webhook_endpoint():
 
 @app.route("/cron", methods=['GET', 'POST'])
 def cron_endpoint():
+    global trade_active
     logger.info("Requête cron reçue de Cloud Scheduler")
     try:
         chat_id = int(os.getenv("DEFAULT_CHAT_ID", "123456789"))
         if not trade_active:
-            global trade_active
             trade_active = True
             threading.Thread(target=initialize_and_run_threads, args=(chat_id,), daemon=True).start()
             logger.info("Threads de trading lancés via cron")
@@ -781,7 +781,6 @@ def trading_cycle(chat_id):
             break
 
 def watchdog(chat_id):
-    logger.info("Watchdog démarré...")
     while trade_active:
         try:
             time.sleep(60)
@@ -1296,7 +1295,7 @@ def show_portfolio(chat_id):
             initialize_bot()
         bnb_balance = w3.eth.get_balance(WALLET_ADDRESS) / 10**18 if w3 and w3.is_connected() else 0
         sol_balance = get_solana_balance(WALLET_ADDRESS)
-        msg = f'💰 Portefeuille:\nBNB : {bnb_balance:.4f}\nSOL : {sol_balance:.4f}\n\n'
+                msg = f'💰 Portefeuille:\nBNB : {bnb_balance:.4f}\nSOL : {sol_balance:.4f}\n\n'
         markup = InlineKeyboardMarkup()
         for ca, data in portfolio.items():
             chain = data['chain']
