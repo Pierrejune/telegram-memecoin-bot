@@ -96,7 +96,6 @@ RETRY_DELAY_MINUTES = 5
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
-PANCAKE_FACTORY_ABI = [json.loads('{"anonymous": false, "inputs": [{"indexed": true, "internalType": "address", "name": "token0", "type": "address"}, {"indexed": true, "internalType": "address", "name": "token1", "type": "address"}, {"indexed": false, "internalType": "address", "name": "pair", "type": "address"}, {"indexed": false, "internalType": "uint256", "name": "type", "type": "uint256"}], "name": "PairCreated", "type": "event"}')]
 PANCAKE_ROUTER_ABI = json.loads('[{"inputs": [{"internalType": "uint256", "name": "amountIn", "type": "uint256"}, {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactETHForTokens", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "payable", "type": "function"}, {"inputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}, {"internalType": "uint256", "name": "amountInMax", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactTokensForETH", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "nonpayable", "type": "function"}]')
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
@@ -566,6 +565,11 @@ def detect_new_tokens_solana(chat_id):
         if not trade_active:
             break
 
+@app.route("/")
+def health_check():
+    logger.debug("Health check appelé")
+    return "Bot is running", 200
+
 @app.route("/webhook", methods=['POST'])
 def webhook():
     global trade_active
@@ -585,11 +589,6 @@ def webhook():
     except Exception as e:
         logger.error(f"Erreur dans webhook: {str(e)}")
         return 'ERROR', 500
-
-@app.route("/")
-def health_check():
-    logger.debug("Health check appelé")
-    return "Bot is running", 200
 
 @app.route("/setup-webhook", methods=['GET'])
 def setup_webhook_endpoint():
@@ -838,7 +837,7 @@ def show_threshold_menu(chat_id):
         f'📊 Seuils de détection :\n- BSC Volume: {MIN_VOLUME_BSC} $ - {MAX_VOLUME_BSC} $\n'
         f'- BSC Ratio A/V: {MIN_BUY_SELL_RATIO_BSC}\n- BSC Market Cap : {MIN_MARKET_CAP_BSC} $ - {MAX_MARKET_CAP_BSC} $\n'
         f'- Min Liquidité : {MIN_LIQUIDITY} $\n- Solana Volume: {MIN_VOLUME_SOL} $ - {MAX_VOLUME_SOL} $\n'
-        f'- Solana Ratio A/V: {MIN_BUY_SELL_RATIO_SOL}\n- Solana Market Cap : {MIN_MARKET_CAP_SOL} $ - {MAX_MARKET_CAP_SOL} $\n'
+                f'- Solana Ratio A/V: {MIN_BUY_SELL_RATIO_SOL}\n- Solana Market Cap : {MIN_MARKET_CAP_SOL} $ - {MAX_MARKET_CAP_SOL} $\n'
         f'- Âge max : {MAX_TOKEN_AGE_HOURS}h'
     ), reply_markup=markup)
 
@@ -1230,7 +1229,8 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
                     'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')
                 })
             else:
-                                bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}, TX: {tx_hash.hex()}')
+                logger.error(f"Échec vente BSC: Transaction {tx_hash.hex()} échouée")
+                bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}, TX: {tx_hash.hex()}')
         except Exception as e:
             logger.error(f"Erreur vente BSC: {str(e)}")
             bot.send_message(chat_id, f'⚠️ Échec vente {contract_address}: {str(e)}')
