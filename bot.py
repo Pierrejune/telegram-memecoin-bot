@@ -1182,11 +1182,19 @@ def initialize_and_run_threads(chat_id):
             asyncio.to_thread(monitor_twitter, chat_id),
             asyncio.to_thread(monitor_and_sell, chat_id)
         ]
-        loop.run_until_complete(asyncio.gather(*tasks))
+        # Exécuter les tâches avec gestion individuelle des erreurs
+        async def run_with_error_handling(task):
+            try:
+                await task
+            except Exception as e:
+                logger.error(f"Erreur dans une tâche: {str(e)}")
+                bot.send_message(chat_id, f"⚠️ Erreur dans une tâche: {str(e)}")
+        
+        loop.run_until_complete(asyncio.gather(*(run_with_error_handling(t) for t in tasks), return_exceptions=True))
     except Exception as e:
-        logger.error(f"Erreur dans l'initialisation ou les threads: {str(e)}")
+        logger.error(f"Erreur générale dans initialize_and_run_threads: {str(e)}")
         bot.send_message(chat_id, f"⚠️ Erreur threads: {str(e)}. Certaines fonctionnalités peuvent être indisponibles.")
-
+        
 def run_polling():
     logger.info("Démarrage du mode polling pour Telegram...")
     while True:
