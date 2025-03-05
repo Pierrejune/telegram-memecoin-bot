@@ -18,7 +18,6 @@ from urllib3.util.retry import Retry
 import threading
 import asyncio
 import websockets
-import websockets
 import concurrent.futures
 from statistics import mean
 from datetime import datetime
@@ -272,8 +271,7 @@ def monitor_twitter(chat_id):
         except Exception as e:
             logger.error(f"Erreur Twitter inattendue: {str(e)}")
             time.sleep(60)
-
-async def snipe_new_pairs_bsc(chat_id):
+            async def snipe_new_pairs_bsc(chat_id):
     if trade_active:
         logger.info("Sniping BSC démarré...")
         bot.send_message(chat_id, "🔫 Sniping BSC activé...")
@@ -300,7 +298,7 @@ async def snipe_new_pairs_bsc(chat_id):
                 logger.error(f"Erreur sniping BSC: {str(e)}")
                 await asyncio.sleep(1)
 
- async def snipe_solana_pools(chat_id):
+async def snipe_solana_pools(chat_id):
     if trade_active:
         logger.info("Sniping Solana démarré...")
         bot.send_message(chat_id, "🔫 Sniping Solana activé...")
@@ -1229,3 +1227,4 @@ if __name__ == "__main__":
             time.sleep(60)
 
 logger.info("Fin du chargement du module bot.py")
+        
