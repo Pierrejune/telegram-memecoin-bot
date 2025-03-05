@@ -17,7 +17,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import threading
 import asyncio
-from solana.rpc.websocket_api import connect
+import websockets
 import websockets
 import concurrent.futures
 from statistics import mean
@@ -300,19 +300,27 @@ async def snipe_new_pairs_bsc(chat_id):
                 logger.error(f"Erreur sniping BSC: {str(e)}")
                 await asyncio.sleep(1)
 
-async def snipe_solana_pools(chat_id):
+ async def snipe_solana_pools(chat_id):
     if trade_active:
         logger.info("Sniping Solana démarré...")
         bot.send_message(chat_id, "🔫 Sniping Solana activé...")
-    async with connect(SOLANA_RPC_ALT) as ws:
-        await ws.program_subscribe(RAYDIUM_PROGRAM_ID, commitment="confirmed")
+    uri = SOLANA_RPC_ALT  # "wss://api.mainnet-beta.solana.com"
+    async with websockets.connect(uri) as ws:
+        subscription_msg = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "programSubscribe",
+            "params": [str(RAYDIUM_PROGRAM_ID), {"encoding": "base64", "commitment": "confirmed"}]
+        }
+        await ws.send(json.dumps(subscription_msg))
         while trade_active:
             try:
                 msg = await ws.recv()
-                if hasattr(msg, 'result') and 'value' in msg.result and 'account' in msg.result.value:
-                    data = msg.result.value.account.data
-                    if isinstance(data, bytes):
-                        decoded = data.decode('utf-8', errors='ignore')
+                data = json.loads(msg)
+                if 'result' in data and 'value' in data['result'] and 'account' in data['result']['value']:
+                    account_data = data['result']['value']['account']['data']
+                    if isinstance(account_data, list) and account_data[1] == "base64":
+                        decoded = base58.b58decode(account_data[0]).decode('utf-8', errors='ignore')
                         match = re.search(r'[A-Za-z0-9]{32,44}', decoded)
                         if match:
                             token_address = match.group(0)
