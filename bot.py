@@ -304,13 +304,15 @@ async def snipe_solana_pools(chat_id):
         logger.info("Sniping Solana démarré...")
         bot.send_message(chat_id, "🔫 Sniping Solana activé...")
     uri = SOLANA_RPC_ALT
+    logger.info(f"Tentative de connexion WebSocket Solana à {uri}")
     if not uri.startswith(('ws://', 'wss://')):
         error_msg = f"URI Solana invalide: {uri} - doit commencer par ws:// ou wss://"
         logger.error(error_msg)
         bot.send_message(chat_id, f"⚠️ {error_msg}")
         return
     try:
-        async with websockets.connect(uri) as ws:
+        async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
+            logger.info(f"Connexion WebSocket Solana établie à {uri}")
             subscription_msg = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -318,9 +320,11 @@ async def snipe_solana_pools(chat_id):
                 "params": [str(RAYDIUM_PROGRAM_ID), {"encoding": "base64", "commitment": "confirmed"}]
             }
             await ws.send(json.dumps(subscription_msg))
+            logger.info("Abonnement au programme Raydium envoyé")
             while trade_active:
                 try:
                     msg = await ws.recv()
+                    logger.debug(f"Message reçu de Solana: {msg}")
                     data = json.loads(msg)
                     if 'result' in data and 'value' in data['result'] and 'account' in data['result']['value']:
                         account_data = data['result']['value']['account']['data']
@@ -1183,21 +1187,28 @@ def initialize_and_run_threads(chat_id):
     try:
         initialize_bot()
         logger.info("Bot initialisé avec succès.")
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        tasks = [
-            snipe_new_pairs_bsc(chat_id),
-            snipe_solana_pools(chat_id),
-            asyncio.to_thread(monitor_twitter, chat_id),
-            asyncio.to_thread(monitor_and_sell, chat_id)
-        ]
-        # Exécuter les tâches avec gestion individuelle des erreurs
-        async def run_with_error_handling(task):
-            try:
-                await task
-            except Exception as e:
-                logger.error(f"Erreur dans une tâche: {str(e)}")
-                bot.send_message(chat_id, f"⚠️ Erreur dans une tâche: {str(e)}")
+
+        # Lancer chaque tâche dans un thread séparé pour éviter un blocage global
+        def run_async_task(coro, task_name):
+            async def wrapper():
+                try:
+                    await coro
+                except Exception as e:
+                    logger.error(f"Erreur dans {task_name}: {str(e)}")
+                    bot.send_message(chat_id, f"⚠️ Erreur dans {task_name}: {str(e)}")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(wrapper())
+
+        threading.Thread(target=run_async_task, args=(snipe_new_pairs_bsc(chat_id), "Sniping BSC"), daemon=True).start()
+        threading.Thread(target=run_async_task, args=(snipe_solana_pools(chat_id), "Sniping Solana"), daemon=True).start()
+        threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True).start()
+        threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
+
+        logger.info("Toutes les tâches ont été lancées dans des threads séparés.")
+    except Exception as e:
+        logger.error(f"Erreur générale dans initialize_and_run_threads: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur initialisation threads: {str(e)}. Le bot peut encore répondre.")
         
         loop.run_until_complete(asyncio.gather(*(run_with_error_handling(t) for t in tasks), return_exceptions=True))
     except Exception as e:
