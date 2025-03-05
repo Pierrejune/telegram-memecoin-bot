@@ -271,6 +271,7 @@ def monitor_twitter(chat_id):
         except Exception as e:
             logger.error(f"Erreur Twitter inattendue: {str(e)}")
             time.sleep(60)
+            
 async def snipe_new_pairs_bsc(chat_id):
     if trade_active:
         logger.info("Sniping BSC démarré...")
@@ -297,7 +298,7 @@ async def snipe_new_pairs_bsc(chat_id):
             except Exception as e:
                 logger.error(f"Erreur sniping BSC: {str(e)}")
                 await asyncio.sleep(1)
-
+                
 async def snipe_solana_pools(chat_id):
     if trade_active:
         logger.info("Sniping Solana démarré...")
