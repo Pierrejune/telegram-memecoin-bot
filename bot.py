@@ -303,33 +303,42 @@ async def snipe_solana_pools(chat_id):
     if trade_active:
         logger.info("Sniping Solana démarré...")
         bot.send_message(chat_id, "🔫 Sniping Solana activé...")
-    uri = SOLANA_RPC_ALT  # "wss://api.mainnet-beta.solana.com"
-    async with websockets.connect(uri) as ws:
-        subscription_msg = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "programSubscribe",
-            "params": [str(RAYDIUM_PROGRAM_ID), {"encoding": "base64", "commitment": "confirmed"}]
-        }
-        await ws.send(json.dumps(subscription_msg))
-        while trade_active:
-            try:
-                msg = await ws.recv()
-                data = json.loads(msg)
-                if 'result' in data and 'value' in data['result'] and 'account' in data['result']['value']:
-                    account_data = data['result']['value']['account']['data']
-                    if isinstance(account_data, list) and account_data[1] == "base64":
-                        decoded = base58.b58decode(account_data[0]).decode('utf-8', errors='ignore')
-                        match = re.search(r'[A-Za-z0-9]{32,44}', decoded)
-                        if match:
-                            token_address = match.group(0)
-                            if validate_address(token_address, 'solana') and token_address not in portfolio:
-                                logger.info(f"Snipe détecté Solana: {token_address}")
-                                bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Solana)')
-                                threading.Thread(target=validate_and_trade, args=(chat_id, token_address, 'solana')).start()
-            except Exception as e:
-                logger.error(f"Erreur sniping Solana: {str(e)}")
-                await asyncio.sleep(1)
+    uri = SOLANA_RPC_ALT
+    if not uri.startswith(('ws://', 'wss://')):
+        error_msg = f"URI Solana invalide: {uri} - doit commencer par ws:// ou wss://"
+        logger.error(error_msg)
+        bot.send_message(chat_id, f"⚠️ {error_msg}")
+        return
+    try:
+        async with websockets.connect(uri) as ws:
+            subscription_msg = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "programSubscribe",
+                "params": [str(RAYDIUM_PROGRAM_ID), {"encoding": "base64", "commitment": "confirmed"}]
+            }
+            await ws.send(json.dumps(subscription_msg))
+            while trade_active:
+                try:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    if 'result' in data and 'value' in data['result'] and 'account' in data['result']['value']:
+                        account_data = data['result']['value']['account']['data']
+                        if isinstance(account_data, list) and account_data[1] == "base64":
+                            decoded = base58.b58decode(account_data[0]).decode('utf-8', errors='ignore')
+                            match = re.search(r'[A-Za-z0-9]{32,44}', decoded)
+                            if match:
+                                token_address = match.group(0)
+                                if validate_address(token_address, 'solana') and token_address not in portfolio:
+                                    logger.info(f"Snipe détecté Solana: {token_address}")
+                                    bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Solana)')
+                                    threading.Thread(target=validate_and_trade, args=(chat_id, token_address, 'solana')).start()
+                except Exception as e:
+                    logger.error(f"Erreur dans la boucle Solana: {str(e)}")
+                    await asyncio.sleep(1)
+    except Exception as e:
+        logger.error(f"Erreur connexion WebSocket Solana {uri}: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Erreur Solana WebSocket: {str(e)}")
 
 def validate_and_trade(chat_id, token_address, chain):
     try:
