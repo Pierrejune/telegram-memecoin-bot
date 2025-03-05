@@ -271,7 +271,7 @@ def monitor_twitter(chat_id):
         except Exception as e:
             logger.error(f"Erreur Twitter inattendue: {str(e)}")
             time.sleep(60)
-            async def snipe_new_pairs_bsc(chat_id):
+async def snipe_new_pairs_bsc(chat_id):
     if trade_active:
         logger.info("Sniping BSC démarré...")
         bot.send_message(chat_id, "🔫 Sniping BSC activé...")
