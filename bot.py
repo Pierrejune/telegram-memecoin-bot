@@ -957,10 +957,14 @@ def show_threshold_menu(chat_id):
         InlineKeyboardButton("📊 Ratio A/V", callback_data="adjust_buy_sell_ratio_bsc")
     )
     bot.send_message(chat_id, (
-        f'📊 Seuils de détection :\n- BSC Volume: {MIN_VOLUME_BSC} $ - {MAX_VOLUME_BSC} $\n'
-        f'- Ratio A/V: {MIN_BUY_SELL_RATIO}\n- BSC Market Cap : {MIN_MARKET_CAP_BSC} $ - {MAX_MARKET_CAP_BSC} $\n'
-        fupy : {MIN_LIQUIDITY} $\n- Solana Volume: {MIN_VOLUME_SOL} $ - {MAX_VOLUME_SOL} $\n'
-        f'- Solana Market Cap : {MIN_MARKET_CAP_SOL} $ - {MAX_MARKET_CAP_SOL} $\n- Âge max : {MAX_TOKEN_AGE_HOURS}h'
+        f'📊 Seuils de détection :\n'
+        f'- BSC Volume: {MIN_VOLUME_BSC} $ - {MAX_VOLUME_BSC} $\n'
+        f'- Ratio A/V: {MIN_BUY_SELL_RATIO}\n'
+        f'- BSC Market Cap: {MIN_MARKET_CAP_BSC} $ - {MAX_MARKET_CAP_BSC} $\n'
+        f'- Min Liquidité: {MIN_LIQUIDITY} $\n'
+        f'- Solana Volume: {MIN_VOLUME_SOL} $ - {MAX_VOLUME_SOL} $\n'
+        f'- Solana Market Cap: {MIN_MARKET_CAP_SOL} $ - {MAX_MARKET_CAP_SOL} $\n'
+        f'- Âge max: {MAX_TOKEN_AGE_HOURS}h'
     ), reply_markup=markup)
 
 def adjust_mise_bsc(message):
