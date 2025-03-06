@@ -677,7 +677,7 @@ def monitor_and_sell(chat_id):
                 if len(data['price_history']) > 10:
                     data['price_history'].pop(0)
                 portfolio[contract_address]['current_market_cap'] = current_mc
-                                profit_pct = (current_price - data['entry_price']) / data['entry_price'] * 100 if data['entry_price'] > 0 else 0
+                profit_pct = (current_price - data['entry_price']) / data['entry_price'] * 100 if data['entry_price'] > 0 else 0
                 loss_pct = -profit_pct if profit_pct < 0 else 0
                 data['highest_price'] = max(data['highest_price'], current_price)
                 trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
