@@ -21,9 +21,11 @@ from waitress import serve
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Configuration de la session HTTP
 session = requests.Session()
 session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
 retry_strategy = Retry(total=5, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
@@ -55,6 +57,7 @@ PORT = int(os.getenv("PORT", 8080))
 
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
+# Initialisation Flask et Telebot
 app = Flask(__name__)
 bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 
@@ -281,7 +284,7 @@ def snipe_4meme_bsc_with_bscscan(chat_id):
                         bot.send_message(chat_id, f'🎯 Snipe détecté via BscScan : {token_address} (BSC - 4Meme probable)')
                         validate_and_trade(chat_id, token_address, 'bsc')
             last_timestamp = int(time.time())
-            time.sleep(1)  # Polling toutes les secondes pour maximiser les détections
+            time.sleep(1)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur sniping 4Meme via BscScan: {str(e)}")
             time.sleep(5)
@@ -353,7 +356,7 @@ def monitor_x(chat_id):
                 time.sleep(wait_time)
                 continue
 
-            if current_time - last_x_call < 900:  # 15 minutes = 900 secondes
+            if current_time - last_x_call < 900:  # 15 minutes
                 time.sleep(900 - (current_time - last_x_call))
                 continue
 
@@ -385,7 +388,7 @@ def monitor_x(chat_id):
                             validate_and_trade(chat_id, word, chain)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur X: {str(e)}")
-            time.sleep(900)  # Retry après 15 minutes en cas d’erreur
+            time.sleep(900)
 
 def validate_and_trade(chat_id, token_address, chain):
     try:
@@ -445,21 +448,21 @@ def validate_and_trade(chat_id, token_address, chain):
             rejected_tokens[token_address] = time.time()
             return
 
-            exchange = 'PancakeSwap' if chain == 'bsc' and token_address in snipe_new_pairs_bsc.__code__.co_consts else '4Meme' if chain == 'bsc' else 'Uniswap' if chain == 'eth' else 'Raydium' if token_address in snipe_solana_pools.__code__.co_consts else 'Pump.fun'
-            bot.send_message(chat_id, f'✅ Token validé : {token_address} ({chain} - {exchange}) - Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
-            detected_tokens[token_address] = {
-                'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
-                'market_cap': market_cap, 'supply': market_cap / price if price > 0 else 0, 'price': price,
-                'buy_sell_ratio': buy_sell_ratio
-            }
-            if chain == 'bsc':
-                buy_token_bsc(chat_id, token_address, mise_depart_bsc)
-            elif chain == 'eth':
-                buy_token_eth(chat_id, token_address, mise_depart_eth)
-            else:
-                buy_token_solana(chat_id, token_address, mise_depart_sol)
-        except Exception as e:
-            bot.send_message(chat_id, f"⚠️ Erreur validation {token_address}: {str(e)}")
+        exchange = 'PancakeSwap' if chain == 'bsc' and token_address in snipe_new_pairs_bsc.__code__.co_consts else '4Meme' if chain == 'bsc' else 'Uniswap' if chain == 'eth' else 'Raydium' if token_address in snipe_solana_pools.__code__.co_consts else 'Pump.fun'
+        bot.send_message(chat_id, f'✅ Token validé : {token_address} ({chain} - {exchange}) - Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
+        detected_tokens[token_address] = {
+            'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
+            'market_cap': market_cap, 'supply': market_cap / price if price > 0 else 0, 'price': price,
+            'buy_sell_ratio': buy_sell_ratio
+        }
+        if chain == 'bsc':
+            buy_token_bsc(chat_id, token_address, mise_depart_bsc)
+        elif chain == 'eth':
+            buy_token_eth(chat_id, token_address, mise_depart_eth)
+        else:
+            buy_token_solana(chat_id, token_address, mise_depart_sol)
+    except Exception as e:
+        bot.send_message(chat_id, f"⚠️ Erreur validation {token_address}: {str(e)}")
 
 def buy_token_bsc(chat_id, contract_address, amount):
     try:
