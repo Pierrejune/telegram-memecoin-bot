@@ -26,14 +26,14 @@ logger = logging.getLogger(__name__)
 
 session = requests.Session()
 session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
-retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+retry_strategy = Retry(total=5, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 
 # Variables globales
-last_twitter_call = 0
-twitter_last_reset = time.time()
-twitter_requests_remaining = 450
+last_x_call = 0
+x_last_reset = time.time()
+x_requests_remaining = 100  # Limite quotidienne approximative pour API X gratuite
 daily_trades = {'buys': [], 'sells': []}
 rejected_tokens = {}
 trade_active = False
@@ -47,6 +47,7 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY", "dummy_key")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://default.example.com/webhook")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "dummy_solana_key")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "dummy_twitter_token")
+BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "3F24ENAM4DHUTN3PFCRDWAIY53T1XACS22")
 QUICKNODE_BSC_URL = os.getenv("QUICKNODE_BSC_URL", "https://smart-necessary-ensemble.bsc.quiknode.pro/aeb370bcf4299bc365bbbd3d14d19a31f6e46f06/")
 QUICKNODE_ETH_URL = os.getenv("QUICKNODE_ETH_URL", "https://side-cold-diamond.quiknode.pro/698f06abfe4282fc22edbab42297cf468d78070f/")
 QUICKNODE_SOL_URL = os.getenv("QUICKNODE_SOL_URL", "https://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/")
@@ -102,7 +103,6 @@ TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5
 
 def initialize_bot():
     global w3_bsc, w3_eth, solana_keypair
-    # BSC
     try:
         w3_bsc = Web3(Web3.HTTPProvider(QUICKNODE_BSC_URL))
         w3_bsc.middleware_onion.inject(geth_poa_middleware, layer=0)
@@ -116,7 +116,6 @@ def initialize_bot():
         bot.send_message(chat_id_global, f"⚠️ Erreur connexion BSC: {str(e)}")
         w3_bsc = None
 
-    # Ethereum
     try:
         w3_eth = Web3(Web3.HTTPProvider(QUICKNODE_ETH_URL))
         if w3_eth.is_connected():
@@ -129,7 +128,6 @@ def initialize_bot():
         bot.send_message(chat_id_global, f"⚠️ Erreur connexion Ethereum: {str(e)}")
         w3_eth = None
 
-    # Solana
     try:
         solana_keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
         logger.info("Clé Solana initialisée")
@@ -164,7 +162,7 @@ def validate_address(token_address, chain):
 def get_token_data(token_address, chain):
     for attempt in range(5):
         try:
-            response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=10)
+            response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=5)
             response.raise_for_status()
             data = response.json()['pairs'][0] if response.json()['pairs'] else {}
             if not data or data.get('chainId') != chain:
@@ -188,7 +186,7 @@ def get_token_data(token_address, chain):
         except Exception as e:
             logger.error(f"Erreur DexScreener {token_address}, tentative {attempt + 1}/5: {str(e)}")
             if attempt < 4:
-                time.sleep(2 ** attempt)
+                time.sleep(0.5 ** attempt)
             else:
                 logger.error(f"DexScreener échec définitif pour {token_address}")
                 return None
@@ -211,7 +209,7 @@ def snipe_new_pairs_bsc(chat_id):
                     'address': PANCAKE_FACTORY_ADDRESS
                 })
                 for log in logs:
-                    if log['topics'][0].hex() == w3_bsc.sha3(text="PairCreated(address,address,address,uint256)").hex():
+                    if log['topics'][0].hex() == Web3.keccak(text="PairCreated(address,address,address,uint256)").hex():
                         token0 = w3_bsc.to_checksum_address(log['data'][2:66][-40:])
                         token1 = w3_bsc.to_checksum_address(log['data'][66:130][-40:])
                         token_address = token0 if token0 != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1
@@ -222,7 +220,7 @@ def snipe_new_pairs_bsc(chat_id):
             time.sleep(0.1)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur sniping BSC: {str(e)}")
-            time.sleep(5)
+            time.sleep(2)
 
 def snipe_new_pairs_eth(chat_id):
     global w3_eth
@@ -242,10 +240,10 @@ def snipe_new_pairs_eth(chat_id):
                     'address': UNISWAP_FACTORY_ADDRESS
                 })
                 for log in logs:
-                    if log['topics'][0].hex() == w3_eth.sha3(text="PairCreated(address,address,address,uint256)").hex():
+                    if log['topics'][0].hex() == Web3.keccak(text="PairCreated(address,address,address,uint256)").hex():
                         token0 = w3_eth.to_checksum_address(log['data'][2:66][-40:])
                         token1 = w3_eth.to_checksum_address(log['data'][66:130][-40:])
-                        token_address = token0 if token0 != "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" else token1  # WETH
+                        token_address = token0 if token0 != "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" else token1
                         if token_address not in portfolio and (token_address not in rejected_tokens or (time.time() - rejected_tokens[token_address]) / 3600 > 12):
                             bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Ethereum - Uniswap)')
                             validate_and_trade(chat_id, token_address, 'eth')
@@ -253,6 +251,39 @@ def snipe_new_pairs_eth(chat_id):
             time.sleep(0.1)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur sniping Ethereum: {str(e)}")
+            time.sleep(2)
+
+def snipe_4meme_bsc_with_bscscan(chat_id):
+    last_timestamp = int(time.time()) - 600  # Dernières 10 minutes
+    while trade_active:
+        try:
+            if w3_bsc is None or not w3_bsc.is_connected():
+                initialize_bot()
+            if not w3_bsc or not w3_bsc.is_connected():
+                bot.send_message(chat_id, "⚠️ BSC non connecté, sniping 4Meme désactivé")
+                return
+
+            response = session.get(
+                f"https://api.bscscan.com/api?module=account&action=tokentx&sort=desc&apikey={BSCSCAN_API_KEY}&startblock=0&endblock=99999999",
+                timeout=5
+            )
+            response.raise_for_status()
+            txs = response.json().get('result', [])
+            
+            for tx in txs:
+                timestamp = int(tx['timeStamp'])
+                if timestamp <= last_timestamp:
+                    continue
+                token_address = tx['contractAddress']
+                if validate_address(token_address, 'bsc') and token_address not in portfolio and (token_address not in rejected_tokens or (time.time() - rejected_tokens[token_address]) / 3600 > 12):
+                    data = get_token_data(token_address, 'bsc')
+                    if data and data['volume_24h'] < 1000 and data['liquidity'] >= MIN_LIQUIDITY and data['market_cap'] < 50000:
+                        bot.send_message(chat_id, f'🎯 Snipe détecté via BscScan : {token_address} (BSC - 4Meme probable)')
+                        validate_and_trade(chat_id, token_address, 'bsc')
+            last_timestamp = int(time.time())
+            time.sleep(1)  # Polling toutes les secondes pour maximiser les détections
+        except Exception as e:
+            bot.send_message(chat_id, f"⚠️ Erreur sniping 4Meme via BscScan: {str(e)}")
             time.sleep(5)
 
 def snipe_solana_pools(chat_id):
@@ -260,11 +291,10 @@ def snipe_solana_pools(chat_id):
     last_signature_pump = None
     while trade_active:
         try:
-            # Raydium
             response = session.post(QUICKNODE_SOL_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
                 "params": [str(RAYDIUM_PROGRAM_ID), {"limit": 10}]
-            }, timeout=1)
+            }, timeout=0.5)
             signatures = response.json().get('result', [])
             for sig in signatures:
                 if last_signature_raydium and sig['signature'] == last_signature_raydium:
@@ -272,7 +302,7 @@ def snipe_solana_pools(chat_id):
                 tx = session.post(QUICKNODE_SOL_URL, json={
                     "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
                     "params": [sig['signature'], {"encoding": "jsonParsed"}]
-                }, timeout=1).json()
+                }, timeout=0.5).json()
                 if 'result' in tx and tx['result']:
                     for account in tx['result']['transaction']['message']['accountKeys']:
                         token_address = account['pubkey']
@@ -282,11 +312,10 @@ def snipe_solana_pools(chat_id):
             if signatures:
                 last_signature_raydium = signatures[0]['signature']
 
-            # Pump.fun
             response = session.post(QUICKNODE_SOL_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
                 "params": [str(PUMP_FUN_PROGRAM_ID), {"limit": 10}]
-            }, timeout=1)
+            }, timeout=0.5)
             signatures = response.json().get('result', [])
             for sig in signatures:
                 if last_signature_pump and sig['signature'] == last_signature_pump:
@@ -294,7 +323,7 @@ def snipe_solana_pools(chat_id):
                 tx = session.post(QUICKNODE_SOL_URL, json={
                     "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
                     "params": [sig['signature'], {"encoding": "jsonParsed"}]
-                }, timeout=1).json()
+                }, timeout=0.5).json()
                 if 'result' in tx and tx['result']:
                     for account in tx['result']['transaction']['message']['accountKeys']:
                         token_address = account['pubkey']
@@ -306,35 +335,37 @@ def snipe_solana_pools(chat_id):
             time.sleep(0.1)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur sniping Solana: {str(e)}")
-            time.sleep(5)
+            time.sleep(2)
 
-def monitor_twitter(chat_id):
-    global twitter_requests_remaining, twitter_last_reset, last_twitter_call
+def monitor_x(chat_id):
+    global x_requests_remaining, x_last_reset, last_x_call
     while trade_active:
         try:
             current_time = time.time()
-            if current_time - twitter_last_reset >= 900:
-                twitter_requests_remaining = 450
-                twitter_last_reset = current_time
-                bot.send_message(chat_id, "ℹ️ Quota Twitter réinitialisé : 450 requêtes restantes")
+            if current_time - x_last_reset >= 86400:  # Reset quotidien (24h)
+                x_requests_remaining = 100
+                x_last_reset = current_time
+                bot.send_message(chat_id, "ℹ️ Quota X réinitialisé : 100 requêtes restantes")
 
-            if twitter_requests_remaining <= 0:
-                wait_time = 900 - (current_time - twitter_last_reset) + 1
-                bot.send_message(chat_id, f"⏳ Twitter en attente : {int(wait_time)}s avant réinitialisation")
+            if x_requests_remaining <= 0:
+                wait_time = 86400 - (current_time - x_last_reset) + 1
+                bot.send_message(chat_id, f"⏳ X en attente : {int(wait_time)}s avant réinitialisation")
                 time.sleep(wait_time)
                 continue
 
-            if current_time - last_twitter_call < 900:
-                time.sleep(900 - (current_time - last_twitter_call))
+            if current_time - last_x_call < 900:  # 15 minutes = 900 secondes
+                time.sleep(900 - (current_time - last_x_call))
                 continue
 
             response = session.get(
-                "https://api.twitter.com/2/tweets/search/recent?query=\"contract address\" OR CA OR launch OR pump -is:retweet&max_results=100&expansions=author_id&user.fields=public_metrics",
-                headers=TWITTER_HEADERS, timeout=5
+                "https://api.twitter.com/2/tweets/search/recent",
+                headers=TWITTER_HEADERS,
+                params={"query": "\"contract address\" OR CA OR launch OR pump -is:retweet", "max_results": 100, "expansions": "author_id", "user.fields": "public_metrics"},
+                timeout=5
             )
             response.raise_for_status()
-            twitter_requests_remaining -= 1
-            last_twitter_call = current_time
+            x_requests_remaining -= 1
+            last_x_call = current_time
             data = response.json()
             tweets = data.get('data', [])
             users = {u['id']: u for u in data.get('includes', {}).get('users', [])}
@@ -350,11 +381,11 @@ def monitor_twitter(chat_id):
                         if validate_address(word, chain) and word not in portfolio:
                             if word in rejected_tokens and (time.time() - rejected_tokens[word]) / 3600 < 12:
                                 continue
-                            bot.send_message(chat_id, f'🔍 Token détecté via Twitter (@{user["username"]}, {followers} abonnés): {word} ({chain})')
+                            bot.send_message(chat_id, f'🔍 Token détecté via X (@{user["username"]}, {followers} abonnés): {word} ({chain})')
                             validate_and_trade(chat_id, word, chain)
         except Exception as e:
-            bot.send_message(chat_id, f"⚠️ Erreur Twitter: {str(e)}")
-            time.sleep(60)
+            bot.send_message(chat_id, f"⚠️ Erreur X: {str(e)}")
+            time.sleep(900)  # Retry après 15 minutes en cas d’erreur
 
 def validate_and_trade(chat_id, token_address, chain):
     try:
@@ -414,21 +445,21 @@ def validate_and_trade(chat_id, token_address, chain):
             rejected_tokens[token_address] = time.time()
             return
 
-        exchange = 'PancakeSwap' if chain == 'bsc' else 'Uniswap' if chain == 'eth' else 'Raydium' if token_address in snipe_solana_pools.__code__.co_consts else 'Pump.fun'
-        bot.send_message(chat_id, f'✅ Token validé : {token_address} ({chain} - {exchange}) - Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
-        detected_tokens[token_address] = {
-            'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
-            'market_cap': market_cap, 'supply': market_cap / price if price > 0 else 0, 'price': price,
-            'buy_sell_ratio': buy_sell_ratio
-        }
-        if chain == 'bsc':
-            buy_token_bsc(chat_id, token_address, mise_depart_bsc)
-        elif chain == 'eth':
-            buy_token_eth(chat_id, token_address, mise_depart_eth)
-        else:
-            buy_token_solana(chat_id, token_address, mise_depart_sol)
-    except Exception as e:
-        bot.send_message(chat_id, f"⚠️ Erreur validation {token_address}: {str(e)}")
+                    exchange = 'PancakeSwap' if chain == 'bsc' and token_address in snipe_new_pairs_bsc.__code__.co_consts else '4Meme' if chain == 'bsc' else 'Uniswap' if chain == 'eth' else 'Raydium' if token_address in snipe_solana_pools.__code__.co_consts else 'Pump.fun'
+            bot.send_message(chat_id, f'✅ Token validé : {token_address} ({chain} - {exchange}) - Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
+            detected_tokens[token_address] = {
+                'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
+                'market_cap': market_cap, 'supply': market_cap / price if price > 0 else 0, 'price': price,
+                'buy_sell_ratio': buy_sell_ratio
+            }
+            if chain == 'bsc':
+                buy_token_bsc(chat_id, token_address, mise_depart_bsc)
+            elif chain == 'eth':
+                buy_token_eth(chat_id, token_address, mise_depart_eth)
+            else:
+                buy_token_solana(chat_id, token_address, mise_depart_sol)
+        except Exception as e:
+            bot.send_message(chat_id, f"⚠️ Erreur validation {token_address}: {str(e)}")
 
 def buy_token_bsc(chat_id, contract_address, amount):
     try:
@@ -459,9 +490,10 @@ def buy_token_bsc(chat_id, contract_address, amount):
                 'market_cap_at_buy': detected_tokens[contract_address]['market_cap'],
                 'current_market_cap': detected_tokens[contract_address]['market_cap'],
                 'price_history': [entry_price], 'highest_price': entry_price, 'profit': 0.0,
-                '_buy_time': time.time()
+                'buy_time': time.time()
             }
-            bot.send_message(chat_id, f'✅ Achat réussi : {amount} BNB de {contract_address} (PancakeSwap)')
+            exchange = 'PancakeSwap' if contract_address in snipe_new_pairs_bsc.__code__.co_consts else '4Meme'
+            bot.send_message(chat_id, f'✅ Achat réussi : {amount} BNB de {contract_address} ({exchange})')
             daily_trades['buys'].append({'token': contract_address, 'chain': 'bsc', 'amount': amount, 'timestamp': datetime.now().strftime('%H:%M:%S')})
     except Exception as e:
         bot.send_message(chat_id, f"⚠️ Échec achat BSC {contract_address}: {str(e)}")
@@ -477,7 +509,7 @@ def buy_token_eth(chat_id, contract_address, amount):
         amount_out_min = int(amount_in * 0.95)
         tx = router.functions.swapExactETHForTokens(
             amount_out_min,
-            [w3_eth.to_checksum_address('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'), w3_eth.to_checksum_address(contract_address)],  # WETH
+            [w3_eth.to_checksum_address('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'), w3_eth.to_checksum_address(contract_address)],
             w3_eth.to_checksum_address(WALLET_ADDRESS),
             int(time.time()) + 60
         ).build_transaction({
@@ -511,14 +543,14 @@ def buy_token_solana(chat_id, contract_address, amount):
         amount_in = int(amount * 10**9)
         response = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
-        }, timeout=1)
+        }, timeout=0.5)
         blockhash = response.json()['result']['value']['blockhash']
         tx = Transaction()
         tx.recent_blockhash = Pubkey.from_string(blockhash)
         instruction = Instruction(
-            program_id=RAYDIUM_PROGRAM_ID,
+            program_id=RAYDIUM_PROGRAM_ID if contract_address in snipe_solana_pools.__code__.co_consts else PUMP_FUN_PROGRAM_ID,
             accounts=[
-                                {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
+                {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
                 {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
                 {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
             ],
@@ -529,7 +561,7 @@ def buy_token_solana(chat_id, contract_address, amount):
         tx_hash = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
             "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
-        }, timeout=1).json()['result']
+        }, timeout=0.5).json()['result']
         bot.send_message(chat_id, f'⏳ Achat Solana {amount} SOL de {contract_address}, TX: {tx_hash}')
         entry_price = detected_tokens[contract_address]['price']
         portfolio[contract_address] = {
@@ -556,12 +588,12 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
             amount_out = int(amount * 10**9)
             response = session.post(QUICKNODE_SOL_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
-            }, timeout=1)
+            }, timeout=0.5)
             blockhash = response.json()['result']['value']['blockhash']
             tx = Transaction()
             tx.recent_blockhash = Pubkey.from_string(blockhash)
             instruction = Instruction(
-                program_id=RAYDIUM_PROGRAM_ID,
+                program_id=RAYDIUM_PROGRAM_ID if contract_address in snipe_solana_pools.__code__.co_consts else PUMP_FUN_PROGRAM_ID,
                 accounts=[
                     {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
                     {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
@@ -574,7 +606,7 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
             tx_hash = session.post(QUICKNODE_SOL_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
                 "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
-            }, timeout=1).json()['result']
+            }, timeout=0.5).json()['result']
             bot.send_message(chat_id, f'⏳ Vente Solana {amount} SOL de {contract_address}, TX: {tx_hash}')
             profit = (current_price - portfolio[contract_address]['entry_price']) * amount
             portfolio[contract_address]['profit'] += profit
@@ -654,7 +686,8 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
                     del portfolio[contract_address]
                 reinvest_amount = profit * profit_reinvestment_ratio
                 mise_depart_bsc += reinvest_amount
-                bot.send_message(chat_id, f'✅ Vente BSC réussie : {amount} BNB, Profit: {profit:.4f} BNB, Réinvesti: {reinvest_amount:.4f} BNB (PancakeSwap)')
+                exchange = 'PancakeSwap' if contract_address in snipe_new_pairs_bsc.__code__.co_consts else '4Meme'
+                bot.send_message(chat_id, f'✅ Vente BSC réussie : {amount} BNB, Profit: {profit:.4f} BNB, Réinvesti: {reinvest_amount:.4f} BNB ({exchange})')
                 daily_trades['sells'].append({'token': contract_address, 'chain': 'bsc', 'amount': amount, 'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')})
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Échec vente BSC {contract_address}: {str(e)}")
@@ -741,7 +774,7 @@ def get_solana_balance(chat_id):
             return 0
         response = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [str(solana_keypair.pubkey())]
-        }, timeout=1)
+        }, timeout=0.5)
         result = response.json().get('result', {})
         return result.get('value', 0) / 10**9
     except Exception as e:
@@ -876,8 +909,9 @@ def initialize_and_run_threads(chat_id):
         bot.send_message(chat_id, "▶️ Trading lancé avec succès!")
         threading.Thread(target=snipe_new_pairs_bsc, args=(chat_id,), daemon=True).start()
         threading.Thread(target=snipe_new_pairs_eth, args=(chat_id,), daemon=True).start()
+        threading.Thread(target=snipe_4meme_bsc_with_bscscan, args=(chat_id,), daemon=True).start()
         threading.Thread(target=snipe_solana_pools, args=(chat_id,), daemon=True).start()
-        threading.Thread(target=monitor_twitter, args=(chat_id,), daemon=True).start()
+        threading.Thread(target=monitor_x, args=(chat_id,), daemon=True).start()
         threading.Thread(target=monitor_and_sell, args=(chat_id,), daemon=True).start()
     except Exception as e:
         bot.send_message(chat_id, f"⚠️ Erreur initialisation: {str(e)}")
