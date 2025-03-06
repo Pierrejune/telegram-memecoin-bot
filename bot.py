@@ -445,7 +445,7 @@ def validate_and_trade(chat_id, token_address, chain):
             rejected_tokens[token_address] = time.time()
             return
 
-                    exchange = 'PancakeSwap' if chain == 'bsc' and token_address in snipe_new_pairs_bsc.__code__.co_consts else '4Meme' if chain == 'bsc' else 'Uniswap' if chain == 'eth' else 'Raydium' if token_address in snipe_solana_pools.__code__.co_consts else 'Pump.fun'
+            exchange = 'PancakeSwap' if chain == 'bsc' and token_address in snipe_new_pairs_bsc.__code__.co_consts else '4Meme' if chain == 'bsc' else 'Uniswap' if chain == 'eth' else 'Raydium' if token_address in snipe_solana_pools.__code__.co_consts else 'Pump.fun'
             bot.send_message(chat_id, f'✅ Token validé : {token_address} ({chain} - {exchange}) - Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
             detected_tokens[token_address] = {
                 'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
