@@ -259,55 +259,99 @@ def get_holder_distribution(token_address, chain):
         except Exception:
             return 100
     return 0
-
+    
 async def snipe_new_pairs_bsc(chat_id):
     while trade_active:
         tasks = []
         for node in BSC_NODES:
+            if node["url"] in failed_nodes and time.time() - failed_nodes[node["url"]] < 300:
+                continue
             if node["type"] == "ws":
                 tasks.append(snipe_bsc_node(chat_id, node["url"]))
-        await asyncio.gather(*tasks, return_exceptions=True)
+            else:
+                tasks.append(snipe_bsc_http(chat_id, node["url"]))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            bot.send_message(chat_id, "⚠️ Aucun nœud BSC disponible")
+            await asyncio.sleep(10)
 
 async def snipe_bsc_node(chat_id, node_url):
-    while trade_active:
+    retries = 0
+    while trade_active and retries < 5:
         try:
             w3_node = Web3(Web3.WebsocketProvider(node_url))
             w3_node.middleware_onion.inject(geth_poa_middleware, layer=0)
             if not w3_node.is_connected():
-                bot.send_message(chat_id, f"⚠️ BSC non connecté sur {node_url}")
-                await asyncio.sleep(5)
-                continue
+                raise Exception("WebSocket non connecté")
             factory = w3_node.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
             subscription_id = w3_node.eth.subscribe('logs', {'address': PANCAKE_FACTORY_ADDRESS})
             async with w3_node.ws as ws:
                 while trade_active:
-                    try:
-                        event = await ws.recv()
-                        if 'topics' in event and event['topics'][0].hex() == factory.events.PairCreated.signature:
-                            token0 = w3_node.to_checksum_address(event['data'][2:66][-40:])
-                            token1 = w3_node.to_checksum_address(event['data'][66:130][-40:])
-                            token_address = token0 if token0 != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1
-                            if token_address not in portfolio and (token_address not in rejected_tokens or (time.time() - rejected_tokens[token_address]) / 3600 > REJECT_EXPIRATION_HOURS):
-                                bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (BSC)')
-                                threading.Thread(target=validate_and_trade, args=(chat_id, token_address, 'bsc')).start()
-                    except Exception as e:
-                        bot.send_message(chat_id, f"⚠️ Erreur sniping BSC {node_url}: {str(e)}")
-                        await asyncio.sleep(1)
+                    event = await ws.recv()
+                    if 'topics' in event and event['topics'][0].hex() == factory.events.PairCreated.signature:
+                        token0 = w3_node.to_checksum_address(event['data'][2:66][-40:])
+                        token1 = w3_node.to_checksum_address(event['data'][66:130][-40:])
+                        token_address = token0 if token0 != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1
+                        if token_address not in portfolio and (token_address not in rejected_tokens or (time.time() - rejected_tokens[token_address]) / 3600 > REJECT_EXPIRATION_HOURS):
+                            bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (BSC)')
+                            threading.Thread(target=validate_and_trade, args=(chat_id, token_address, 'bsc')).start()
+            break
         except Exception as e:
+            retries += 1
             bot.send_message(chat_id, f"⚠️ Erreur connexion BSC {node_url}: {str(e)}")
+            failed_nodes[node_url] = time.time()
+            await asyncio.sleep(2 ** retries)  # Backoff exponentiel
+
+async def snipe_bsc_http(chat_id, node_url):
+    w3_node = Web3(Web3.HTTPProvider(node_url))
+    w3_node.middleware_onion.inject(geth_poa_middleware, layer=0)
+    last_block = w3_node.eth.block_number
+    while trade_active:
+        try:
+            if not w3_node.is_connected():
+                raise Exception("HTTP non connecté")
+            current_block = w3_node.eth.block_number
+            if current_block > last_block:
+                logs = w3_node.eth.get_logs({
+                    'fromBlock': last_block,
+                    'toBlock': current_block,
+                    'address': PANCAKE_FACTORY_ADDRESS
+                })
+                for log in logs:
+                    if log['topics'][0].hex() == w3_node.sha3(text="PairCreated(address,address,address,uint256)").hex():
+                        token0 = w3_node.to_checksum_address(log['data'][2:66][-40:])
+                        token1 = w3_node.to_checksum_address(log['data'][66:130][-40:])
+                        token_address = token0 if token0 != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1
+                        if token_address not in portfolio and (token_address not in rejected_tokens or (time.time() - rejected_tokens[token_address]) / 3600 > REJECT_EXPIRATION_HOURS):
+                            bot.send_message(chat_id, f'🎯 Snipe détecté (HTTP) : {token_address} (BSC)')
+                            threading.Thread(target=validate_and_trade, args=(chat_id, token_address, 'bsc')).start()
+                last_block = current_block
+            await asyncio.sleep(0.1)  # Polling rapide
+        except Exception as e:
+            bot.send_message(chat_id, f"⚠️ Erreur HTTP BSC {node_url}: {str(e)}")
             await asyncio.sleep(5)
 
 async def snipe_solana_pools(chat_id):
     while trade_active:
         tasks = []
         for node in SOLANA_NODES:
+            if node["url"] in failed_nodes and time.time() - failed_nodes[node["url"]] < 300:
+                continue
             if node["type"] == "ws":
                 tasks.append(snipe_solana_node(chat_id, node["url"], RAYDIUM_PROGRAM_ID))
-                tasks.append(snipe_solana_node(chat_id, node["url"], PUMP_FUN_PROGRAM_ID))  # Pump.fun
-        await asyncio.gather(*tasks, return_exceptions=True)
+                tasks.append(snipe_solana_node(chat_id, node["url"], PUMP_FUN_PROGRAM_ID))
+            else:
+                tasks.append(snipe_solana_http(chat_id, node["url"]))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            bot.send_message(chat_id, "⚠️ Aucun nœud Solana disponible")
+            await asyncio.sleep(10)
 
 async def snipe_solana_node(chat_id, node_url, program_id):
-    while trade_active:
+    retries = 0
+    while trade_active and retries < 5:
         try:
             async with websockets.connect(node_url, ping_interval=20, ping_timeout=20) as ws:
                 subscription_msg = {
@@ -318,24 +362,52 @@ async def snipe_solana_node(chat_id, node_url, program_id):
                 }
                 await ws.send(json.dumps(subscription_msg))
                 while trade_active:
-                    try:
-                        msg = await ws.recv()
-                        data = json.loads(msg)
-                        if 'result' in data and 'value' in data['result'] and 'account' in data['result']['value']:
-                            account_data = data['result']['value']['account']['data']
-                            if isinstance(account_data, list) and account_data[1] == "base64":
-                                decoded = base58.b58decode(account_data[0]).decode('utf-8', errors='ignore')
-                                match = re.search(r'[A-Za-z0-9]{32,44}', decoded)
-                                if match:
-                                    token_address = match.group(0)
-                                    if validate_address(token_address, 'solana') and token_address not in portfolio:
-                                        bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Solana - {program_id})')
-                                        threading.Thread(target=validate_and_trade, args=(chat_id, token_address, 'solana')).start()
-                    except Exception as e:
-                        bot.send_message(chat_id, f"⚠️ Erreur sniping Solana {node_url}: {str(e)}")
-                        await asyncio.sleep(1)
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    if 'result' in data and 'value' in data['result'] and 'account' in data['result']['value']:
+                        account_data = data['result']['value']['account']['data']
+                        if isinstance(account_data, list) and account_data[1] == "base64":
+                            decoded = base58.b58decode(account_data[0]).decode('utf-8', errors='ignore')
+                            match = re.search(r'[A-Za-z0-9]{32,44}', decoded)
+                            if match:
+                                token_address = match.group(0)
+                                if validate_address(token_address, 'solana') and token_address not in portfolio:
+                                    bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Solana - {program_id})')
+                                    threading.Thread(target=validate_and_trade, args=(chat_id, token_address, 'solana')).start()
+            break
         except Exception as e:
+            retries += 1
             bot.send_message(chat_id, f"⚠️ Erreur connexion Solana {node_url}: {str(e)}")
+            failed_nodes[node_url] = time.time()
+            await asyncio.sleep(2 ** retries)
+
+async def snipe_solana_http(chat_id, node_url):
+    last_signature = None
+    while trade_active:
+        try:
+            response = session.post(node_url, json={
+                "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+                "params": [str(RAYDIUM_PROGRAM_ID), {"limit": 10}]
+            }, timeout=1)
+            signatures = response.json().get('result', [])
+            for sig in signatures:
+                if last_signature and sig['signature'] == last_signature:
+                    break
+                tx = session.post(node_url, json={
+                    "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+                    "params": [sig['signature'], {"encoding": "jsonParsed"}]
+                }, timeout=1).json()
+                if 'result' in tx and tx['result']:
+                    for account in tx['result']['transaction']['message']['accountKeys']:
+                        token_address = account['pubkey']
+                        if validate_address(token_address, 'solana') and token_address not in portfolio:
+                            bot.send_message(chat_id, f'🎯 Snipe détecté (HTTP) : {token_address} (Solana)')
+                            threading.Thread(target=validate_and_trade, args=(chat_id, token_address, 'solana')).start()
+            if signatures:
+                last_signature = signatures[0]['signature']
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            bot.send_message(chat_id, f"⚠️ Erreur HTTP Solana {node_url}: {str(e)}")
             await asyncio.sleep(5)
 
 def monitor_twitter(chat_id):
@@ -349,11 +421,13 @@ def monitor_twitter(chat_id):
                 bot.send_message(chat_id, "ℹ️ Quota Twitter réinitialisé : 450 requêtes restantes")
 
             if twitter_requests_remaining <= 10:
-                time.sleep(900 - (current_time - twitter_last_reset) + 1)
+                wait_time = 900 - (current_time - twitter_last_reset) + 1
+                bot.send_message(chat_id, f"⏳ Twitter en attente : {int(wait_time)}s avant réinitialisation")
+                time.sleep(wait_time)
                 continue
 
             response = session.get(
-                "https://api.twitter.com/2/tweets/search/recent?query=\"contract address\" OR CA OR launch OR pump -is:retweet&max_results=100&expansions=author_id&user.fields=public_metrics",
+                "https://api.twitter.com/2/tweets/search/recent?query=\"contract address\" OR CA OR launch OR pump -is:retweet&max_results=10&expansions=author_id&user.fields=public_metrics",
                 headers=TWITTER_HEADERS, timeout=5
             )
             response.raise_for_status()
@@ -366,7 +440,7 @@ def monitor_twitter(chat_id):
             for tweet in tweets:
                 user = users.get(tweet['author_id'])
                 followers = user.get('public_metrics', {}).get('followers_count', 0) if user else 0
-                if followers >= 1000:  # Réduit pour plus de détections
+                if followers >= 1000:
                     text = tweet['text'].lower()
                     words = text.split()
                     hype_score = followers / 1000 + len([w for w in words if w in ["pump", "launch", "moon"]])
@@ -377,7 +451,7 @@ def monitor_twitter(chat_id):
                                 continue
                             bot.send_message(chat_id, f'🔍 Token détecté via Twitter (@{user["username"]}, {followers} abonnés, hype: {hype_score:.1f}): {word} ({chain})')
                             threading.Thread(target=validate_and_trade, args=(chat_id, word, chain, hype_score)).start()
-            time.sleep(900)
+            time.sleep(2)  # Réduit à 2s pour ~450 requêtes/15 min
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur Twitter: {str(e)}")
             time.sleep(60)
