@@ -13,6 +13,7 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import Transaction
 from solders.instruction import Instruction
+from solders.system_program import TransferParams, transfer
 import threading
 from datetime import datetime
 import re
@@ -39,25 +40,18 @@ trade_active = False
 portfolio = {}
 detected_tokens = {}
 
+# Variables d’environnement
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "default_token")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "0x0")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "dummy_key")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://default.example.com/webhook")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "dummy_solana_key")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "dummy_twitter_token")
-QUICKNODE_URL = os.getenv("QUICKNODE_URL", "https://your-quicknode-endpoint")  # Ajoutez votre URL QuickNode ici
+QUICKNODE_BSC_URL = os.getenv("QUICKNODE_BSC_URL", "https://smart-necessary-ensemble.bsc.quiknode.pro/aeb370bcf4299bc365bbbd3d14d19a31f6e46f06/")
+QUICKNODE_ETH_URL = os.getenv("QUICKNODE_ETH_URL", "https://side-cold-diamond.quiknode.pro/698f06abfe4282fc22edbab42297cf468d78070f/")
+QUICKNODE_SOL_URL = os.getenv("QUICKNODE_SOL_URL", "https://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/")
 PORT = int(os.getenv("PORT", 8080))
 
-BSC_NODES = [
-    "https://bsc-dataseed1.binance.org/",
-    "https://bsc-dataseed2.binance.org/",
-    "https://bsc-dataseed3.binance.org/",
-    "https://bsc-dataseed4.binance.org/",
-    "https://bsc-dataseed1.ninicoin.io/",
-    "https://bsc-dataseed1.defibit.io/"
-]
-SOLANA_NODES = ["https://api.mainnet-beta.solana.com", "https://solana-api.projectserum.com"]
-ETH_NODES = [QUICKNODE_URL]  # Utilise QuickNode pour Ethereum
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
 app = Flask(__name__)
@@ -67,9 +61,10 @@ w3_bsc = None
 w3_eth = None
 solana_keypair = None
 
+# Paramètres de trading
 mise_depart_bsc = 0.02
 mise_depart_sol = 0.37
-mise_depart_eth = 0.05  # Nouvelle mise pour Ethereum
+mise_depart_eth = 0.05
 gas_fee = 10
 stop_loss_threshold = 15
 trailing_stop_percentage = 5
@@ -77,27 +72,28 @@ take_profit_steps = [1.5, 2, 5]
 max_positions = 5
 profit_reinvestment_ratio = 0.7
 
-MIN_VOLUME_SOL = 0
+MIN_VOLUME_SOL = 100
 MAX_VOLUME_SOL = 2000000
-MIN_VOLUME_BSC = 0
+MIN_VOLUME_BSC = 100
 MAX_VOLUME_BSC = 2000000
-MIN_VOLUME_ETH = 0
+MIN_VOLUME_ETH = 100
 MAX_VOLUME_ETH = 2000000
-MIN_LIQUIDITY = 100
-MIN_MARKET_CAP_SOL = 500
+MIN_LIQUIDITY = 10000
+MIN_MARKET_CAP_SOL = 1000
 MAX_MARKET_CAP_SOL = 3000000
-MIN_MARKET_CAP_BSC = 500
+MIN_MARKET_CAP_BSC = 1000
 MAX_MARKET_CAP_BSC = 3000000
-MIN_MARKET_CAP_ETH = 500
+MIN_MARKET_CAP_ETH = 1000
 MAX_MARKET_CAP_ETH = 3000000
-MIN_BUY_SELL_RATIO = 0.5
+MIN_BUY_SELL_RATIO = 0.8
 MAX_TOKEN_AGE_HOURS = 12
 
+# Constantes des exchanges
 ERC20_ABI = json.loads('[{"constant": true, "inputs": [], "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "payable": false, "stateMutability": "view", "type": "function"}]')
 PANCAKE_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 PANCAKE_FACTORY_ADDRESS = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
-UNISWAP_ROUTER_ADDRESS = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"  # Uniswap V2 Router
-UNISWAP_FACTORY_ADDRESS = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"  # Uniswap V2 Factory
+UNISWAP_ROUTER_ADDRESS = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
+UNISWAP_FACTORY_ADDRESS = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
 PANCAKE_ROUTER_ABI = json.loads('[{"inputs": [{"internalType": "uint256", "name": "amountIn", "type": "uint256"}, {"internalType": "uint256", "name": "amountOutMin", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactETHForTokens", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "payable", "type": "function"}, {"inputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}, {"internalType": "uint256", "name": "amountInMax", "type": "uint256"}, {"internalType": "address[]", "name": "path", "type": "address[]"}, {"internalType": "address", "name": "to", "type": "address"}, {"internalType": "uint256", "name": "deadline", "type": "uint256"}], "name": "swapExactTokensForETH", "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}], "stateMutability": "nonpayable", "type": "function"}]')
 PANCAKE_FACTORY_ABI = json.loads('[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token0","type":"address"},{"indexed":true,"internalType":"address","name":"token1","type":"address"},{"indexed":false,"internalType":"address","name":"pair","type":"address"},{"indexed":false,"internalType":"uint256","name":"","type":"uint256"}],"name":"PairCreated","type":"event"}]')
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
@@ -107,26 +103,24 @@ TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5
 def initialize_bot():
     global w3_bsc, w3_eth, solana_keypair
     # BSC
-    for node in BSC_NODES:
-        try:
-            w3_bsc = Web3(Web3.HTTPProvider(node))
-            w3_bsc.middleware_onion.inject(geth_poa_middleware, layer=0)
-            if w3_bsc.is_connected():
-                logger.info(f"Connexion BSC réussie via {node}")
-                bot.send_message(chat_id_global, f"✅ Connexion BSC établie : {node}")
-                break
-        except Exception as e:
-            logger.error(f"Erreur connexion BSC {node}: {str(e)}")
-            bot.send_message(chat_id_global, f"⚠️ Erreur connexion BSC {node}: {str(e)}")
-    if not w3_bsc or not w3_bsc.is_connected():
-        w3_bsc = None
-        bot.send_message(chat_id_global, "⚠️ Aucun nœud BSC fonctionnel")
-
-    # Ethereum via QuickNode
     try:
-        w3_eth = Web3(Web3.HTTPProvider(QUICKNODE_URL))
+        w3_bsc = Web3(Web3.HTTPProvider(QUICKNODE_BSC_URL))
+        w3_bsc.middleware_onion.inject(geth_poa_middleware, layer=0)
+        if w3_bsc.is_connected():
+            logger.info("Connexion BSC réussie via QuickNode")
+            bot.send_message(chat_id_global, "✅ Connexion BSC établie : QuickNode")
+        else:
+            raise Exception("Échec de connexion")
+    except Exception as e:
+        logger.error(f"Erreur connexion BSC: {str(e)}")
+        bot.send_message(chat_id_global, f"⚠️ Erreur connexion BSC: {str(e)}")
+        w3_bsc = None
+
+    # Ethereum
+    try:
+        w3_eth = Web3(Web3.HTTPProvider(QUICKNODE_ETH_URL))
         if w3_eth.is_connected():
-            logger.info(f"Connexion Ethereum réussie via QuickNode")
+            logger.info("Connexion Ethereum réussie via QuickNode")
             bot.send_message(chat_id_global, "✅ Connexion Ethereum établie : QuickNode")
         else:
             raise Exception("Échec de connexion")
@@ -137,7 +131,7 @@ def initialize_bot():
 
     # Solana
     try:
-        solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
+        solana_keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
         logger.info("Clé Solana initialisée")
         bot.send_message(chat_id_global, "✅ Clé Solana initialisée")
     except Exception as e:
@@ -170,10 +164,12 @@ def validate_address(token_address, chain):
 def get_token_data(token_address, chain):
     for attempt in range(5):
         try:
-            response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=5)
+            response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=10)
+            response.raise_for_status()
             data = response.json()['pairs'][0] if response.json()['pairs'] else {}
             if not data or data.get('chainId') != chain:
-                return {'volume_24h': 0, 'liquidity': 0, 'market_cap': 0, 'price': 0, 'buy_sell_ratio': 1, 'pair_created_at': time.time()}
+                logger.warning(f"DexScreener: Pas de données pour {token_address} sur {chain}")
+                return None
             
             volume_24h = float(data.get('volume', {}).get('h24', 0))
             liquidity = float(data.get('liquidity', {}).get('usd', 0))
@@ -184,17 +180,18 @@ def get_token_data(token_address, chain):
             buy_sell_ratio = buy_count_5m / max(sell_count_5m, 1)
             pair_created_at = data.get('pairCreatedAt', 0) / 1000 if data.get('pairCreatedAt') else time.time() - 3600
             
+            logger.info(f"DexScreener OK: {token_address} - Vol: ${volume_24h}, Liq: ${liquidity}, MC: ${market_cap}")
             return {
                 'volume_24h': volume_24h, 'liquidity': liquidity, 'market_cap': market_cap,
                 'price': price, 'buy_sell_ratio': buy_sell_ratio, 'pair_created_at': pair_created_at
             }
         except Exception as e:
-            bot.send_message(chat_id_global, f"⚠️ Erreur DexScreener {token_address}: {str(e)}")
+            logger.error(f"Erreur DexScreener {token_address}, tentative {attempt + 1}/5: {str(e)}")
             if attempt < 4:
-                time.sleep(2 ** attempt)  # Backoff exponentiel
+                time.sleep(2 ** attempt)
             else:
-                # Fallback : accepter volume 0 pour nouveaux tokens
-                return {'volume_24h': 0, 'liquidity': 0, 'market_cap': 0, 'price': 0, 'buy_sell_ratio': 1, 'pair_created_at': time.time()}
+                logger.error(f"DexScreener échec définitif pour {token_address}")
+                return None
 
 def snipe_new_pairs_bsc(chat_id):
     global w3_bsc
@@ -204,7 +201,6 @@ def snipe_new_pairs_bsc(chat_id):
         bot.send_message(chat_id, "⚠️ BSC non connecté, sniping désactivé")
         return
     last_block = w3_bsc.eth.block_number - 10
-    node_index = 0
     while trade_active:
         try:
             current_block = w3_bsc.eth.block_number
@@ -220,14 +216,12 @@ def snipe_new_pairs_bsc(chat_id):
                         token1 = w3_bsc.to_checksum_address(log['data'][66:130][-40:])
                         token_address = token0 if token0 != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1
                         if token_address not in portfolio and (token_address not in rejected_tokens or (time.time() - rejected_tokens[token_address]) / 3600 > 12):
-                            bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (BSC)')
+                            bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (BSC - PancakeSwap)')
                             validate_and_trade(chat_id, token_address, 'bsc')
                 last_block = current_block
-            time.sleep(0.1)  # Polling rapide pour ne rien rater
+            time.sleep(0.1)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur sniping BSC: {str(e)}")
-            node_index = (node_index + 1) % len(BSC_NODES)
-            w3_bsc = Web3(Web3.HTTPProvider(BSC_NODES[node_index]))
             time.sleep(5)
 
 def snipe_new_pairs_eth(chat_id):
@@ -253,7 +247,7 @@ def snipe_new_pairs_eth(chat_id):
                         token1 = w3_eth.to_checksum_address(log['data'][66:130][-40:])
                         token_address = token0 if token0 != "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" else token1  # WETH
                         if token_address not in portfolio and (token_address not in rejected_tokens or (time.time() - rejected_tokens[token_address]) / 3600 > 12):
-                            bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Ethereum)')
+                            bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Ethereum - Uniswap)')
                             validate_and_trade(chat_id, token_address, 'eth')
                 last_block = current_block
             time.sleep(0.1)
@@ -264,12 +258,10 @@ def snipe_new_pairs_eth(chat_id):
 def snipe_solana_pools(chat_id):
     last_signature_raydium = None
     last_signature_pump = None
-    node_index = 0
     while trade_active:
-        node = SOLANA_NODES[node_index % len(SOLANA_NODES)]
         try:
             # Raydium
-            response = session.post(node, json={
+            response = session.post(QUICKNODE_SOL_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
                 "params": [str(RAYDIUM_PROGRAM_ID), {"limit": 10}]
             }, timeout=1)
@@ -277,21 +269,21 @@ def snipe_solana_pools(chat_id):
             for sig in signatures:
                 if last_signature_raydium and sig['signature'] == last_signature_raydium:
                     break
-                tx = session.post(node, json={
+                tx = session.post(QUICKNODE_SOL_URL, json={
                     "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
                     "params": [sig['signature'], {"encoding": "jsonParsed"}]
                 }, timeout=1).json()
                 if 'result' in tx and tx['result']:
                     for account in tx['result']['transaction']['message']['accountKeys']:
                         token_address = account['pubkey']
-                        if validate_address(token_address, 'solana') and token_address not in portfolio:
+                        if validate_address(token_address, 'solana') and token_address not in [str(RAYDIUM_PROGRAM_ID), str(TOKEN_PROGRAM_ID), "ComputeBudget111111111111111111111111111111"] and token_address not in portfolio:
                             bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Solana - Raydium)')
                             validate_and_trade(chat_id, token_address, 'solana')
             if signatures:
                 last_signature_raydium = signatures[0]['signature']
 
             # Pump.fun
-            response = session.post(node, json={
+            response = session.post(QUICKNODE_SOL_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
                 "params": [str(PUMP_FUN_PROGRAM_ID), {"limit": 10}]
             }, timeout=1)
@@ -299,22 +291,21 @@ def snipe_solana_pools(chat_id):
             for sig in signatures:
                 if last_signature_pump and sig['signature'] == last_signature_pump:
                     break
-                tx = session.post(node, json={
+                tx = session.post(QUICKNODE_SOL_URL, json={
                     "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
                     "params": [sig['signature'], {"encoding": "jsonParsed"}]
                 }, timeout=1).json()
                 if 'result' in tx and tx['result']:
                     for account in tx['result']['transaction']['message']['accountKeys']:
                         token_address = account['pubkey']
-                        if validate_address(token_address, 'solana') and token_address not in portfolio:
+                        if validate_address(token_address, 'solana') and token_address not in [str(PUMP_FUN_PROGRAM_ID), str(TOKEN_PROGRAM_ID), "ComputeBudget111111111111111111111111111111"] and token_address not in portfolio:
                             bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Solana - Pump.fun)')
                             validate_and_trade(chat_id, token_address, 'solana')
             if signatures:
                 last_signature_pump = signatures[0]['signature']
             time.sleep(0.1)
         except Exception as e:
-            bot.send_message(chat_id, f"⚠️ Erreur sniping Solana {node}: {str(e)}")
-            node_index = (node_index + 1) % len(SOLANA_NODES)
+            bot.send_message(chat_id, f"⚠️ Erreur sniping Solana: {str(e)}")
             time.sleep(5)
 
 def monitor_twitter(chat_id):
@@ -367,7 +358,17 @@ def monitor_twitter(chat_id):
 
 def validate_and_trade(chat_id, token_address, chain):
     try:
+        if chain == 'solana' and token_address in [str(TOKEN_PROGRAM_ID), str(RAYDIUM_PROGRAM_ID), str(PUMP_FUN_PROGRAM_ID), "ComputeBudget111111111111111111111111111111"]:
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Programme système détecté')
+            rejected_tokens[token_address] = time.time()
+            return
+
         data = get_token_data(token_address, chain)
+        if data is None:
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Échec récupération données DexScreener')
+            rejected_tokens[token_address] = time.time()
+            return
+
         volume_24h = data['volume_24h']
         liquidity = data['liquidity']
         market_cap = data['market_cap']
@@ -388,24 +389,33 @@ def validate_and_trade(chat_id, token_address, chain):
             bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Âge {age_hours:.2f}h > {MAX_TOKEN_AGE_HOURS}h')
             rejected_tokens[token_address] = time.time()
             return
-        if liquidity < MIN_LIQUIDITY and liquidity > 0:
+        if liquidity < MIN_LIQUIDITY:
             bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Liquidité ${liquidity:.2f} < ${MIN_LIQUIDITY}')
+            rejected_tokens[token_address] = time.time()
+            return
+        if volume_24h < min_volume:
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Volume ${volume_24h:.2f} < ${min_volume}')
             rejected_tokens[token_address] = time.time()
             return
         if volume_24h > max_volume:
             bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Volume ${volume_24h:.2f} > ${max_volume}')
             rejected_tokens[token_address] = time.time()
             return
+        if market_cap < min_market_cap:
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Market Cap ${market_cap:.2f} < ${min_market_cap}')
+            rejected_tokens[token_address] = time.time()
+            return
         if market_cap > max_market_cap:
             bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Market Cap ${market_cap:.2f} > ${max_market_cap}')
             rejected_tokens[token_address] = time.time()
             return
-        if buy_sell_ratio < MIN_BUY_SELL_RATIO and age_hours > 0.5:  # Tolérance pour nouveaux tokens
+        if buy_sell_ratio < MIN_BUY_SELL_RATIO and age_hours > 0.5:
             bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Ratio A/V {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO}')
             rejected_tokens[token_address] = time.time()
             return
 
-        bot.send_message(chat_id, f'✅ Token validé : {token_address} ({chain}) - Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
+        exchange = 'PancakeSwap' if chain == 'bsc' else 'Uniswap' if chain == 'eth' else 'Raydium' if token_address in snipe_solana_pools.__code__.co_consts else 'Pump.fun'
+        bot.send_message(chat_id, f'✅ Token validé : {token_address} ({chain} - {exchange}) - Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
         detected_tokens[token_address] = {
             'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
             'market_cap': market_cap, 'supply': market_cap / price if price > 0 else 0, 'price': price,
@@ -449,9 +459,9 @@ def buy_token_bsc(chat_id, contract_address, amount):
                 'market_cap_at_buy': detected_tokens[contract_address]['market_cap'],
                 'current_market_cap': detected_tokens[contract_address]['market_cap'],
                 'price_history': [entry_price], 'highest_price': entry_price, 'profit': 0.0,
-                'buy_time': time.time()
+                '_buy_time': time.time()
             }
-            bot.send_message(chat_id, f'✅ Achat réussi : {amount} BNB de {contract_address}')
+            bot.send_message(chat_id, f'✅ Achat réussi : {amount} BNB de {contract_address} (PancakeSwap)')
             daily_trades['buys'].append({'token': contract_address, 'chain': 'bsc', 'amount': amount, 'timestamp': datetime.now().strftime('%H:%M:%S')})
     except Exception as e:
         bot.send_message(chat_id, f"⚠️ Échec achat BSC {contract_address}: {str(e)}")
@@ -462,7 +472,7 @@ def buy_token_eth(chat_id, contract_address, amount):
             initialize_bot()
             if not w3_eth.is_connected():
                 raise Exception("Ethereum non connecté")
-        router = w3_eth.eth.contract(address=UNISWAP_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)  # Même ABI que PancakeSwap
+        router = w3_eth.eth.contract(address=UNISWAP_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
         amount_in = w3_eth.to_wei(amount, 'ether')
         amount_out_min = int(amount_in * 0.95)
         tx = router.functions.swapExactETHForTokens(
@@ -487,7 +497,7 @@ def buy_token_eth(chat_id, contract_address, amount):
                 'price_history': [entry_price], 'highest_price': entry_price, 'profit': 0.0,
                 'buy_time': time.time()
             }
-            bot.send_message(chat_id, f'✅ Achat réussi : {amount} ETH de {contract_address}')
+            bot.send_message(chat_id, f'✅ Achat réussi : {amount} ETH de {contract_address} (Uniswap)')
             daily_trades['buys'].append({'token': contract_address, 'chain': 'eth', 'amount': amount, 'timestamp': datetime.now().strftime('%H:%M:%S')})
     except Exception as e:
         bot.send_message(chat_id, f"⚠️ Échec achat Ethereum {contract_address}: {str(e)}")
@@ -498,17 +508,17 @@ def buy_token_solana(chat_id, contract_address, amount):
             initialize_bot()
             if not solana_keypair:
                 raise Exception("Solana non initialisé")
-        node = SOLANA_NODES[0]
         amount_in = int(amount * 10**9)
-        response = session.post(node, json={
+        response = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
         }, timeout=1)
         blockhash = response.json()['result']['value']['blockhash']
-        tx = Transaction.from_recent_blockhash(Pubkey.from_string(blockhash))
+        tx = Transaction()
+        tx.recent_blockhash = Pubkey.from_string(blockhash)
         instruction = Instruction(
             program_id=RAYDIUM_PROGRAM_ID,
             accounts=[
-                {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
+                                {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
                 {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
                 {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
             ],
@@ -516,7 +526,7 @@ def buy_token_solana(chat_id, contract_address, amount):
         )
         tx.add(instruction)
         tx.sign([solana_keypair])
-        tx_hash = session.post(node, json={
+        tx_hash = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
             "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
         }, timeout=1).json()['result']
@@ -529,7 +539,8 @@ def buy_token_solana(chat_id, contract_address, amount):
             'price_history': [entry_price], 'highest_price': entry_price, 'profit': 0.0,
             'buy_time': time.time()
         }
-        bot.send_message(chat_id, f'✅ Achat réussi : {amount} SOL de {contract_address}')
+        exchange = 'Raydium' if contract_address in snipe_solana_pools.__code__.co_consts else 'Pump.fun'
+        bot.send_message(chat_id, f'✅ Achat réussi : {amount} SOL de {contract_address} ({exchange})')
         daily_trades['buys'].append({'token': contract_address, 'chain': 'solana', 'amount': amount, 'timestamp': datetime.now().strftime('%H:%M:%S')})
     except Exception as e:
         bot.send_message(chat_id, f"⚠️ Échec achat Solana {contract_address}: {str(e)}")
@@ -542,13 +553,13 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
                 initialize_bot()
                 if not solana_keypair:
                     raise Exception("Solana non initialisé")
-            node = SOLANA_NODES[0]
             amount_out = int(amount * 10**9)
-            response = session.post(node, json={
+            response = session.post(QUICKNODE_SOL_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
             }, timeout=1)
             blockhash = response.json()['result']['value']['blockhash']
-            tx = Transaction.from_recent_blockhash(Pubkey.from_string(blockhash))
+            tx = Transaction()
+            tx.recent_blockhash = Pubkey.from_string(blockhash)
             instruction = Instruction(
                 program_id=RAYDIUM_PROGRAM_ID,
                 accounts=[
@@ -560,7 +571,7 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
             )
             tx.add(instruction)
             tx.sign([solana_keypair])
-            tx_hash = session.post(node, json={
+            tx_hash = session.post(QUICKNODE_SOL_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
                 "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
             }, timeout=1).json()['result']
@@ -572,7 +583,8 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
                 del portfolio[contract_address]
             reinvest_amount = profit * profit_reinvestment_ratio
             mise_depart_sol += reinvest_amount
-            bot.send_message(chat_id, f'✅ Vente Solana réussie : {amount} SOL, Profit: {profit:.4f} SOL, Réinvesti: {reinvest_amount:.4f} SOL')
+            exchange = 'Raydium' if contract_address in snipe_solana_pools.__code__.co_consts else 'Pump.fun'
+            bot.send_message(chat_id, f'✅ Vente Solana réussie : {amount} SOL, Profit: {profit:.4f} SOL, Réinvesti: {reinvest_amount:.4f} SOL ({exchange})')
             daily_trades['sells'].append({'token': contract_address, 'chain': 'solana', 'amount': amount, 'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')})
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Échec vente Solana {contract_address}: {str(e)}")
@@ -607,7 +619,7 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
                     del portfolio[contract_address]
                 reinvest_amount = profit * profit_reinvestment_ratio
                 mise_depart_eth += reinvest_amount
-                bot.send_message(chat_id, f'✅ Vente Ethereum réussie : {amount} ETH, Profit: {profit:.4f} ETH, Réinvesti: {reinvest_amount:.4f} ETH')
+                bot.send_message(chat_id, f'✅ Vente Ethereum réussie : {amount} ETH, Profit: {profit:.4f} ETH, Réinvesti: {reinvest_amount:.4f} ETH (Uniswap)')
                 daily_trades['sells'].append({'token': contract_address, 'chain': 'eth', 'amount': amount, 'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')})
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Échec vente Ethereum {contract_address}: {str(e)}")
@@ -642,7 +654,7 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
                     del portfolio[contract_address]
                 reinvest_amount = profit * profit_reinvestment_ratio
                 mise_depart_bsc += reinvest_amount
-                bot.send_message(chat_id, f'✅ Vente BSC réussie : {amount} BNB, Profit: {profit:.4f} BNB, Réinvesti: {reinvest_amount:.4f} BNB')
+                bot.send_message(chat_id, f'✅ Vente BSC réussie : {amount} BNB, Profit: {profit:.4f} BNB, Réinvesti: {reinvest_amount:.4f} BNB (PancakeSwap)')
                 daily_trades['sells'].append({'token': contract_address, 'chain': 'bsc', 'amount': amount, 'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')})
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Échec vente BSC {contract_address}: {str(e)}")
@@ -727,7 +739,7 @@ def get_solana_balance(chat_id):
             initialize_bot()
         if not solana_keypair:
             return 0
-        response = session.post(SOLANA_NODES[0], json={
+        response = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [str(solana_keypair.pubkey())]
         }, timeout=1)
         result = response.json().get('result', {})
