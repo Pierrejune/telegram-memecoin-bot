@@ -91,22 +91,22 @@ def initialize_bot():
             w3.middleware_onion.inject(geth_poa_middleware, layer=0)
             if w3.is_connected():
                 logger.info(f"Connexion BSC réussie via {node}")
-                bot.send_message(chat_id=chat_id_global, f"✅ Connexion BSC établie : {node}")
+                bot.send_message(chat_id_global, f"✅ Connexion BSC établie : {node}")  # Corrigé : chat_id en positionnel
                 break
         except Exception as e:
             logger.error(f"Erreur connexion BSC {node}: {str(e)}")
-            bot.send_message(chat_id=chat_id_global, f"⚠️ Erreur connexion BSC {node}: {str(e)}")
+            bot.send_message(chat_id_global, f"⚠️ Erreur connexion BSC {node}: {str(e)}")
     if not w3 or not w3.is_connected():
         w3 = None
-        bot.send_message(chat_id=chat_id_global, "⚠️ Aucun nœud BSC fonctionnel")
+        bot.send_message(chat_id_global, "⚠️ Aucun nœud BSC fonctionnel")
 
     try:
         solana_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
         logger.info("Clé Solana initialisée")
-        bot.send_message(chat_id=chat_id_global, "✅ Clé Solana initialisée")
+        bot.send_message(chat_id_global, "✅ Clé Solana initialisée")
     except Exception as e:
         logger.error(f"Erreur initialisation Solana: {str(e)}")
-        bot.send_message(chat_id=chat_id_global, f"⚠️ Erreur initialisation Solana: {str(e)}")
+        bot.send_message(chat_id_global, f"⚠️ Erreur initialisation Solana: {str(e)}")
         solana_keypair = None
 
 def set_webhook():
@@ -152,7 +152,7 @@ def get_token_data(token_address, chain):
             'price': price, 'buy_sell_ratio': buy_sell_ratio, 'pair_created_at': pair_created_at
         }
     except Exception as e:
-        bot.send_message(chat_id=chat_id_global, f"⚠️ Erreur DexScreener {token_address}: {str(e)}")
+        bot.send_message(chat_id_global, f"⚠️ Erreur DexScreener {token_address}: {str(e)}")
         return {'volume_24h': 0, 'liquidity': 0, 'market_cap': 0, 'price': 0, 'buy_sell_ratio': 0, 'pair_created_at': time.time()}
 
 def snipe_new_pairs_bsc(chat_id):
