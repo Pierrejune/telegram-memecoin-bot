@@ -1145,10 +1145,27 @@ def webhook():
         return 'OK', 200
     return abort(403)
 
+start_lock = threading.Lock()
+last_start_time = 0
+
 @bot.message_handler(commands=['start'])
 def start_message(message):
-    queue_message(message.chat.id, "✅ Bot démarré!")
-    asyncio.run(show_main_menu(message.chat.id))
+    global last_start_time
+    chat_id = message.chat.id
+    current_time = time.time()
+    with start_lock:
+        if current_time - last_start_time < 1:  # Limiter à 1 appel par seconde
+            return
+        last_start_time = current_time
+        queue_message(chat_id, "✅ Bot démarré!")
+        # Exécuter show_main_menu dans un thread avec sa propre boucle asyncio
+        threading.Thread(target=run_task_in_thread, args=(show_main_menu, chat_id), daemon=True).start()
+
+@bot.message_handler(commands=['menu'])
+def menu_message(message):
+    chat_id = message.chat.id
+    # Exécuter show_main_menu dans un thread avec sa propre boucle asyncio
+    threading.Thread(target=run_task_in_thread, args=(show_main_menu, chat_id), daemon=True).start()
 
 async def show_main_menu(chat_id):
     markup = InlineKeyboardMarkup()
@@ -1191,9 +1208,9 @@ def callback_query(call):
             trade_active = False
             queue_message(chat_id, "⏹️ Trading arrêté.")
         elif call.data == "portfolio":
-            asyncio.run(show_portfolio(chat_id))
+            threading.Thread(target=run_task_in_thread, args=(show_portfolio, chat_id), daemon=True).start()
         elif call.data == "daily_summary":
-            asyncio.run(show_daily_summary(chat_id))
+            threading.Thread(target=run_task_in_thread, args=(show_daily_summary, chat_id), daemon=True).start()
         elif call.data == "adjust_mise_bsc":
             queue_message(chat_id, "Entrez la nouvelle mise BSC (en BNB, ex. : 0.02) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_mise_bsc)
@@ -1211,10 +1228,10 @@ def callback_query(call):
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_take_profit)
         elif call.data.startswith("sell_"):
             token = call.data.split("_")[1]
-            asyncio.run(sell_token_immediate(chat_id, token))
+            threading.Thread(target=run_task_in_thread, args=(sell_token_immediate, chat_id), daemon=True).start()
         elif call.data.startswith("sell_pct_"):
             _, token, pct = call.data.split("_")
-            asyncio.run(sell_token_percentage(chat_id, token, float(pct)))
+            threading.Thread(target=run_task_in_thread, args=(sell_token_percentage, (chat_id, token, float(pct))), daemon=True).start()
     except Exception as e:
         queue_message(chat_id, f"⚠️ Erreur générale: {str(e)}")
         logger.error(f"Erreur callback: {str(e)}")
