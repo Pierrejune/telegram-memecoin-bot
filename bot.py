@@ -9,12 +9,8 @@ import base58
 from flask import Flask, request, abort
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.transaction import Transaction
-from solders.instruction import Instruction
 import threading
 import asyncio
-from datetime import datetime
-import re
 from waitress import serve
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -36,19 +32,11 @@ session.mount("https://", adapter)
 # File d’attente pour Telegram
 message_queue = Queue()
 message_lock = threading.Lock()
-start_lock = threading.Lock()
-last_start_time = 0
-last_twitter_request_time = 0
 
 # Variables globales
-daily_trades = {'buys': [], 'sells': []}
-rejected_tokens = {}
 trade_active = False
-portfolio = {}
-detected_tokens = {}
-BLACKLISTED_TOKENS = {"So11111111111111111111111111111111111111112"}
-pause_auto_sell = False
 chat_id_global = None
+stop_event = threading.Event()  # Signal d’arrêt pour les threads
 active_threads = []
 
 # Variables d’environnement
@@ -56,9 +44,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "5be903b581bc47d29bbfb5ab859de2eb")
-TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "AAAAAAAAAAAAAAAAAAAAAD6%2BzQEAAAAAaDN4Thznh7iGRdfqEhebMgWtohs%3DyuaSpNWBCnPcQv5gjERphqmZTIclzPiVqqnirPmdZt4fpRd96D")
-QUICKNODE_SOL_URL = "https://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/"
 QUICKNODE_SOL_WS_URL = "wss://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/"
 PORT = int(os.getenv("PORT", 8080))
 
@@ -67,27 +52,9 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 
 solana_keypair = None
 
-# Paramètres de trading (inchangés)
-mise_depart_sol = 0.37
-stop_loss_threshold = 15
-trailing_stop_percentage = 5
-take_profit_steps = [1.2, 2, 10, 100, 500]
-max_positions = 5
-profit_reinvestment_ratio = 0.9
-slippage_max = 0.05
-MIN_VOLUME_SOL = 100
-MAX_VOLUME_SOL = 2000000
-MIN_LIQUIDITY = 5000
-MIN_MARKET_CAP_SOL = 1000
-MAX_MARKET_CAP_SOL = 5000000
-MIN_BUY_SELL_RATIO = 1.5
-MAX_TOKEN_AGE_HOURS = 6
-MIN_SOCIAL_MENTIONS = 5
-
-# Constantes Solana (inchangées)
+# Constantes Solana
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 PUMP_FUN_PROGRAM_ID = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfH43SboMiMEWCPkDPk")
-TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
 def send_message_worker():
     while True:
@@ -138,6 +105,89 @@ def set_webhook():
         queue_message(chat_id_global, f"⚠️ Erreur webhook: `{str(e)}`")
         return False
 
+def validate_address(token_address):
+    try:
+        Pubkey.from_string(token_address)
+        return len(token_address) >= 32 and len(token_address) <= 44
+    except ValueError:
+        return False
+
+@backoff.on_exception(backoff.expo, Exception, max_tries=5)
+async def snipe_solana_pools(chat_id):
+    while not stop_event.is_set():
+        if not solana_keypair:
+            initialize_bot(chat_id)
+            if not solana_keypair:
+                await asyncio.sleep(30)
+                continue
+        try:
+            async with websockets.connect(QUICKNODE_SOL_WS_URL, ping_interval=10, ping_timeout=20) as ws:
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": 1, "method": "programSubscribe",
+                    "params": [str(RAYDIUM_PROGRAM_ID), {"encoding": "base64"}]
+                }))
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": 2, "method": "programSubscribe",
+                    "params": [str(PUMP_FUN_PROGRAM_ID), {"encoding": "base64"}]
+                }))
+                queue_message(chat_id, "🔄 Sniping Solana actif (Raydium/Pump.fun)")
+                logger.info("Sniping Solana démarré")
+                while not stop_event.is_set():
+                    try:
+                        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+                        if 'params' not in msg or 'result' not in msg:
+                            continue
+                        data = msg['params']['result']['value']['account']['data'][0]
+                        pubkey = msg['params']['result']['pubkey']
+                        logger.info(f"Données WebSocket reçues: {data[:100]}... (pubkey: {pubkey})")
+                        potential_addresses = [addr for addr in data.split() if validate_address(addr) and addr not in BLACKLISTED_TOKENS]
+                        for token_address in potential_addresses:
+                            queue_message(chat_id, f"🎯 Token détecté : `{token_address}` (Solana)")
+                            logger.info(f"Token détecté: {token_address}")
+                    except Exception as e:
+                        logger.error(f"Erreur sniping Solana WebSocket: {str(e)}")
+                    await asyncio.sleep(0.1)
+        except Exception as e:
+            queue_message(chat_id, f"⚠️ Erreur sniping Solana: `{str(e)}`")
+            logger.error(f"Erreur sniping Solana connexion: {str(e)}")
+            await asyncio.sleep(5)
+
+def run_task_in_thread(task, *args):
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(task(*args))
+        loop.close()
+    except Exception as e:
+        logger.error(f"Erreur dans thread {task.__name__}: {str(e)}")
+        queue_message(args[0], f"⚠️ Erreur thread `{task.__name__}`: `{str(e)}`")
+
+def initialize_and_run_threads(chat_id):
+    global trade_active, chat_id_global, active_threads
+    chat_id_global = chat_id
+    try:
+        initialize_bot(chat_id)
+        if solana_keypair:
+            trade_active = True
+            stop_event.clear()  # Réinitialiser l’événement d’arrêt
+            queue_message(chat_id, "▶️ Trading Solana lancé avec succès!")
+            logger.info("Trading démarré")
+            tasks = [snipe_solana_pools]  # Temporairement une seule tâche pour tester
+            active_threads = []
+            for task in tasks:
+                thread = threading.Thread(target=run_task_in_thread, args=(task, chat_id), daemon=True)
+                thread.start()
+                active_threads.append(thread)
+                logger.info(f"Tâche {task.__name__} lancée")
+        else:
+            queue_message(chat_id, "⚠️ Échec initialisation : Solana non connecté")
+            logger.error("Échec initialisation: Solana manquant")
+            trade_active = False
+    except Exception as e:
+        queue_message(chat_id, f"⚠️ Erreur initialisation: `{str(e)}`")
+        logger.error(f"Erreur initialisation: {str(e)}")
+        trade_active = False
+
 @app.route("/webhook", methods=['POST'])
 def webhook():
     if request.method == "POST" and request.headers.get("content-type") == "application/json":
@@ -156,28 +206,22 @@ def webhook():
 
 @bot.message_handler(commands=['start', 'Start', 'START'])
 def start_message(message):
-    global trade_active, last_start_time
+    global trade_active
     chat_id = message.chat.id
-    current_time = time.time()
-    with start_lock:
-        if current_time - last_start_time < 1:
-            queue_message(chat_id, "⚠️ Attendez 1 seconde avant de redémarrer!")
-            return
-        last_start_time = current_time
-        logger.info(f"Commande /start reçue de {chat_id}")
-        queue_message(chat_id, "✅ Bot démarré!")
-        if not trade_active:
-            initialize_and_run_threads(chat_id)
-        else:
-            queue_message(chat_id, "ℹ️ Trading déjà actif!")
-        asyncio.run_coroutine_threadsafe(show_main_menu(chat_id), asyncio.get_event_loop())
+    logger.info(f"Commande /start reçue de {chat_id}")
+    queue_message(chat_id, "✅ Bot démarré!")
+    if not trade_active:
+        initialize_and_run_threads(chat_id)
+    else:
+        queue_message(chat_id, "ℹ️ Trading déjà actif!")
+    show_main_menu(chat_id)  # Appel synchrone
 
 @bot.message_handler(commands=['menu', 'Menu', 'MENU'])
 def menu_message(message):
     chat_id = message.chat.id
     logger.info(f"Commande /menu reçue de {chat_id}")
     queue_message(chat_id, "ℹ️ Affichage du menu...")
-    asyncio.run_coroutine_threadsafe(show_main_menu(chat_id), asyncio.get_event_loop())
+    show_main_menu(chat_id)  # Appel synchrone
 
 @bot.message_handler(commands=['stop', 'Stop', 'STOP'])
 def stop_message(message):
@@ -186,9 +230,11 @@ def stop_message(message):
     logger.info(f"Commande /stop reçue de {chat_id}")
     if trade_active:
         trade_active = False
+        stop_event.set()  # Signal d’arrêt pour tous les threads
         for thread in active_threads:
             if thread.is_alive():
-                logger.info(f"Arrêt du thread {thread.name}")
+                logger.info(f"Attente arrêt du thread {thread.name}")
+                thread.join(timeout=2)  # Attendre max 2s
         active_threads = []
         while not message_queue.empty():
             message_queue.get()
@@ -196,53 +242,21 @@ def stop_message(message):
         logger.info("Trading arrêté, threads réinitialisés")
     else:
         queue_message(chat_id, "ℹ️ Trading déjà arrêté!")
-    asyncio.run_coroutine_threadsafe(show_main_menu(chat_id), asyncio.get_event_loop())
+    show_main_menu(chat_id)  # Appel synchrone
 
-async def show_main_menu(chat_id):
-    markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton("ℹ️ Statut", callback_data="status"),
-        InlineKeyboardButton("▶️ Lancer", callback_data="launch"),
-        InlineKeyboardButton("⏹️ Arrêter", callback_data="stop"),
-        InlineKeyboardButton("💰 Portefeuille", callback_data="portfolio"),
-        InlineKeyboardButton("📅 Récapitulatif", callback_data="daily_summary")
-    )
-    markup.add(
-        InlineKeyboardButton("🔧 Ajuster Mise SOL", callback_data="adjust_mise_sol"),
-        InlineKeyboardButton("📉 Ajuster Stop-Loss", callback_data="adjust_stop_loss")
-    )
-    markup.add(
-        InlineKeyboardButton("📈 Ajuster Take-Profit", callback_data="adjust_take_profit"),
-        InlineKeyboardButton("🔄 Ajuster Réinvestissement", callback_data="adjust_reinvestment")
-    )
-    queue_message(chat_id, "*Menu principal:*", reply_markup=markup)
-
-def initialize_and_run_threads(chat_id):
-    global trade_active, chat_id_global, active_threads
-    chat_id_global = chat_id
+def show_main_menu(chat_id):
     try:
-        initialize_bot(chat_id)
-        if solana_keypair:
-            trade_active = True
-            queue_message(chat_id, "▶️ Trading Solana lancé avec succès!")
-            logger.info("Trading démarré")
-            tasks = [snipe_solana_pools, detect_dexscreener, detect_birdeye, monitor_and_sell]
-            active_threads = []
-            for task in tasks:
-                thread = threading.Thread(target=run_task_in_thread, args=(task, chat_id), daemon=True)
-                thread.start()
-                active_threads.append(thread)
-                logger.info(f"Tâche {task.__name__} lancée")
-        else:
-            queue_message(chat_id, "⚠️ Échec initialisation : Solana non connecté")
-            logger.error("Échec initialisation: Solana manquant")
-            trade_active = False
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("ℹ️ Statut", callback_data="status"),
+            InlineKeyboardButton("▶️ Lancer", callback_data="launch"),
+            InlineKeyboardButton("⏹️ Arrêter", callback_data="stop")
+        )
+        queue_message(chat_id, "*Menu principal:*", reply_markup=markup)
+        logger.info(f"Menu affiché pour {chat_id}")
     except Exception as e:
-        queue_message(chat_id, f"⚠️ Erreur initialisation: `{str(e)}`")
-        logger.error(f"Erreur initialisation: {str(e)}")
-        trade_active = False
-
-# ... (autres fonctions inchangées pour l'instant)
+        queue_message(chat_id, f"⚠️ Erreur affichage menu: `{str(e)}`")
+        logger.error(f"Erreur affichage menu: {str(e)}")
 
 if __name__ == "__main__":
     if not all([TELEGRAM_TOKEN, WALLET_ADDRESS, SOLANA_PRIVATE_KEY, WEBHOOK_URL]):
