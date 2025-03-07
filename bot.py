@@ -18,7 +18,6 @@ import re
 from waitress import serve
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from telethon import TelegramClient, events
 from concurrent.futures import ThreadPoolExecutor
 import backoff
 import websockets
@@ -58,15 +57,12 @@ SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "dummy_solana_key")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://default.example.com/webhook")
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "5be903b581bc47d29bbfb5ab859de2eb")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "AAAAAAAAAAAAAAAAAAAAAD6%2BzQEAAAAAaDN4Thznh7iGRdfqEhebMgWtohs%3DyuaSpNWBCnPcQv5gjERphqmZTIclzPiVqqnirPmdZt4fpRd96D")
-TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "your_telegram_api_id")
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "your_telegram_api_hash")
 QUICKNODE_SOL_URL = "https://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/"
 QUICKNODE_SOL_WS_URL = "wss://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/"
 PORT = int(os.getenv("PORT", 8080))
 
 app = Flask(__name__)
 bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
-telegram_client = TelegramClient('session_name', TELEGRAM_API_ID, TELEGRAM_API_HASH) if TELEGRAM_API_ID and TELEGRAM_API_HASH else None
 
 solana_keypair = None
 
@@ -182,7 +178,7 @@ def get_token_data(token_address):
             'liquidity': data.get('liquidity', 0),
             'market_cap': data.get('mc', 0),
             'price': data.get('price', 0),
-            'buy_sell_ratio': 1,  # Approximation si non disponible
+            'buy_sell_ratio': 1,
             'pair_created_at': data.get('created_at', time.time()) / 1000
         }
     except Exception as e:
@@ -256,9 +252,9 @@ def check_dump_risk(token_address):
                 "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
                 "params": [tx['signature'], {"encoding": "jsonParsed"}]
             }).json()
-            if 'sell' in str(tx_details).lower():  # Simplification, à affiner
-                total_sold += 1  # Approximation
-        if total_sold > 5:  # Plus de 5 ventes récentes
+            if 'sell' in str(tx_details).lower():
+                total_sold += 1
+        if total_sold > 5:
             return False
         return True
     except Exception as e:
@@ -335,54 +331,6 @@ async def detect_birdeye(chat_id):
             queue_message(chat_id, f"⚠️ Erreur Birdeye: {str(e)}")
             logger.error(f"Erreur Birdeye: {str(e)}")
             await asyncio.sleep(10)
-
-@backoff.on_exception(backoff.expo, Exception, max_tries=5)
-async def detect_pump_fun(chat_id):
-    while trade_active:
-        try:
-            response = session.get("https://api.pump.fun/v1/tokens/recent", timeout=10)  # API hypothétique, à valider
-            response.raise_for_status()
-            tokens = response.json().get('tokens', [])
-            for token in tokens:
-                token_address = token.get('address')
-                age_hours = (time.time() - token.get('created_at', time.time()) / 1000) / 3600
-                if not token_address or age_hours > MAX_TOKEN_AGE_HOURS or token_address in BLACKLISTED_TOKENS or token_address in portfolio:
-                    continue
-                queue_message(chat_id, f'🔍 Détection Pump.fun : {token_address} (Solana)')
-                logger.info(f"Détection Pump.fun: {token_address}")
-                await validate_and_trade(chat_id, token_address)
-            await asyncio.sleep(5)
-        except Exception as e:
-            queue_message(chat_id, f"⚠️ Erreur Pump.fun: {str(e)}")
-            logger.error(f"Erreur Pump.fun: {str(e)}")
-            await asyncio.sleep(10)
-
-async def monitor_telegram(chat_id):
-    if not telegram_client:
-        queue_message(chat_id, "⚠️ Telegram API non configurée")
-        return
-    try:
-        await telegram_client.start()
-        queue_message(chat_id, "🔄 Monitoring Telegram actif")
-
-        @telegram_client.on(events.NewMessage)
-        async def handler(event):
-            text = event.message.text.lower()
-            message_time = event.message.date.timestamp()
-            if (time.time() - message_time) / 3600 > MAX_TOKEN_AGE_HOURS:
-                return
-            words = text.split()
-            for word in words:
-                if validate_address(word) and word not in BLACKLISTED_TOKENS and word not in portfolio:
-                    sender = await event.get_sender()
-                    if sender and hasattr(sender, 'participants_count') and sender.participants_count > 1000:
-                        queue_message(chat_id, f'🔍 Détection Telegram (@{sender.username}): {word} (Solana)')
-                        logger.info(f"Détection Telegram: {word}")
-                        await validate_and_trade(chat_id, word)
-        await telegram_client.run_until_disconnected()
-    except Exception as e:
-        queue_message(chat_id, f"⚠️ Erreur Telegram: {str(e)}")
-        logger.error(f"Erreur Telegram: {str(e)}")
 
 def calculate_buy_amount(liquidity):
     if liquidity < 10000:
@@ -758,8 +706,8 @@ def initialize_and_run_threads(chat_id):
             trade_active = True
             queue_message(chat_id, "▶️ Trading Solana lancé avec succès!")
             logger.info("Trading démarré")
-            tasks = [snipe_solana_pools, detect_birdeye, detect_pump_fun, monitor_telegram, monitor_and_sell]
-            with ThreadPoolExecutor(max_workers=5) as executor:
+            tasks = [snipe_solana_pools, detect_birdeye, monitor_and_sell]  # Pas de Pump.fun pour éviter crash
+            with ThreadPoolExecutor(max_workers=3) as executor:
                 for task in tasks:
                     executor.submit(run_task_in_thread, task, chat_id)
                     logger.info(f"Tâche {task.__name__} lancée")
@@ -798,6 +746,13 @@ def start_message(message):
 def menu_message(message):
     chat_id = message.chat.id
     threading.Thread(target=run_task_in_thread, args=(show_main_menu, chat_id), daemon=True).start()
+
+@bot.message_handler(commands=['stop'])
+def stop_message(message):
+    global trade_active
+    chat_id = message.chat.id
+    trade_active = False
+    queue_message(chat_id, "⏹️ Trading arrêté.")
 
 @bot.message_handler(commands=['pause'])
 def pause_auto_sell_handler(message):
