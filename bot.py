@@ -9,8 +9,11 @@ import base58
 from flask import Flask, request, abort
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
+from solders.transaction import Transaction
+from solders.instruction import Instruction
 import threading
 import asyncio
+from datetime import datetime
 from waitress import serve
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -34,9 +37,15 @@ message_queue = Queue()
 message_lock = threading.Lock()
 
 # Variables globales
+daily_trades = {'buys': [], 'sells': []}
+rejected_tokens = {}
 trade_active = False
+portfolio = {}
+detected_tokens = {}
+BLACKLISTED_TOKENS = {"So11111111111111111111111111111111111111112"}
+pause_auto_sell = False
 chat_id_global = None
-stop_event = threading.Event()  # Signal d’arrêt pour les threads
+stop_event = threading.Event()
 active_threads = []
 
 # Variables d’environnement
@@ -44,17 +53,36 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+QUICKNODE_SOL_URL = "https://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/"
 QUICKNODE_SOL_WS_URL = "wss://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/"
 PORT = int(os.getenv("PORT", 8080))
+
+# Paramètres de trading
+mise_depart_sol = 0.37
+stop_loss_threshold = 15
+trailing_stop_percentage = 5
+take_profit_steps = [1.2, 2, 10, 100, 500]
+max_positions = 5
+profit_reinvestment_ratio = 0.9
+slippage_max = 0.05
+MIN_VOLUME_SOL = 100
+MAX_VOLUME_SOL = 2000000
+MIN_LIQUIDITY = 5000
+MIN_MARKET_CAP_SOL = 1000
+MAX_MARKET_CAP_SOL = 5000000
+MIN_BUY_SELL_RATIO = 1.5
+MAX_TOKEN_AGE_HOURS = 6
+MIN_SOCIAL_MENTIONS = 5
+
+# Constantes Solana
+RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
+PUMP_FUN_PROGRAM_ID = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfH43SboMiMEWCPkDPk")
+TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
 app = Flask(__name__)
 bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 
 solana_keypair = None
-
-# Constantes Solana
-RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
-PUMP_FUN_PROGRAM_ID = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfH43SboMiMEWCPkDPk")
 
 def send_message_worker():
     while True:
@@ -96,7 +124,6 @@ def set_webhook():
         success = bot.set_webhook(url=WEBHOOK_URL)
         if success:
             logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
-            queue_message(chat_id_global, f"✅ Webhook configuré sur {WEBHOOK_URL}")
             return True
         else:
             raise Exception("Échec de la configuration du webhook")
@@ -111,6 +138,31 @@ def validate_address(token_address):
         return len(token_address) >= 32 and len(token_address) <= 44
     except ValueError:
         return False
+
+@backoff.on_exception(backoff.expo, Exception, max_tries=5)
+def get_token_data(token_address):
+    try:
+        response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=10)
+        response.raise_for_status()
+        pairs = response.json().get('pairs', [])
+        if not pairs or pairs[0].get('chainId') != 'solana':
+            return None
+        data = pairs[0]
+        age_hours = (time.time() - (data.get('pairCreatedAt', 0) / 1000)) / 3600 if data.get('pairCreatedAt') else 0
+        if age_hours > MAX_TOKEN_AGE_HOURS:
+            return None
+        return {
+            'volume_24h': float(data.get('volume', {}).get('h24', 0) or 0),
+            'liquidity': float(data.get('liquidity', {}).get('usd', 0) or 0),
+            'market_cap': float(data.get('marketCap', 0) or 0),
+            'price': float(data.get('priceUsd', 0) or 0),
+            'buy_sell_ratio': float(data.get('txns', {}).get('m5', {}).get('buys', 0) or 0) / max(float(data.get('txns', {}).get('m5', {}).get('sells', 0) or 1), 1),
+            'pair_created_at': data.get('pairCreatedAt', 0) / 1000 if data.get('pairCreatedAt') else time.time(),
+            'supply': float(data.get('marketCap', 0) or 0) / float(data.get('priceUsd', 0) or 1)
+        }
+    except Exception as e:
+        logger.error(f"Erreur DexScreener pour {token_address}: {str(e)}")
+        return None
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
 async def snipe_solana_pools(chat_id):
@@ -142,8 +194,11 @@ async def snipe_solana_pools(chat_id):
                         logger.info(f"Données WebSocket reçues: {data[:100]}... (pubkey: {pubkey})")
                         potential_addresses = [addr for addr in data.split() if validate_address(addr) and addr not in BLACKLISTED_TOKENS]
                         for token_address in potential_addresses:
-                            queue_message(chat_id, f"🎯 Token détecté : `{token_address}` (Solana)")
-                            logger.info(f"Token détecté: {token_address}")
+                            token_data = get_token_data(token_address)
+                            if token_data and validate_token(chat_id, token_address, token_data):
+                                queue_message(chat_id, f"🎯 Token détecté : `{token_address}` (Solana)")
+                                logger.info(f"Token détecté: {token_address}")
+                                await buy_token_solana(chat_id, token_address, mise_depart_sol)
                     except Exception as e:
                         logger.error(f"Erreur sniping Solana WebSocket: {str(e)}")
                     await asyncio.sleep(0.1)
@@ -151,6 +206,272 @@ async def snipe_solana_pools(chat_id):
             queue_message(chat_id, f"⚠️ Erreur sniping Solana: `{str(e)}`")
             logger.error(f"Erreur sniping Solana connexion: {str(e)}")
             await asyncio.sleep(5)
+
+def validate_token(chat_id, token_address, data):
+    try:
+        volume_24h = data.get('volume_24h', 0)
+        liquidity = data.get('liquidity', 0)
+        market_cap = data.get('market_cap', 0)
+        buy_sell_ratio = data.get('buy_sell_ratio', 1)
+        age_hours = (time.time() - data.get('pair_created_at', time.time())) / 3600
+
+        if len(portfolio) >= max_positions:
+            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Limite de {max_positions} positions atteinte")
+            return False
+        if age_hours > MAX_TOKEN_AGE_HOURS:
+            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Âge {age_hours:.2f}h > {MAX_TOKEN_AGE_HOURS}h")
+            return False
+        if liquidity < MIN_LIQUIDITY:
+            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Liquidité ${liquidity:.2f} < ${MIN_LIQUIDITY}")
+            return False
+        if volume_24h < MIN_VOLUME_SOL or volume_24h > MAX_VOLUME_SOL:
+            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Volume ${volume_24h:.2f} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]")
+            return False
+        if market_cap < MIN_MARKET_CAP_SOL or market_cap > MAX_MARKET_CAP_SOL:
+            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Market Cap ${market_cap:.2f} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]")
+            return False
+        if buy_sell_ratio < MIN_BUY_SELL_RATIO:
+            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Ratio A/V {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO}")
+            return False
+        return True
+    except Exception as e:
+        queue_message(chat_id, f"⚠️ Erreur validation `{token_address}`: `{str(e)}`")
+        return False
+
+async def buy_token_solana(chat_id, contract_address, amount):
+    try:
+        if not solana_keypair:
+            initialize_bot(chat_id)
+            if not solana_keypair:
+                raise Exception("Solana non initialisé")
+        amount_in = int(amount * 10**9)
+        response = session.post(QUICKNODE_SOL_URL, json={
+            "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
+            "params": [{"commitment": "finalized"}]
+        }, timeout=5)
+        blockhash = response.json()['result']['value']['blockhash']
+        tx = Transaction()
+        tx.recent_blockhash = Pubkey.from_string(blockhash)
+        instruction = Instruction(
+            program_id=RAYDIUM_PROGRAM_ID if 'Raydium' in contract_address else PUMP_FUN_PROGRAM_ID,
+            accounts=[
+                {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
+                {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
+                {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
+            ],
+            data=bytes([2]) + amount_in.to_bytes(8, 'little')
+        )
+        tx.add(instruction)
+        tx.sign([solana_keypair])
+        tx_hash = session.post(QUICKNODE_SOL_URL, json={
+            "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+            "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
+        }, timeout=5).json()['result']
+        queue_message(chat_id, f"✅ Achat réussi : {amount} SOL de `{contract_address}` (TX: `{tx_hash}`)")
+        entry_price = get_token_data(contract_address).get('price', 0)
+        portfolio[contract_address] = {
+            'amount': amount, 'chain': 'solana', 'entry_price': entry_price,
+            'price_history': [entry_price], 'highest_price': entry_price, 'profit': 0.0,
+            'buy_time': time.time()
+        }
+        daily_trades['buys'].append({'token': contract_address, 'amount': amount, 'timestamp': datetime.now().strftime('%H:%M:%S')})
+    except Exception as e:
+        queue_message(chat_id, f"⚠️ Échec achat Solana `{contract_address}`: `{str(e)}`")
+        logger.error(f"Échec achat Solana: {str(e)}")
+
+async def sell_token(chat_id, contract_address, amount, current_price):
+    global mise_depart_sol
+    try:
+        if not solana_keypair:
+            initialize_bot(chat_id)
+            if not solana_keypair:
+                raise Exception("Solana non initialisé")
+        amount_out = int(amount * 10**9)
+        response = session.post(QUICKNODE_SOL_URL, json={
+            "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
+            "params": [{"commitment": "finalized"}]
+        }, timeout=5)
+        blockhash = response.json()['result']['value']['blockhash']
+        tx = Transaction()
+        tx.recent_blockhash = Pubkey.from_string(blockhash)
+        instruction = Instruction(
+            program_id=RAYDIUM_PROGRAM_ID if 'Raydium' in contract_address else PUMP_FUN_PROGRAM_ID,
+            accounts=[
+                {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
+                {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
+                {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
+            ],
+            data=bytes([3]) + amount_out.to_bytes(8, 'little')
+        )
+        tx.add(instruction)
+        tx.sign([solana_keypair])
+        tx_hash = session.post(QUICKNODE_SOL_URL, json={
+            "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+            "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
+        }, timeout=5).json()['result']
+        profit = (current_price - portfolio[contract_address]['entry_price']) * amount
+        portfolio[contract_address]['profit'] += profit
+        portfolio[contract_address]['amount'] -= amount
+        reinvest_amount = profit * profit_reinvestment_ratio
+        mise_depart_sol += reinvest_amount
+        queue_message(chat_id, f"✅ Vente réussie : {amount} SOL, Profit: {profit:.4f} SOL (TX: `{tx_hash}`)")
+        daily_trades['sells'].append({'token': contract_address, 'amount': amount, 'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')})
+        if portfolio[contract_address]['amount'] <= 0:
+            del portfolio[contract_address]
+    except Exception as e:
+        queue_message(chat_id, f"⚠️ Échec vente Solana `{contract_address}`: `{str(e)}`")
+        logger.error(f"Échec vente Solana: {str(e)}")
+
+async def monitor_and_sell(chat_id):
+    while not stop_event.is_set():
+        try:
+            if not portfolio:
+                await asyncio.sleep(2)
+                continue
+            for contract_address, data in list(portfolio.items()):
+                amount = data['amount']
+                current_data = get_token_data(contract_address)
+                if not current_data:
+                    continue
+                current_price = current_data.get('price', 0)
+                data['price_history'].append(current_price)
+                if len(data['price_history']) > 10:
+                    data['price_history'].pop(0)
+                profit_pct = (current_price - data['entry_price']) / data['entry_price'] * 100 if data['entry_price'] > 0 else 0
+                loss_pct = -profit_pct if profit_pct < 0 else 0
+                data['highest_price'] = max(data['highest_price'], current_price)
+                trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
+
+                if not pause_auto_sell:
+                    if profit_pct >= take_profit_steps[4] * 100:
+                        await sell_token(chat_id, contract_address, amount * 0.5, current_price)
+                    elif profit_pct >= take_profit_steps[3] * 100:
+                        await sell_token(chat_id, contract_address, amount * 0.25, current_price)
+                    elif profit_pct >= take_profit_steps[2] * 100:
+                        await sell_token(chat_id, contract_address, amount * 0.2, current_price)
+                    elif profit_pct >= take_profit_steps[1] * 100:
+                        await sell_token(chat_id, contract_address, amount * 0.15, current_price)
+                    elif profit_pct >= take_profit_steps[0] * 100:
+                        await sell_token(chat_id, contract_address, amount * 0.1, current_price)
+                    elif current_price <= trailing_stop_price or loss_pct >= stop_loss_threshold:
+                        await sell_token(chat_id, contract_address, amount, current_price)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            queue_message(chat_id, f"⚠️ Erreur surveillance: `{str(e)}`")
+            logger.error(f"Erreur surveillance: {str(e)}")
+            await asyncio.sleep(5)
+
+async def show_portfolio(chat_id):
+    try:
+        sol_balance = await get_solana_balance(chat_id)
+        msg = f"💰 *Portefeuille:*\nSOL : {sol_balance:.4f}\n\n"
+        markup = InlineKeyboardMarkup()
+        for ca, data in portfolio.items():
+            current_price = get_token_data(ca).get('price', 0)
+            profit = (current_price - data['entry_price']) * data['amount']
+            markup.add(
+                InlineKeyboardButton(f"💸 Sell 25% {ca[:6]}", callback_data=f"sell_pct_{ca}_25"),
+                InlineKeyboardButton(f"💸 Sell 50% {ca[:6]}", callback_data=f"sell_pct_{ca}_50"),
+                InlineKeyboardButton(f"💸 Sell 100% {ca[:6]}", callback_data=f"sell_{ca}")
+            )
+            msg += (
+                f"*Token:* `{ca}` (Solana)\n"
+                f"Montant: {data['amount']:.4f} SOL\n"
+                f"Prix d’entrée: ${data['entry_price']:.6f}\n"
+                f"Prix actuel: ${current_price:.6f}\n"
+                f"Profit: {profit:.4f} SOL\n\n"
+            )
+        queue_message(chat_id, msg, reply_markup=markup if portfolio else None)
+    except Exception as e:
+        queue_message(chat_id, f"⚠️ Erreur portefeuille: `{str(e)}`")
+        logger.error(f"Erreur portefeuille: {str(e)}")
+
+async def get_solana_balance(chat_id):
+    try:
+        if not solana_keypair:
+            initialize_bot(chat_id)
+        if not solana_keypair:
+            return 0
+        response = session.post(QUICKNODE_SOL_URL, json={
+            "jsonrpc": "2.0", "id": 1, "method": "getBalance",
+            "params": [str(solana_keypair.pubkey())]
+        }, timeout=5)
+        return response.json().get('result', {}).get('value', 0) / 10**9
+    except Exception as e:
+        queue_message(chat_id, f"⚠️ Erreur solde Solana: `{str(e)}`")
+        return 0
+
+async def show_daily_summary(chat_id):
+    try:
+        msg = f"📅 *Récapitulatif du jour ({datetime.now().strftime('%Y-%m-%d')})*:\n\n"
+        msg += "📈 *Achats* :\n"
+        total_buys = 0
+        for trade in daily_trades['buys']:
+            total_buys += trade['amount']
+            msg += f"- `{trade['token']}` : {trade['amount']} SOL à {trade['timestamp']}\n"
+        msg += f"Total investi : {total_buys:.4f} SOL\n\n"
+        msg += "📉 *Ventes* :\n"
+        total_profit = 0
+        for trade in daily_trades['sells']:
+            total_profit += trade['pnl']
+            msg += f"- `{trade['token']}` : {trade['amount']} SOL à {trade['timestamp']}, PNL: {trade['pnl']:.4f} SOL\n"
+        msg += f"Profit net : {total_profit:.4f} SOL\n"
+        queue_message(chat_id, msg)
+    except Exception as e:
+        queue_message(chat_id, f"⚠️ Erreur récapitulatif: `{str(e)}`")
+        logger.error(f"Erreur récapitulatif: {str(e)}")
+
+async def adjust_mise_sol(message):
+    global mise_depart_sol
+    chat_id = message.chat.id
+    try:
+        new_mise = float(message.text)
+        if new_mise > 0:
+            mise_depart_sol = new_mise
+            queue_message(chat_id, f"✅ Mise Solana mise à jour à {mise_depart_sol} SOL")
+        else:
+            queue_message(chat_id, "⚠️ La mise doit être positive!")
+    except ValueError:
+        queue_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 0.37)")
+
+async def adjust_stop_loss(message):
+    global stop_loss_threshold
+    chat_id = message.chat.id
+    try:
+        new_sl = float(message.text)
+        if new_sl > 0:
+            stop_loss_threshold = new_sl
+            queue_message(chat_id, f"✅ Stop-Loss mis à jour à {stop_loss_threshold} %")
+        else:
+            queue_message(chat_id, "⚠️ Le Stop-Loss doit être positif!")
+    except ValueError:
+        queue_message(chat_id, "⚠️ Erreur : Entrez un pourcentage valide (ex. : 15)")
+
+async def adjust_take_profit(message):
+    global take_profit_steps
+    chat_id = message.chat.id
+    try:
+        new_tp = [float(x) for x in message.text.split(",")]
+        if len(new_tp) == 5 and all(x > 0 for x in new_tp):
+            take_profit_steps = new_tp
+            queue_message(chat_id, f"✅ Take-Profit mis à jour à x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}, x{take_profit_steps[3]}, x{take_profit_steps[4]}")
+        else:
+            queue_message(chat_id, "⚠️ Entrez 5 valeurs positives séparées par des virgules (ex. : 1.2,2,10,100,500)")
+    except ValueError:
+        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 1.2,2,10,100,500)")
+
+async def adjust_reinvestment_ratio(message):
+    global profit_reinvestment_ratio
+    chat_id = message.chat.id
+    try:
+        new_ratio = float(message.text)
+        if 0 <= new_ratio <= 1:
+            profit_reinvestment_ratio = new_ratio
+            queue_message(chat_id, f"✅ Ratio de réinvestissement mis à jour à {profit_reinvestment_ratio * 100}%")
+        else:
+            queue_message(chat_id, "⚠️ Le ratio doit être entre 0 et 1 (ex. : 0.9)")
+    except ValueError:
+        queue_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 0.9)")
 
 def run_task_in_thread(task, *args):
     try:
@@ -169,10 +490,10 @@ def initialize_and_run_threads(chat_id):
         initialize_bot(chat_id)
         if solana_keypair:
             trade_active = True
-            stop_event.clear()  # Réinitialiser l’événement d’arrêt
+            stop_event.clear()
             queue_message(chat_id, "▶️ Trading Solana lancé avec succès!")
             logger.info("Trading démarré")
-            tasks = [snipe_solana_pools]  # Temporairement une seule tâche pour tester
+            tasks = [snipe_solana_pools, monitor_and_sell]
             active_threads = []
             for task in tasks:
                 thread = threading.Thread(target=run_task_in_thread, args=(task, chat_id), daemon=True)
@@ -209,19 +530,18 @@ def start_message(message):
     global trade_active
     chat_id = message.chat.id
     logger.info(f"Commande /start reçue de {chat_id}")
-    queue_message(chat_id, "✅ Bot démarré!")
     if not trade_active:
+        queue_message(chat_id, "✅ Bot démarré!")
         initialize_and_run_threads(chat_id)
     else:
         queue_message(chat_id, "ℹ️ Trading déjà actif!")
-    show_main_menu(chat_id)  # Appel synchrone
 
 @bot.message_handler(commands=['menu', 'Menu', 'MENU'])
 def menu_message(message):
     chat_id = message.chat.id
     logger.info(f"Commande /menu reçue de {chat_id}")
     queue_message(chat_id, "ℹ️ Affichage du menu...")
-    show_main_menu(chat_id)  # Appel synchrone
+    show_main_menu(chat_id)
 
 @bot.message_handler(commands=['stop', 'Stop', 'STOP'])
 def stop_message(message):
@@ -230,11 +550,11 @@ def stop_message(message):
     logger.info(f"Commande /stop reçue de {chat_id}")
     if trade_active:
         trade_active = False
-        stop_event.set()  # Signal d’arrêt pour tous les threads
+        stop_event.set()
         for thread in active_threads:
             if thread.is_alive():
                 logger.info(f"Attente arrêt du thread {thread.name}")
-                thread.join(timeout=2)  # Attendre max 2s
+                thread.join(timeout=2)
         active_threads = []
         while not message_queue.empty():
             message_queue.get()
@@ -242,7 +562,22 @@ def stop_message(message):
         logger.info("Trading arrêté, threads réinitialisés")
     else:
         queue_message(chat_id, "ℹ️ Trading déjà arrêté!")
-    show_main_menu(chat_id)  # Appel synchrone
+
+@bot.message_handler(commands=['pause', 'Pause', 'PAUSE'])
+def pause_auto_sell_handler(message):
+    global pause_auto_sell
+    chat_id = message.chat.id
+    logger.info(f"Commande /pause reçue de {chat_id}")
+    pause_auto_sell = True
+    queue_message(chat_id, "⏸️ Ventes automatiques désactivées.")
+
+@bot.message_handler(commands=['resume', 'Resume', 'RESUME'])
+def resume_auto_sell_handler(message):
+    global pause_auto_sell
+    chat_id = message.chat.id
+    logger.info(f"Commande /resume reçue de {chat_id}")
+    pause_auto_sell = False
+    queue_message(chat_id, "▶️ Ventes automatiques réactivées.")
 
 def show_main_menu(chat_id):
     try:
@@ -252,11 +587,80 @@ def show_main_menu(chat_id):
             InlineKeyboardButton("▶️ Lancer", callback_data="launch"),
             InlineKeyboardButton("⏹️ Arrêter", callback_data="stop")
         )
+        markup.add(
+            InlineKeyboardButton("💰 Portefeuille", callback_data="portfolio"),
+            InlineKeyboardButton("📅 Récapitulatif", callback_data="daily_summary")
+        )
+        markup.add(
+            InlineKeyboardButton("🔧 Ajuster Mise SOL", callback_data="adjust_mise_sol"),
+            InlineKeyboardButton("📉 Ajuster Stop-Loss", callback_data="adjust_stop_loss")
+        )
+        markup.add(
+            InlineKeyboardButton("📈 Ajuster Take-Profit", callback_data="adjust_take_profit"),
+            InlineKeyboardButton("🔄 Ajuster Réinvestissement", callback_data="adjust_reinvestment")
+        )
         queue_message(chat_id, "*Menu principal:*", reply_markup=markup)
         logger.info(f"Menu affiché pour {chat_id}")
     except Exception as e:
         queue_message(chat_id, f"⚠️ Erreur affichage menu: `{str(e)}`")
         logger.error(f"Erreur affichage menu: {str(e)}")
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    global trade_active
+    chat_id = call.message.chat.id
+    logger.info(f"Callback reçu: {call.data} de {chat_id}")
+    try:
+        if call.data == "status":
+            sol_balance = asyncio.run(get_solana_balance(chat_id))
+            queue_message(chat_id, (
+                f"ℹ️ *Statut actuel* :\n"
+                f"Trading actif: {'Oui' if trade_active else 'Non'}\n"
+                f"SOL disponible: {sol_balance:.4f}\n"
+                f"Positions: {len(portfolio)}/{max_positions}\n"
+                f"Mise Solana: {mise_depart_sol} SOL\n"
+                f"Stop-Loss: {stop_loss_threshold}%\n"
+                f"Take-Profit: x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}, x{take_profit_steps[3]}, x{take_profit_steps[4]}"
+            ))
+        elif call.data == "launch":
+            if not trade_active:
+                initialize_and_run_threads(chat_id)
+            else:
+                queue_message(chat_id, "ℹ️ Trading déjà actif!")
+        elif call.data == "stop":
+            if trade_active:
+                trade_active = False
+                stop_event.set()
+                for thread in active_threads:
+                    if thread.is_alive():
+                        logger.info(f"Attente arrêt du thread {thread.name}")
+                        thread.join(timeout=2)
+                active_threads = []
+                while not message_queue.empty():
+                    message_queue.get()
+                queue_message(chat_id, "⏹️ Trading arrêté.")
+                logger.info("Trading arrêté via callback")
+            else:
+                queue_message(chat_id, "ℹ️ Trading déjà arrêté!")
+        elif call.data == "portfolio":
+            asyncio.run(show_portfolio(chat_id))
+        elif call.data == "daily_summary":
+            asyncio.run(show_daily_summary(chat_id))
+        elif call.data == "adjust_mise_sol":
+            queue_message(chat_id, "Entrez la nouvelle mise Solana (ex. : 0.37) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_mise_sol)
+        elif call.data == "adjust_stop_loss":
+            queue_message(chat_id, "Entrez le nouveau Stop-Loss (ex. : 15) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_stop_loss)
+        elif call.data == "adjust_take_profit":
+            queue_message(chat_id, "Entrez les nouveaux Take-Profit (ex. : 1.2,2,10,100,500) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_take_profit)
+        elif call.data == "adjust_reinvestment":
+            queue_message(chat_id, "Entrez le nouveau ratio de réinvestissement (ex. : 0.9) :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_reinvestment_ratio)
+    except Exception as e:
+        queue_message(chat_id, f"⚠️ Erreur callback: `{str(e)}`")
+        logger.error(f"Erreur callback: {str(e)}")
 
 if __name__ == "__main__":
     if not all([TELEGRAM_TOKEN, WALLET_ADDRESS, SOLANA_PRIVATE_KEY, WEBHOOK_URL]):
