@@ -54,8 +54,8 @@ BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "3F24ENAM4DHUTN3PFCRDWAIY53T1XACS
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "your_birdeye_api_key")
 TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "your_telegram_api_id")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "your_telegram_api_hash")
-TWITTERAPI_ID = "288621526915493900"
-TWITTERAPI_KEY = "16826fa2edc64438a510a261337e6645"
+TWITTERAPI_ID = os.getenv("TWITTERAPI_ID", "288621526915493900")
+TWITTERAPI_KEY = os.getenv("TWITTERAPI_KEY", "16826fa2edc64438a510a261337e6645")
 QUICKNODE_BSC_URL = "https://smart-necessary-ensemble.bsc.quiknode.pro/aeb370bcf4299bc365bbbd3d14d19a31f6e46f06/"
 QUICKNODE_ETH_URL = "https://side-cold-diamond.quiknode.pro/698f06abfe4282fc22edbab42297cf468d78070f/"
 QUICKNODE_SOL_URL = "https://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/"
@@ -218,7 +218,7 @@ async def get_twitter_mentions(token_address, chat_id):
         return mentions
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 401:
-            bot.send_message(chat_id, "⚠️ Twitter API: Clé invalide ou quota dépassé. Vérifiez auprès de twitterapi.io.")
+            bot.send_message(chat_id, "⚠️ Twitter API: Clé invalide ou quota dépassé. Vérifiez TWITTERAPI_ID et TWITTERAPI_KEY.")
             logger.error("Twitter API: 401 Unauthorized")
             return 0
         raise
@@ -458,10 +458,13 @@ async def detect_birdeye(chat_id):
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
 async def monitor_twitter(chat_id):
+    headers = {"X-API-Key": TWITTERAPI_KEY}  # Utilisation de l’en-tête comme recommandé par twitterapi.io
     while trade_active:
         try:
             response = session.get(
-                f"https://api.twitterapi.io/v1/tweets/search?query=\"contract address\" OR CA OR launch OR pump&id={TWITTERAPI_ID}&key={TWITTERAPI_KEY}",
+                "https://api.twitterapi.io/v1/tweets/search",
+                headers=headers,
+                params={"query": '"contract address" OR CA OR launch OR pump', "id": TWITTERAPI_ID},
                 timeout=5
             )
             response.raise_for_status()
@@ -482,8 +485,8 @@ async def monitor_twitter(chat_id):
             await asyncio.sleep(3)
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
-                bot.send_message(chat_id, "⚠️ Twitter API: Clé invalide ou quota dépassé. Vérifiez auprès de twitterapi.io.")
-                logger.error("Twitter API: 401 Unauthorized")
+                bot.send_message(chat_id, "⚠️ Twitter API: Clé invalide ou quota dépassé. Vérifiez TWITTERAPI_ID et TWITTERAPI_KEY.")
+                logger.error(f"Twitter API: 401 Unauthorized - {e.response.text}")
                 await asyncio.sleep(60)  # Pause longue pour éviter spam
             else:
                 bot.send_message(chat_id, f"⚠️ Erreur Twitter API: {str(e)}")
@@ -641,33 +644,61 @@ async def buy_token_eth(chat_id, contract_address, amount):
             initialize_bot(chat_id)
             if not w3_eth.is_connected():
                 raise Exception("Ethereum non connecté")
+        
+        # Vérification de la clé privée
+        if not isinstance(PRIVATE_KEY, str) or not PRIVATE_KEY.startswith('0x') or len(PRIVATE_KEY) != 66:
+            raise ValueError("Clé privée Ethereum invalide (doit être une chaîne de 64 caractères avec préfixe '0x')")
+        
         router = w3_eth.eth.contract(address=UNISWAP_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
         amount_in = w3_eth.to_wei(amount, 'ether')
         amount_out_min = int(amount_in * (1 - slippage_max))
+        
+        # Construire la transaction
         tx = router.functions.swapExactETHForTokens(
             amount_out_min,
             [w3_eth.to_checksum_address('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'), w3_eth.to_checksum_address(contract_address)],
             w3_eth.to_checksum_address(WALLET_ADDRESS),
             int(time.time()) + 30
         ).build_transaction({
-            'from': WALLET_ADDRESS, 'value': amount_in, 'gas': 250000,
-            'gasPrice': w3_eth.to_wei(gas_fee, 'gwei'), 'nonce': w3_eth.eth.get_transaction_count(WALLET_ADDRESS)
+            'from': WALLET_ADDRESS,
+            'value': amount_in,
+            'gas': 250000,
+            'gasPrice': w3_eth.to_wei(gas_fee, 'gwei'),
+            'nonce': w3_eth.eth.get_transaction_count(WALLET_ADDRESS)
         })
+        
+        # Signature et envoi
         signed_tx = w3_eth.eth.account.sign_transaction(tx, PRIVATE_KEY)
         tx_hash = w3_eth.eth.send_raw_transaction(signed_tx.rawTransaction)
         bot.send_message(chat_id, f'⏳ Achat Ethereum {amount} ETH : {contract_address}, TX: {tx_hash.hex()}')
+        
+        # Attente de la confirmation
         receipt = w3_eth.eth.wait_for_transaction_receipt(tx_hash, timeout=20)
         if receipt.status == 1:
             entry_price = detected_tokens[contract_address]['price']
             portfolio[contract_address] = {
-                'amount': amount, 'chain': 'eth', 'entry_price': entry_price,
+                'amount': amount,
+                'chain': 'eth',
+                'entry_price': entry_price,
                 'market_cap_at_buy': detected_tokens[contract_address]['market_cap'],
                 'current_market_cap': detected_tokens[contract_address]['market_cap'],
-                'price_history': [entry_price], 'highest_price': entry_price, 'profit': 0.0,
+                'price_history': [entry_price],
+                'highest_price': entry_price,
+                'profit': 0.0,
                 'buy_time': time.time()
             }
             bot.send_message(chat_id, f'✅ Achat réussi : {amount} ETH de {contract_address} (Uniswap)')
-            daily_trades['buys'].append({'token': contract_address, 'chain': 'eth', 'amount': amount, 'timestamp': datetime.now().strftime('%H:%M:%S')})
+            daily_trades['buys'].append({
+                'token': contract_address,
+                'chain': 'eth',
+                'amount': amount,
+                'timestamp': datetime.now().strftime('%H:%M:%S')
+            })
+        else:
+            raise Exception("Transaction échouée")
+    except ValueError as ve:
+        bot.send_message(chat_id, f"⚠️ Erreur achat Ethereum {contract_address}: {str(ve)}")
+        logger.error(f"Erreur achat Ethereum (ValueError): {str(ve)}")
     except Exception as e:
         bot.send_message(chat_id, f"⚠️ Échec achat Ethereum {contract_address}: {str(e)}")
         logger.error(f"Échec achat Ethereum: {str(e)}")
@@ -772,66 +803,66 @@ async def sell_token(chat_id, contract_address, amount, chain, current_price):
             tx = router.functions.swapExactTokensForETH(
                 token_amount,
                 amount_in_max,
-            [w3_eth.to_checksum_address(contract_address), w3_eth.to_checksum_address('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2')],
-            w3_eth.to_checksum_address(WALLET_ADDRESS),
-            int(time.time()) + 30
-        ).build_transaction({
-            'from': WALLET_ADDRESS, 'gas': 250000,
-            'gasPrice': w3_eth.to_wei(gas_fee, 'gwei'), 'nonce': w3_eth.eth.get_transaction_count(WALLET_ADDRESS)
-        })
-        signed_tx = w3_eth.eth.account.sign_transaction(tx, PRIVATE_KEY)
-        tx_hash = w3_eth.eth.send_raw_transaction(signed_tx.rawTransaction)
-        bot.send_message(chat_id, f'⏳ Vente Ethereum {amount} ETH : {contract_address}, TX: {tx_hash.hex()}')
-        receipt = w3_eth.eth.wait_for_transaction_receipt(tx_hash, timeout=20)
-        if receipt.status == 1:
-            profit = (current_price - portfolio[contract_address]['entry_price']) * amount
-            portfolio[contract_address]['profit'] += profit
-            portfolio[contract_address]['amount'] -= amount
-            if portfolio[contract_address]['amount'] <= 0:
-                del portfolio[contract_address]
-            reinvest_amount = profit * profit_reinvestment_ratio
-            mise_depart_eth += reinvest_amount
-            bot.send_message(chat_id, f'✅ Vente réussie : {amount} ETH, Profit: {profit:.4f} ETH, Réinvesti: {reinvest_amount:.4f} ETH (Uniswap)')
-            daily_trades['sells'].append({'token': contract_address, 'chain': 'eth', 'amount': amount, 'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')})
-except Exception as e:
-    bot.send_message(chat_id, f"⚠️ Échec vente Ethereum {contract_address}: {str(e)}")
-    logger.error(f"Échec vente Ethereum: {str(e)}")
-else:
-    try:
-        if not w3_bsc or not w3_bsc.is_connected():
-            initialize_bot(chat_id)
-            if not w3_bsc.is_connected():
-                raise Exception("BSC non connecté")
-        token_amount = w3_bsc.to_wei(amount, 'ether')
-        amount_in_max = int(token_amount * (1 + slippage_max))
-        router = w3_bsc.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
-        tx = router.functions.swapExactTokensForETH(
-            token_amount,
-            amount_in_max,
-            [w3_bsc.to_checksum_address(contract_address), w3_bsc.to_checksum_address('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c')],
-            w3_bsc.to_checksum_address(WALLET_ADDRESS),
-            int(time.time()) + 30
-        ).build_transaction({
-            'from': WALLET_ADDRESS, 'gas': 250000,
-            'gasPrice': w3_bsc.to_wei(gas_fee, 'gwei'), 'nonce': w3_bsc.eth.get_transaction_count(WALLET_ADDRESS)
-        })
-        signed_tx = w3_bsc.eth.account.sign_transaction(tx, PRIVATE_KEY)
-        tx_hash = w3_bsc.eth.send_raw_transaction(signed_tx.rawTransaction)
-        bot.send_message(chat_id, f'⏳ Vente BSC {amount} BNB : {contract_address}, TX: {tx_hash.hex()}')
-        receipt = w3_bsc.eth.wait_for_transaction_receipt(tx_hash, timeout=20)
-        if receipt.status == 1:
-            profit = (current_price - portfolio[contract_address]['entry_price']) * amount
-            portfolio[contract_address]['profit'] += profit
-            portfolio[contract_address]['amount'] -= amount
-            if portfolio[contract_address]['amount'] <= 0:
-                del portfolio[contract_address]
-            reinvest_amount = profit * profit_reinvestment_ratio
-            mise_depart_bsc += reinvest_amount
-            bot.send_message(chat_id, f'✅ Vente réussie : {amount} BNB, Profit: {profit:.4f} BNB, Réinvesti: {reinvest_amount:.4f} BNB (PancakeSwap)')
-            daily_trades['sells'].append({'token': contract_address, 'chain': 'bsc', 'amount': amount, 'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')})
-    except Exception as e:
-        bot.send_message(chat_id, f"⚠️ Échec vente BSC {contract_address}: {str(e)}")
-        logger.error(f"Échec vente BSC: {str(e)}")
+                [w3_eth.to_checksum_address(contract_address), w3_eth.to_checksum_address('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2')],
+                w3_eth.to_checksum_address(WALLET_ADDRESS),
+                int(time.time()) + 30
+            ).build_transaction({
+                'from': WALLET_ADDRESS, 'gas': 250000,
+                'gasPrice': w3_eth.to_wei(gas_fee, 'gwei'), 'nonce': w3_eth.eth.get_transaction_count(WALLET_ADDRESS)
+            })
+            signed_tx = w3_eth.eth.account.sign_transaction(tx, PRIVATE_KEY)
+            tx_hash = w3_eth.eth.send_raw_transaction(signed_tx.rawTransaction)
+            bot.send_message(chat_id, f'⏳ Vente Ethereum {amount} ETH : {contract_address}, TX: {tx_hash.hex()}')
+            receipt = w3_eth.eth.wait_for_transaction_receipt(tx_hash, timeout=20)
+            if receipt.status == 1:
+                profit = (current_price - portfolio[contract_address]['entry_price']) * amount
+                portfolio[contract_address]['profit'] += profit
+                portfolio[contract_address]['amount'] -= amount
+                if portfolio[contract_address]['amount'] <= 0:
+                    del portfolio[contract_address]
+                reinvest_amount = profit * profit_reinvestment_ratio
+                mise_depart_eth += reinvest_amount
+                bot.send_message(chat_id, f'✅ Vente réussie : {amount} ETH, Profit: {profit:.4f} ETH, Réinvesti: {reinvest_amount:.4f} ETH (Uniswap)')
+                daily_trades['sells'].append({'token': contract_address, 'chain': 'eth', 'amount': amount, 'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')})
+        except Exception as e:
+            bot.send_message(chat_id, f"⚠️ Échec vente Ethereum {contract_address}: {str(e)}")
+            logger.error(f"Échec vente Ethereum: {str(e)}")
+    else:
+        try:
+            if not w3_bsc or not w3_bsc.is_connected():
+                initialize_bot(chat_id)
+                if not w3_bsc.is_connected():
+                    raise Exception("BSC non connecté")
+            token_amount = w3_bsc.to_wei(amount, 'ether')
+            amount_in_max = int(token_amount * (1 + slippage_max))
+            router = w3_bsc.eth.contract(address=PANCAKE_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
+            tx = router.functions.swapExactTokensForETH(
+                token_amount,
+                amount_in_max,
+                [w3_bsc.to_checksum_address(contract_address), w3_bsc.to_checksum_address('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c')],
+                w3_bsc.to_checksum_address(WALLET_ADDRESS),
+                int(time.time()) + 30
+            ).build_transaction({
+                'from': WALLET_ADDRESS, 'gas': 250000,
+                'gasPrice': w3_bsc.to_wei(gas_fee, 'gwei'), 'nonce': w3_bsc.eth.get_transaction_count(WALLET_ADDRESS)
+            })
+            signed_tx = w3_bsc.eth.account.sign_transaction(tx, PRIVATE_KEY)
+            tx_hash = w3_bsc.eth.send_raw_transaction(signed_tx.rawTransaction)
+            bot.send_message(chat_id, f'⏳ Vente BSC {amount} BNB : {contract_address}, TX: {tx_hash.hex()}')
+            receipt = w3_bsc.eth.wait_for_transaction_receipt(tx_hash, timeout=20)
+            if receipt.status == 1:
+                profit = (current_price - portfolio[contract_address]['entry_price']) * amount
+                portfolio[contract_address]['profit'] += profit
+                portfolio[contract_address]['amount'] -= amount
+                if portfolio[contract_address]['amount'] <= 0:
+                    del portfolio[contract_address]
+                reinvest_amount = profit * profit_reinvestment_ratio
+                mise_depart_bsc += reinvest_amount
+                bot.send_message(chat_id, f'✅ Vente réussie : {amount} BNB, Profit: {profit:.4f} BNB, Réinvesti: {reinvest_amount:.4f} BNB (PancakeSwap)')
+                daily_trades['sells'].append({'token': contract_address, 'chain': 'bsc', 'amount': amount, 'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')})
+        except Exception as e:
+            bot.send_message(chat_id, f"⚠️ Échec vente BSC {contract_address}: {str(e)}")
+            logger.error(f"Échec vente BSC: {str(e)}")
 
 async def sell_token_percentage(chat_id, token, percentage):
     try:
