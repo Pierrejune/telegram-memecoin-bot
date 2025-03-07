@@ -106,13 +106,14 @@ PUMP_FUN_PROGRAM_ID = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfH43SboMiMEW
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
 def initialize_bot():
-    global w3_bsc, w3_eth, solana_keypair
+    global w3_bsc, w3_eth, solana_keypair, chat_id_global
     try:
         w3_bsc = Web3(Web3.WebsocketProvider(QUICKNODE_BSC_WS_URL))
         w3_bsc.middleware_onion.inject(geth_poa_middleware, layer=0)
         if w3_bsc.is_connected():
             logger.info("Connexion BSC réussie")
-            bot.send_message(chat_id_global, "✅ Connexion BSC établie : QuickNode")
+            if chat_id_global:
+                bot.send_message(chat_id_global, "✅ Connexion BSC établie : QuickNode")
         else:
             w3_bsc = Web3(Web3.HTTPProvider(QUICKNODE_BSC_URL))
             if w3_bsc.is_connected():
@@ -121,14 +122,16 @@ def initialize_bot():
                 raise Exception("Échec de connexion")
     except Exception as e:
         logger.error(f"Erreur connexion BSC: {str(e)}")
-        bot.send_message(chat_id_global, f"⚠️ Erreur connexion BSC: {str(e)}")
+        if chat_id_global:
+            bot.send_message(chat_id_global, f"⚠️ Erreur connexion BSC: {str(e)}")
         w3_bsc = None
 
     try:
         w3_eth = Web3(Web3.WebsocketProvider(QUICKNODE_ETH_WS_URL))
         if w3_eth.is_connected():
             logger.info("Connexion Ethereum réussie")
-            bot.send_message(chat_id_global, "✅ Connexion Ethereum établie : QuickNode")
+            if chat_id_global:
+                bot.send_message(chat_id_global, "✅ Connexion Ethereum établie : QuickNode")
         else:
             w3_eth = Web3(Web3.HTTPProvider(QUICKNODE_ETH_URL))
             if w3_eth.is_connected():
@@ -137,16 +140,19 @@ def initialize_bot():
                 raise Exception("Échec de connexion")
     except Exception as e:
         logger.error(f"Erreur connexion Ethereum: {str(e)}")
-        bot.send_message(chat_id_global, f"⚠️ Erreur connexion Ethereum: {str(e)}")
+        if chat_id_global:
+            bot.send_message(chat_id_global, f"⚠️ Erreur connexion Ethereum: {str(e)}")
         w3_eth = None
 
     try:
         solana_keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
         logger.info("Clé Solana initialisée")
-        bot.send_message(chat_id_global, "✅ Clé Solana initialisée")
+        if chat_id_global:
+            bot.send_message(chat_id_global, "✅ Clé Solana initialisée")
     except Exception as e:
         logger.error(f"Erreur initialisation Solana: {str(e)}")
-        bot.send_message(chat_id_global, f"⚠️ Erreur initialisation Solana: {str(e)}")
+        if chat_id_global:
+            bot.send_message(chat_id_global, f"⚠️ Erreur initialisation Solana: {str(e)}")
         solana_keypair = None
 
 def set_webhook():
@@ -883,6 +889,22 @@ async def adjust_take_profit(message):
 
 chat_id_global = None
 
+async def run_trading_tasks(chat_id):
+    tasks = [
+        snipe_new_pairs_bsc(chat_id),
+        snipe_new_pairs_eth(chat_id),
+        snipe_4meme_bsc_with_bscscan(chat_id),
+        snipe_solana_pools(chat_id),
+        monitor_x(chat_id),
+        monitor_and_sell(chat_id)
+    ]
+    await asyncio.gather(*tasks)
+
+def start_trading_thread(chat_id):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_trading_tasks(chat_id))
+
 def initialize_and_run_threads(chat_id):
     global trade_active, chat_id_global
     chat_id_global = chat_id
@@ -890,13 +912,7 @@ def initialize_and_run_threads(chat_id):
         initialize_bot()
         trade_active = True
         bot.send_message(chat_id, "▶️ Trading lancé avec succès!")
-        loop = asyncio.get_event_loop()
-        loop.create_task(snipe_new_pairs_bsc(chat_id))
-        loop.create_task(snipe_new_pairs_eth(chat_id))
-        loop.create_task(snipe_4meme_bsc_with_bscscan(chat_id))
-        loop.create_task(snipe_solana_pools(chat_id))
-        loop.create_task(monitor_x(chat_id))
-        loop.create_task(monitor_and_sell(chat_id))
+        threading.Thread(target=start_trading_thread, args=(chat_id,), daemon=True).start()
     except Exception as e:
         bot.send_message(chat_id, f"⚠️ Erreur initialisation: {str(e)}")
         trade_active = False
@@ -938,7 +954,7 @@ async def show_main_menu(chat_id):
     bot.send_message(chat_id, "Menu principal:", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: True)
-async def callback_query(call):
+def callback_query(call):
     global trade_active
     chat_id = call.message.chat.id
     try:
@@ -958,9 +974,9 @@ async def callback_query(call):
             trade_active = False
             bot.send_message(chat_id, "⏹️ Trading arrêté.")
         elif call.data == "portfolio":
-            await show_portfolio(chat_id)
+            asyncio.run(show_portfolio(chat_id))
         elif call.data == "daily_summary":
-            await show_daily_summary(chat_id)
+            asyncio.run(show_daily_summary(chat_id))
         elif call.data == "adjust_mise_bsc":
             bot.send_message(chat_id, "Entrez la nouvelle mise BSC (en BNB, ex. : 0.02) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_mise_bsc)
@@ -978,10 +994,10 @@ async def callback_query(call):
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_take_profit)
         elif call.data.startswith("sell_"):
             token = call.data.split("_")[1]
-            await sell_token_immediate(chat_id, token)
+            asyncio.run(sell_token_immediate(chat_id, token))
         elif call.data.startswith("sell_pct_"):
             _, token, pct = call.data.split("_")
-            await sell_token_percentage(chat_id, token, float(pct))
+            asyncio.run(sell_token_percentage(chat_id, token, float(pct)))
     except Exception as e:
         bot.send_message(chat_id, f"⚠️ Erreur générale: {str(e)}")
 
