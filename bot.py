@@ -23,6 +23,7 @@ from urllib3.util.retry import Retry
 from telethon import TelegramClient, events
 from concurrent.futures import ThreadPoolExecutor
 import backoff
+import websockets
 
 # Configuration logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -1055,12 +1056,9 @@ def initialize_and_run_threads(chat_id):
             tasks = [
                 snipe_new_pairs_bsc, snipe_new_pairs_eth, snipe_solana_pools,
                 detect_bsc_blocks, detect_eth_blocks, detect_bscscan,
-                detect_birdeye, monitor_twitter, monitor_and_sell
+                detect_birdeye, monitor_twitter, monitor_telegram, monitor_and_sell
             ]
-            # Lancer Telegram dans le même event loop
-            loop = asyncio.get_event_loop()
-            loop.create_task(monitor_telegram(chat_id))
-            with ThreadPoolExecutor(max_workers=9) as executor:
+            with ThreadPoolExecutor(max_workers=10) as executor:
                 for task in tasks:
                     executor.submit(run_task_in_thread, task, chat_id)
                     logger.info(f"Tâche {task.__name__} lancée")
