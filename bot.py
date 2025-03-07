@@ -31,7 +31,7 @@ adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 
 # Variables globales
-last_x_call = 0
+last_x_call = time.time() - 900  # Décalage initial pour éviter appels immédiats
 x_last_reset = time.time()
 x_requests_remaining = 100
 daily_trades = {'buys': [], 'sells': []}
@@ -39,7 +39,7 @@ rejected_tokens = {}
 trade_active = False
 portfolio = {}
 detected_tokens = {}
-BLACKLISTED_TOKENS = {"So11111111111111111111111111111111111111112"}  # Tokens à ignorer
+BLACKLISTED_TOKENS = {"So11111111111111111111111111111111111111112"}
 
 # Variables d’environnement
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "default_token")
@@ -205,8 +205,8 @@ def snipe_new_pairs_bsc(chat_id):
                     if log['topics'][0].hex() != Web3.keccak(text="PairCreated(address,address,address,uint256)").hex():
                         continue
                     try:
-                        token0 = w3_bsc.to_checksum_address('0x' + log['data'][26:66])
-                        token1 = w3_bsc.to_checksum_address('0x' + log['data'][90:130])
+                        token0 = w3_bsc.to_checksum_address('0x' + log['data'].hex()[26:66])
+                        token1 = w3_bsc.to_checksum_address('0x' + log['data'].hex()[90:130])
                         token_address = token0 if token0 != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1
                         if token_address in BLACKLISTED_TOKENS or token_address in portfolio or (token_address in rejected_tokens and (time.time() - rejected_tokens[token_address]) / 3600 <= 12):
                             continue
@@ -241,8 +241,8 @@ def snipe_new_pairs_eth(chat_id):
                     if log['topics'][0].hex() != Web3.keccak(text="PairCreated(address,address,address,uint256)").hex():
                         continue
                     try:
-                        token0 = w3_eth.to_checksum_address('0x' + log['data'][26:66])
-                        token1 = w3_eth.to_checksum_address('0x' + log['data'][90:130])
+                        token0 = w3_eth.to_checksum_address('0x' + log['data'].hex()[26:66])
+                        token1 = w3_eth.to_checksum_address('0x' + log['data'].hex()[90:130])
                         token_address = token0 if token0 != "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" else token1
                         if token_address in BLACKLISTED_TOKENS or token_address in portfolio or (token_address in rejected_tokens and (time.time() - rejected_tokens[token_address]) / 3600 <= 12):
                             continue
@@ -284,8 +284,10 @@ def snipe_4meme_bsc_with_bscscan(chat_id):
                 if token_address in BLACKLISTED_TOKENS or token_address in portfolio or (token_address in rejected_tokens and (time.time() - rejected_tokens[token_address]) / 3600 <= 12):
                     continue
                 if validate_address(token_address, 'bsc'):
-                    bot.send_message(chat_id, f'🎯 Snipe détecté via BscScan : {token_address} (BSC - 4Meme probable)')
-                    validate_and_trade(chat_id, token_address, 'bsc')
+                    data = get_token_data(token_address, 'bsc')
+                    if data and data['volume_24h'] < 1000 and data['liquidity'] >= MIN_LIQUIDITY and data['market_cap'] < 50000:
+                        bot.send_message(chat_id, f'🎯 Snipe détecté via BscScan : {token_address} (BSC - 4Meme probable)')
+                        validate_and_trade(chat_id, token_address, 'bsc')
             last_timestamp = int(time.time())
             time.sleep(0.01)
         except Exception as e:
@@ -300,7 +302,7 @@ def snipe_solana_pools(chat_id):
             response = session.post(QUICKNODE_SOL_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
                 "params": [str(RAYDIUM_PROGRAM_ID), {"limit": 10}]
-            }, timeout=0.5)
+            }, timeout=1)
             signatures = response.json().get('result', [])
             for sig in signatures:
                 if last_signature_raydium and sig['signature'] == last_signature_raydium:
@@ -308,7 +310,7 @@ def snipe_solana_pools(chat_id):
                 tx = session.post(QUICKNODE_SOL_URL, json={
                     "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
                     "params": [sig['signature'], {"encoding": "jsonParsed"}]
-                }, timeout=0.5).json()
+                }, timeout=1).json()
                 if 'result' in tx and tx['result']:
                     for account in tx['result']['transaction']['message']['accountKeys']:
                         token_address = account['pubkey']
@@ -323,7 +325,7 @@ def snipe_solana_pools(chat_id):
             response = session.post(QUICKNODE_SOL_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
                 "params": [str(PUMP_FUN_PROGRAM_ID), {"limit": 10}]
-            }, timeout=0.5)
+            }, timeout=1)
             signatures = response.json().get('result', [])
             for sig in signatures:
                 if last_signature_pump and sig['signature'] == last_signature_pump:
@@ -331,7 +333,7 @@ def snipe_solana_pools(chat_id):
                 tx = session.post(QUICKNODE_SOL_URL, json={
                     "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
                     "params": [sig['signature'], {"encoding": "jsonParsed"}]
-                }, timeout=0.5).json()
+                }, timeout=1).json()
                 if 'result' in tx and tx['result']:
                     for account in tx['result']['transaction']['message']['accountKeys']:
                         token_address = account['pubkey']
@@ -342,7 +344,7 @@ def snipe_solana_pools(chat_id):
                             validate_and_trade(chat_id, token_address, 'solana')
             if signatures:
                 last_signature_pump = signatures[0]['signature']
-            time.sleep(0.01)
+            time.sleep(0.1)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur sniping Solana: {str(e)}")
             time.sleep(1)
@@ -408,7 +410,7 @@ def monitor_x(chat_id):
 def validate_and_trade(chat_id, token_address, chain):
     try:
         if token_address in BLACKLISTED_TOKENS:
-            return  # Ignorer immédiatement
+            return
 
         data = get_token_data(token_address, chain)
         if data is None:
@@ -429,9 +431,35 @@ def validate_and_trade(chat_id, token_address, chain):
         min_market_cap = MIN_MARKET_CAP_BSC if chain == 'bsc' else MIN_MARKET_CAP_ETH if chain == 'eth' else MIN_MARKET_CAP_SOL
         max_market_cap = MAX_MARKET_CAP_BSC if chain == 'bsc' else MAX_MARKET_CAP_ETH if chain == 'eth' else MAX_MARKET_CAP_SOL
 
-        if len(portfolio) >= max_positions or age_hours > MAX_TOKEN_AGE_HOURS or liquidity < MIN_LIQUIDITY or \
-           volume_24h < min_volume or volume_24h > max_volume or market_cap < min_market_cap or \
-           market_cap > max_market_cap or (buy_sell_ratio < MIN_BUY_SELL_RATIO and age_hours > 0.5):
+        if len(portfolio) >= max_positions:
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Limite de {max_positions} positions atteinte')
+            return
+        if age_hours > MAX_TOKEN_AGE_HOURS:
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Âge {age_hours:.2f}h > {MAX_TOKEN_AGE_HOURS}h')
+            rejected_tokens[token_address] = time.time()
+            return
+        if liquidity < MIN_LIQUIDITY:
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Liquidité ${liquidity:.2f} < ${MIN_LIQUIDITY}')
+            rejected_tokens[token_address] = time.time()
+            return
+        if volume_24h < min_volume:
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Volume ${volume_24h:.2f} < ${min_volume}')
+            rejected_tokens[token_address] = time.time()
+            return
+        if volume_24h > max_volume:
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Volume ${volume_24h:.2f} > ${max_volume}')
+            rejected_tokens[token_address] = time.time()
+            return
+        if market_cap < min_market_cap:
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Market Cap ${market_cap:.2f} < ${min_market_cap}')
+            rejected_tokens[token_address] = time.time()
+            return
+        if market_cap > max_market_cap:
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Market Cap ${market_cap:.2f} > ${max_market_cap}')
+            rejected_tokens[token_address] = time.time()
+            return
+        if buy_sell_ratio < MIN_BUY_SELL_RATIO and age_hours > 0.5:
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Ratio A/V {buy_sell_ratio:.2f} < ${MIN_BUY_SELL_RATIO}')
             rejected_tokens[token_address] = time.time()
             return
 
@@ -533,7 +561,7 @@ def buy_token_solana(chat_id, contract_address, amount):
         amount_in = int(amount * 10**9)
         response = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
-        }, timeout=0.5)
+        }, timeout=1)
         blockhash = response.json()['result']['value']['blockhash']
         tx = Transaction()
         tx.recent_blockhash = Pubkey.from_string(blockhash)
@@ -551,7 +579,7 @@ def buy_token_solana(chat_id, contract_address, amount):
         tx_hash = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
             "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
-        }, timeout=0.5).json()['result']
+        }, timeout=1).json()['result']
         bot.send_message(chat_id, f'⏳ Achat Solana {amount} SOL de {contract_address}, TX: {tx_hash}')
         entry_price = detected_tokens[contract_address]['price']
         portfolio[contract_address] = {
@@ -578,7 +606,7 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
             amount_out = int(amount * 10**9)
             response = session.post(QUICKNODE_SOL_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
-            }, timeout=0.5)
+            }, timeout=1)
             blockhash = response.json()['result']['value']['blockhash']
             tx = Transaction()
             tx.recent_blockhash = Pubkey.from_string(blockhash)
@@ -596,7 +624,7 @@ def sell_token(chat_id, contract_address, amount, chain, current_price):
             tx_hash = session.post(QUICKNODE_SOL_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
                 "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
-            }, timeout=0.5).json()['result']
+            }, timeout=1).json()['result']
             bot.send_message(chat_id, f'⏳ Vente Solana {amount} SOL de {contract_address}, TX: {tx_hash}')
             profit = (current_price - portfolio[contract_address]['entry_price']) * amount
             portfolio[contract_address]['profit'] += profit
@@ -707,7 +735,7 @@ def monitor_and_sell(chat_id):
                 chain = data['chain']
                 amount = data['amount']
                 current_mc = get_token_data(contract_address, chain)['market_cap']
-                current_price = current_mc / data['supply'] if data['supply'] > 0 else 0
+                current_price = current_mc / data['supply'] if 'supply' in data and data['supply'] > 0 else 0
                 data['price_history'].append(current_price)
                 if len(data['price_history']) > 10:
                     data['price_history'].pop(0)
@@ -764,7 +792,7 @@ def get_solana_balance(chat_id):
             return 0
         response = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [str(solana_keypair.pubkey())]
-        }, timeout=0.5)
+        }, timeout=1)
         result = response.json().get('result', {})
         return result.get('value', 0) / 10**9
     except Exception as e:
