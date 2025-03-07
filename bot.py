@@ -499,7 +499,7 @@ async def monitor_telegram(chat_id):
                 text = event.message.text.lower()
                 words = text.split()
                 for word in words:
-                    chain = 'bsc' if word.startswith("0x") and len(word) == 42 else 'solana' if len(word) in [32, 44omycin) else 'eth'
+                    chain = 'bsc' if word.startswith("0x") and len(word) == 42 else 'solana' if len(word) in [32, 44] else 'eth'
                     if word in BLACKLISTED_TOKENS or word in portfolio or (word in rejected_tokens and (time.time() - rejected_tokens[word]) / 3600 <= 6):
                         continue
                     if validate_address(word, chain):
