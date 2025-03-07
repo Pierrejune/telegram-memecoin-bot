@@ -18,7 +18,6 @@ from waitress import serve
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import backoff
-import websockets
 from queue import Queue
 
 # Configuration logging
@@ -53,11 +52,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-QUICKNODE_SOL_URL = "https://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/"
-QUICKNODE_SOL_WS_URL = "wss://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/"
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")  # Clé Helius
+QUICKNODE_SOL_URL = os.getenv("QUICKNODE_SOL_URL")  # Votre endpoint QuickNode
 PORT = int(os.getenv("PORT", 8080))
 
-# Paramètres de trading
+# Paramètres de trading (modifiables)
 mise_depart_sol = 0.37
 stop_loss_threshold = 15
 trailing_stop_percentage = 5
@@ -140,32 +139,7 @@ def validate_address(token_address):
         return False
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
-def get_token_data(token_address):
-    try:
-        response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=10)
-        response.raise_for_status()
-        pairs = response.json().get('pairs', [])
-        if not pairs or pairs[0].get('chainId') != 'solana':
-            return None
-        data = pairs[0]
-        age_hours = (time.time() - (data.get('pairCreatedAt', 0) / 1000)) / 3600 if data.get('pairCreatedAt') else 0
-        if age_hours > MAX_TOKEN_AGE_HOURS:
-            return None
-        return {
-            'volume_24h': float(data.get('volume', {}).get('h24', 0) or 0),
-            'liquidity': float(data.get('liquidity', {}).get('usd', 0) or 0),
-            'market_cap': float(data.get('marketCap', 0) or 0),
-            'price': float(data.get('priceUsd', 0) or 0),
-            'buy_sell_ratio': float(data.get('txns', {}).get('m5', {}).get('buys', 0) or 0) / max(float(data.get('txns', {}).get('m5', {}).get('sells', 0) or 1), 1),
-            'pair_created_at': data.get('pairCreatedAt', 0) / 1000 if data.get('pairCreatedAt') else time.time(),
-            'supply': float(data.get('marketCap', 0) or 0) / float(data.get('priceUsd', 0) or 1)
-        }
-    except Exception as e:
-        logger.error(f"Erreur DexScreener pour {token_address}: {str(e)}")
-        return None
-
-@backoff.on_exception(backoff.expo, Exception, max_tries=5)
-async def snipe_solana_pools(chat_id):
+async def detect_helius_tokens(chat_id):
     while not stop_event.is_set():
         if not solana_keypair:
             initialize_bot(chat_id)
@@ -173,39 +147,53 @@ async def snipe_solana_pools(chat_id):
                 await asyncio.sleep(30)
                 continue
         try:
-            async with websockets.connect(QUICKNODE_SOL_WS_URL, ping_interval=10, ping_timeout=20) as ws:
-                await ws.send(json.dumps({
-                    "jsonrpc": "2.0", "id": 1, "method": "programSubscribe",
-                    "params": [str(RAYDIUM_PROGRAM_ID), {"encoding": "base64"}]
-                }))
-                await ws.send(json.dumps({
-                    "jsonrpc": "2.0", "id": 2, "method": "programSubscribe",
-                    "params": [str(PUMP_FUN_PROGRAM_ID), {"encoding": "base64"}]
-                }))
-                queue_message(chat_id, "🔄 Sniping Solana actif (Raydium/Pump.fun)")
-                logger.info("Sniping Solana démarré")
-                while not stop_event.is_set():
-                    try:
-                        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
-                        if 'params' not in msg or 'result' not in msg:
-                            continue
-                        data = msg['params']['result']['value']['account']['data'][0]
-                        pubkey = msg['params']['result']['pubkey']
-                        logger.info(f"Données WebSocket reçues: {data[:100]}... (pubkey: {pubkey})")
-                        potential_addresses = [addr for addr in data.split() if validate_address(addr) and addr not in BLACKLISTED_TOKENS]
-                        for token_address in potential_addresses:
-                            token_data = get_token_data(token_address)
-                            if token_data and validate_token(chat_id, token_address, token_data):
-                                queue_message(chat_id, f"🎯 Token détecté : `{token_address}` (Solana)")
-                                logger.info(f"Token détecté: {token_address}")
-                                await buy_token_solana(chat_id, token_address, mise_depart_sol)
-                    except Exception as e:
-                        logger.error(f"Erreur sniping Solana WebSocket: {str(e)}")
-                    await asyncio.sleep(0.1)
-        except Exception as e:
-            queue_message(chat_id, f"⚠️ Erreur sniping Solana: `{str(e)}`")
-            logger.error(f"Erreur sniping Solana connexion: {str(e)}")
+            response = session.get(
+                f"https://api.helius.xyz/v1/tokens/new?api-key={HELIUS_API_KEY}&chain=solana",
+                timeout=10
+            )
+            response.raise_for_status()
+            tokens = response.json().get('tokens', [])
+            queue_message(chat_id, "🔄 Détection Helius active")
+            logger.info("Détection Helius démarrée")
+            for token in tokens:
+                token_address = token.get('address')
+                if not validate_address(token_address) or token_address in BLACKLISTED_TOKENS or token_address in portfolio:
+                    continue
+                token_data = get_token_data_helius(token_address)
+                if token_data and validate_token(chat_id, token_address, token_data):
+                    queue_message(chat_id, f"🎯 Token détecté : `{token_address}` (Solana - Helius)")
+                    logger.info(f"Token détecté: {token_address}")
+                    await buy_token_solana(chat_id, token_address, mise_depart_sol)
             await asyncio.sleep(5)
+        except Exception as e:
+            queue_message(chat_id, f"⚠️ Erreur Helius: `{str(e)}`")
+            logger.error(f"Erreur Helius: {str(e)}")
+            await asyncio.sleep(10)
+
+@backoff.on_exception(backoff.expo, Exception, max_tries=5)
+def get_token_data_helius(token_address):
+    try:
+        response = session.get(
+            f"https://api.helius.xyz/v1/tokens/meta?api-key={HELIUS_API_KEY}&addresses={token_address}",
+            timeout=10
+        )
+        response.raise_for_status()
+        data = response.json().get('data', [])[0]
+        age_hours = (time.time() - data.get('createdAt', time.time()) / 1000) / 3600
+        if age_hours > MAX_TOKEN_AGE_HOURS:
+            return None
+        return {
+            'volume_24h': data.get('volume24hUSD', 0),
+            'liquidity': data.get('liquidityUSD', 0),
+            'market_cap': data.get('marketCapUSD', 0),
+            'price': data.get('priceUSD', 0),
+            'buy_sell_ratio': data.get('buySellRatio', 1),
+            'pair_created_at': data.get('createdAt', time.time()) / 1000,
+            'supply': data.get('totalSupply', 0)
+        }
+    except Exception as e:
+        logger.error(f"Erreur Helius data pour {token_address}: {str(e)}")
+        return None
 
 def validate_token(chat_id, token_address, data):
     try:
@@ -268,7 +256,8 @@ async def buy_token_solana(chat_id, contract_address, amount):
             "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
         }, timeout=5).json()['result']
         queue_message(chat_id, f"✅ Achat réussi : {amount} SOL de `{contract_address}` (TX: `{tx_hash}`)")
-        entry_price = get_token_data(contract_address).get('price', 0)
+        token_data = get_token_data_helius(contract_address)
+        entry_price = token_data.get('price', 0)
         portfolio[contract_address] = {
             'amount': amount, 'chain': 'solana', 'entry_price': entry_price,
             'price_history': [entry_price], 'highest_price': entry_price, 'profit': 0.0,
@@ -330,7 +319,7 @@ async def monitor_and_sell(chat_id):
                 continue
             for contract_address, data in list(portfolio.items()):
                 amount = data['amount']
-                current_data = get_token_data(contract_address)
+                current_data = get_token_data_helius(contract_address)
                 if not current_data:
                     continue
                 current_price = current_data.get('price', 0)
@@ -367,7 +356,7 @@ async def show_portfolio(chat_id):
         msg = f"💰 *Portefeuille:*\nSOL : {sol_balance:.4f}\n\n"
         markup = InlineKeyboardMarkup()
         for ca, data in portfolio.items():
-            current_price = get_token_data(ca).get('price', 0)
+            current_price = get_token_data_helius(ca).get('price', 0)
             profit = (current_price - data['entry_price']) * data['amount']
             markup.add(
                 InlineKeyboardButton(f"💸 Sell 25% {ca[:6]}", callback_data=f"sell_pct_{ca}_25"),
@@ -473,6 +462,36 @@ async def adjust_reinvestment_ratio(message):
     except ValueError:
         queue_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 0.9)")
 
+async def adjust_detection_criteria(message):
+    global MIN_VOLUME_SOL, MAX_VOLUME_SOL, MIN_LIQUIDITY, MIN_MARKET_CAP_SOL, MAX_MARKET_CAP_SOL, MIN_BUY_SELL_RATIO, MAX_TOKEN_AGE_HOURS
+    chat_id = message.chat.id
+    try:
+        criteria = message.text.split(",")
+        if len(criteria) != 7:
+            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 100,2000000,5000,1000,5000000,1.5,6)")
+            return
+        min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age = map(float, criteria)
+        if min_vol < 0 or max_vol < min_vol or min_liq < 0 or min_mc < 0 or max_mc < min_mc or min_ratio < 0 or max_age < 0:
+            queue_message(chat_id, "⚠️ Valeurs invalides ! Assurez-vous que toutes sont positives et cohérentes.")
+            return
+        MIN_VOLUME_SOL = min_vol
+        MAX_VOLUME_SOL = max_vol
+        MIN_LIQUIDITY = min_liq
+        MIN_MARKET_CAP_SOL = min_mc
+        MAX_MARKET_CAP_SOL = max_mc
+        MIN_BUY_SELL_RATIO = min_ratio
+        MAX_TOKEN_AGE_HOURS = max_age
+        queue_message(chat_id, (
+            f"✅ Critères de détection mis à jour :\n"
+            f"Volume : [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}] SOL\n"
+            f"Liquidité min : {MIN_LIQUIDITY} $\n"
+            f"Market Cap : [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}] $\n"
+            f"Ratio A/V min : {MIN_BUY_SELL_RATIO}\n"
+            f"Âge max : {MAX_TOKEN_AGE_HOURS} h"
+        ))
+    except ValueError:
+        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 100,2000000,5000,1000,5000000,1.5,6)")
+
 def run_task_in_thread(task, *args):
     try:
         loop = asyncio.new_event_loop()
@@ -493,7 +512,7 @@ def initialize_and_run_threads(chat_id):
             stop_event.clear()
             queue_message(chat_id, "▶️ Trading Solana lancé avec succès!")
             logger.info("Trading démarré")
-            tasks = [snipe_solana_pools, monitor_and_sell]
+            tasks = [detect_helius_tokens, monitor_and_sell]
             active_threads = []
             for task in tasks:
                 thread = threading.Thread(target=run_task_in_thread, args=(task, chat_id), daemon=True)
@@ -599,6 +618,9 @@ def show_main_menu(chat_id):
             InlineKeyboardButton("📈 Ajuster Take-Profit", callback_data="adjust_take_profit"),
             InlineKeyboardButton("🔄 Ajuster Réinvestissement", callback_data="adjust_reinvestment")
         )
+        markup.add(
+            InlineKeyboardButton("🔍 Ajuster Critères Détection", callback_data="adjust_detection_criteria")
+        )
         queue_message(chat_id, "*Menu principal:*", reply_markup=markup)
         logger.info(f"Menu affiché pour {chat_id}")
     except Exception as e:
@@ -620,7 +642,8 @@ def callback_query(call):
                 f"Positions: {len(portfolio)}/{max_positions}\n"
                 f"Mise Solana: {mise_depart_sol} SOL\n"
                 f"Stop-Loss: {stop_loss_threshold}%\n"
-                f"Take-Profit: x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}, x{take_profit_steps[3]}, x{take_profit_steps[4]}"
+                f"Take-Profit: x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}, x{take_profit_steps[3]}, x{take_profit_steps[4]}\n"
+                f"Critères détection: Volume [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}] SOL, Liquidité min {MIN_LIQUIDITY} $, Market Cap [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}] $, Ratio A/V min {MIN_BUY_SELL_RATIO}, Âge max {MAX_TOKEN_AGE_HOURS} h"
             ))
         elif call.data == "launch":
             if not trade_active:
@@ -658,12 +681,15 @@ def callback_query(call):
         elif call.data == "adjust_reinvestment":
             queue_message(chat_id, "Entrez le nouveau ratio de réinvestissement (ex. : 0.9) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_reinvestment_ratio)
+        elif call.data == "adjust_detection_criteria":
+            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age) ex. : 100,2000000,5000,1000,5000000,1.5,6 :")
+            bot.register_next_step_handler_by_chat_id(chat_id, adjust_detection_criteria)
     except Exception as e:
         queue_message(chat_id, f"⚠️ Erreur callback: `{str(e)}`")
         logger.error(f"Erreur callback: {str(e)}")
 
 if __name__ == "__main__":
-    if not all([TELEGRAM_TOKEN, WALLET_ADDRESS, SOLANA_PRIVATE_KEY, WEBHOOK_URL]):
+    if not all([TELEGRAM_TOKEN, WALLET_ADDRESS, SOLANA_PRIVATE_KEY, WEBHOOK_URL, HELIUS_API_KEY, QUICKNODE_SOL_URL]):
         logger.error("Variables d’environnement manquantes")
         exit(1)
     if set_webhook():
