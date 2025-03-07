@@ -50,6 +50,7 @@ detected_tokens = {}
 BLACKLISTED_TOKENS = {"So11111111111111111111111111111111111111112"}
 pause_auto_sell = False
 chat_id_global = None
+active_threads = []  # Liste pour suivre les threads actifs
 
 # Variables d’environnement
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -146,7 +147,6 @@ def validate_address(token_address):
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
 def get_token_data(token_address):
-    # DexScreener comme source principale
     for _ in range(5):
         try:
             response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=10)
@@ -171,7 +171,6 @@ def get_token_data(token_address):
         except Exception as e:
             logger.error(f"Erreur DexScreener pour {token_address}: {str(e)}")
             time.sleep(1)
-    # Fallback Solana RPC si DexScreener échoue
     try:
         response = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
@@ -180,12 +179,11 @@ def get_token_data(token_address):
         account_info = response.json().get('result', {}).get('value', {})
         if not account_info:
             return None
-        # Estimation des données (approximation car RPC ne donne pas tout)
         return {
-            'volume_24h': MIN_VOLUME_SOL,  # Valeur par défaut
+            'volume_24h': MIN_VOLUME_SOL,
             'liquidity': MIN_LIQUIDITY,
             'market_cap': MIN_MARKET_CAP_SOL,
-            'price': 0.001,  # Approximation
+            'price': 0.001,
             'buy_sell_ratio': 1,
             'pair_created_at': time.time() - (account_info.get('lamports', 0) % 3600),
             'supply': MIN_MARKET_CAP_SOL / 0.001
@@ -266,7 +264,7 @@ def check_dump_risk(token_address):
                 "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
                 "params": [tx['signature'], {"encoding": "jsonParsed"}]
             }).json()
-            if 'sell' in str(tx_details).lower():  # Approximation
+            if 'sell' in str(tx_details).lower():
                 total_sold += 1
         if total_sold > 5:
             return False
@@ -366,7 +364,7 @@ async def detect_birdeye(chat_id):
             data = response.json()
             if not data or 'data' not in data or 'tokens' not in data['data']:
                 logger.error(f"Réponse Birdeye invalide: {data}")
-                await asyncio.sleep(60)  # Pause plus longue si erreur
+                await asyncio.sleep(60)
                 continue
             tokens = data['data']['tokens']
             for token in tokens:
@@ -462,7 +460,7 @@ async def buy_token_solana(chat_id, contract_address, amount):
             initialize_bot(chat_id)
             if not solana_keypair:
                 raise Exception("Solana non initialisé")
-        amount_in = int(amount * 10**9)  # Lamports
+        amount_in = int(amount * 10**9)
         response = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
             "params": [{"commitment": "finalized"}]
@@ -748,14 +746,13 @@ def run_task_in_thread(task, *args):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(task(*args))
+        loop.close()
     except Exception as e:
         logger.error(f"Erreur dans thread {task.__name__}: {str(e)}")
         queue_message(args[0], f"⚠️ Erreur thread `{task.__name__}`: `{str(e)}`")
 
-tasks = []
-
 def initialize_and_run_threads(chat_id):
-    global trade_active, chat_id_global, tasks
+    global trade_active, chat_id_global, active_threads
     chat_id_global = chat_id
     try:
         initialize_bot(chat_id)
@@ -763,13 +760,12 @@ def initialize_and_run_threads(chat_id):
             trade_active = True
             queue_message(chat_id, "▶️ Trading Solana lancé avec succès!")
             logger.info("Trading démarré")
-            tasks = [
-                snipe_solana_pools, detect_dexscreener, detect_birdeye,
-                monitor_and_sell
-            ]
+            tasks = [snipe_solana_pools, detect_dexscreener, detect_birdeye, monitor_and_sell]
+            active_threads = []
             for task in tasks:
                 thread = threading.Thread(target=run_task_in_thread, args=(task, chat_id), daemon=True)
                 thread.start()
+                active_threads.append(thread)
                 logger.info(f"Tâche {task.__name__} lancée")
         else:
             queue_message(chat_id, "⚠️ Échec initialisation : Solana non connecté")
@@ -818,12 +814,19 @@ def menu_message(message):
 
 @bot.message_handler(commands=['stop'])
 def stop_message(message):
-    global trade_active, tasks
+    global trade_active, active_threads
     chat_id = message.chat.id
     logger.info(f"Commande /stop reçue de {chat_id}")
     trade_active = False
-    tasks = []  # Réinitialise les tâches pour éviter les threads zombies
+    for thread in active_threads:
+        if thread.is_alive():
+            logger.info(f"Arrêt du thread {thread.name}")
+            # Les threads daemon s'arrêtent automatiquement à la fin du programme
+    active_threads = []
+    while not message_queue.empty():  # Vider la file d'attente
+        message_queue.get()
     queue_message(chat_id, "⏹️ Trading arrêté.")
+    logger.info("Trading arrêté, threads réinitialisés")
 
 @bot.message_handler(commands=['pause'])
 def pause_auto_sell_handler(message):
@@ -881,7 +884,14 @@ def callback_query(call):
             else:
                 queue_message(chat_id, "⚠️ Trading déjà en cours.")
         elif call.data == "stop":
+            global active_threads
             trade_active = False
+            for thread in active_threads:
+                if thread.is_alive():
+                    logger.info(f"Arrêt du thread {thread.name}")
+            active_threads = []
+            while not message_queue.empty():
+                message_queue.get()
             queue_message(chat_id, "⏹️ Trading arrêté.")
         elif call.data == "portfolio":
             asyncio.run_coroutine_threadsafe(show_portfolio(chat_id), asyncio.get_event_loop())
