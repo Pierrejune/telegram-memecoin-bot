@@ -15,7 +15,6 @@ from solders.transaction import Transaction
 from solders.instruction import Instruction
 import threading
 import asyncio
-import websockets
 from datetime import datetime
 import re
 from waitress import serve
@@ -54,8 +53,7 @@ BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "3F24ENAM4DHUTN3PFCRDWAIY53T1XACS
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "your_birdeye_api_key")
 TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "your_telegram_api_id")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "your_telegram_api_hash")
-TWITTERAPI_ID = os.getenv("TWITTERAPI_ID", "288621526915493900")
-TWITTERAPI_KEY = os.getenv("TWITTERAPI_KEY", "16826fa2edc64438a510a261337e6645")
+TWITTERAPI_KEY = os.getenv("TWITTERAPI_KEY", "your_twitter_api_key_here")
 QUICKNODE_BSC_URL = "https://smart-necessary-ensemble.bsc.quiknode.pro/aeb370bcf4299bc365bbbd3d14d19a31f6e46f06/"
 QUICKNODE_ETH_URL = "https://side-cold-diamond.quiknode.pro/698f06abfe4282fc22edbab42297cf468d78070f/"
 QUICKNODE_SOL_URL = "https://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/"
@@ -116,10 +114,8 @@ TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5
 def initialize_bot(chat_id):
     global w3_bsc, w3_eth, solana_keypair
     try:
-        w3_bsc = Web3(Web3.WebsocketProvider(QUICKNODE_BSC_WS_URL))
+        w3_bsc = Web3(Web3.HTTPProvider(QUICKNODE_BSC_URL))
         w3_bsc.middleware_onion.inject(geth_poa_middleware, layer=0)
-        if not w3_bsc.is_connected():
-            w3_bsc = Web3(Web3.HTTPProvider(QUICKNODE_BSC_URL))
         if w3_bsc.is_connected():
             bot.send_message(chat_id, "✅ Connexion BSC établie : QuickNode")
             logger.info("BSC connecté")
@@ -131,9 +127,7 @@ def initialize_bot(chat_id):
         w3_bsc = None
 
     try:
-        w3_eth = Web3(Web3.WebsocketProvider(QUICKNODE_ETH_WS_URL))
-        if not w3_eth.is_connected():
-            w3_eth = Web3(Web3.HTTPProvider(QUICKNODE_ETH_URL))
+        w3_eth = Web3(Web3.HTTPProvider(QUICKNODE_ETH_URL))
         if w3_eth.is_connected():
             bot.send_message(chat_id, "✅ Connexion Ethereum établie : QuickNode")
             logger.info("Ethereum connecté")
@@ -208,7 +202,8 @@ def check_token_security(token_address, chain):
 async def get_twitter_mentions(token_address, chat_id):
     try:
         response = session.get(
-            f"https://api.twitterapi.io/v1/tweets/search?query={token_address}&id={TWITTERAPI_ID}&key={TWITTERAPI_KEY}",
+            f"https://api.twitterapi.io/v1/tweets/search?query={token_address}",
+            headers={"X-API-Key": TWITTERAPI_KEY},
             timeout=5
         )
         response.raise_for_status()
@@ -218,7 +213,7 @@ async def get_twitter_mentions(token_address, chat_id):
         return mentions
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 401:
-            bot.send_message(chat_id, "⚠️ Twitter API: Clé invalide ou quota dépassé. Vérifiez TWITTERAPI_ID et TWITTERAPI_KEY.")
+            bot.send_message(chat_id, "⚠️ Twitter API: Clé invalide ou quota dépassé. Vérifiez TWITTERAPI_KEY.")
             logger.error("Twitter API: 401 Unauthorized")
             return 0
         raise
@@ -232,33 +227,25 @@ async def snipe_new_pairs_bsc(chat_id):
                 await asyncio.sleep(30)
                 continue
         try:
-            async with websockets.connect(QUICKNODE_BSC_WS_URL, ping_interval=10, ping_timeout=20) as ws:
-                await ws.send(json.dumps({"method": "eth_subscribe", "params": ["logs", {"address": PANCAKE_FACTORY_ADDRESS}], "id": 1}))
-                bot.send_message(chat_id, "🔄 Sniping BSC actif (PancakeSwap)")
-                logger.info("Sniping BSC démarré")
-                while trade_active:
-                    try:
-                        log = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
-                        if 'params' not in log:
-                            continue
-                        data = log['params']['result']
-                        if data['topics'][0] != Web3.keccak(text="PairCreated(address,address,address,uint256)").hex():
-                            continue
-                        token0 = w3_bsc.to_checksum_address('0x' + data['data'][26:66])
-                        token1 = w3_bsc.to_checksum_address('0x' + data['data'][90:130])
-                        token_address = token0 if token0 != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1
-                        if token_address in BLACKLISTED_TOKENS or token_address in portfolio or (token_address in rejected_tokens and (time.time() - rejected_tokens[token_address]) / 3600 <= 6):
-                            continue
-                        bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (BSC - PancakeSwap)')
-                        logger.info(f"Snipe BSC: {token_address}")
-                        await validate_and_trade(chat_id, token_address, 'bsc')
-                    except Exception as e:
-                        logger.error(f"Erreur sniping BSC WebSocket: {str(e)}")
-                    await asyncio.sleep(0.005)
+            factory = w3_bsc.eth.contract(address=PANCAKE_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
+            latest_block = w3_bsc.eth.block_number
+            events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 200, toBlock=latest_block)
+            bot.send_message(chat_id, f"🔄 Sniping BSC actif (PancakeSwap) - {len(events)} paires détectées")
+            logger.info(f"Sniping BSC démarré - {len(events)} événements")
+            for event in events:
+                token0 = w3_bsc.to_checksum_address(event['args']['token0'])
+                token1 = w3_bsc.to_checksum_address(event['args']['token1'])
+                token_address = token0 if token0 != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1
+                if token_address in BLACKLISTED_TOKENS or token_address in portfolio or (token_address in rejected_tokens and (time.time() - rejected_tokens[token_address]) / 3600 <= 6):
+                    continue
+                bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (BSC - PancakeSwap)')
+                logger.info(f"Snipe BSC: {token_address}")
+                await validate_and_trade(chat_id, token_address, 'bsc')
+            await asyncio.sleep(5)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur sniping BSC: {str(e)}")
-            logger.error(f"Erreur sniping BSC connexion: {str(e)}")
-            await asyncio.sleep(5)
+            logger.error(f"Erreur sniping BSC: {str(e)}")
+            await asyncio.sleep(10)
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
 async def snipe_new_pairs_eth(chat_id):
@@ -269,33 +256,25 @@ async def snipe_new_pairs_eth(chat_id):
                 await asyncio.sleep(30)
                 continue
         try:
-            async with websockets.connect(QUICKNODE_ETH_WS_URL, ping_interval=10, ping_timeout=20) as ws:
-                await ws.send(json.dumps({"method": "eth_subscribe", "params": ["logs", {"address": UNISWAP_FACTORY_ADDRESS}], "id": 1}))
-                bot.send_message(chat_id, "🔄 Sniping Ethereum actif (Uniswap)")
-                logger.info("Sniping Ethereum démarré")
-                while trade_active:
-                    try:
-                        log = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
-                        if 'params' not in log:
-                            continue
-                        data = log['params']['result']
-                        if data['topics'][0] != Web3.keccak(text="PairCreated(address,address,address,uint256)").hex():
-                            continue
-                        token0 = w3_eth.to_checksum_address('0x' + data['data'][26:66])
-                        token1 = w3_eth.to_checksum_address('0x' + data['data'][90:130])
-                        token_address = token0 if token0 != "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" else token1
-                        if token_address in BLACKLISTED_TOKENS or token_address in portfolio or (token_address in rejected_tokens and (time.time() - rejected_tokens[token_address]) / 3600 <= 6):
-                            continue
-                        bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Ethereum - Uniswap)')
-                        logger.info(f"Snipe Ethereum: {token_address}")
-                        await validate_and_trade(chat_id, token_address, 'eth')
-                    except Exception as e:
-                        logger.error(f"Erreur sniping Ethereum WebSocket: {str(e)}")
-                    await asyncio.sleep(0.005)
+            factory = w3_eth.eth.contract(address=UNISWAP_FACTORY_ADDRESS, abi=PANCAKE_FACTORY_ABI)
+            latest_block = w3_eth.eth.block_number
+            events = factory.events.PairCreated.get_logs(fromBlock=latest_block - 200, toBlock=latest_block)
+            bot.send_message(chat_id, f"🔄 Sniping Ethereum actif (Uniswap) - {len(events)} paires détectées")
+            logger.info(f"Sniping Ethereum démarré - {len(events)} événements")
+            for event in events:
+                token0 = w3_eth.to_checksum_address(event['args']['token0'])
+                token1 = w3_eth.to_checksum_address(event['args']['token1'])
+                token_address = token0 if token0 != "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" else token1
+                if token_address in BLACKLISTED_TOKENS or token_address in portfolio or (token_address in rejected_tokens and (time.time() - rejected_tokens[token_address]) / 3600 <= 6):
+                    continue
+                bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Ethereum - Uniswap)')
+                logger.info(f"Snipe Ethereum: {token_address}")
+                await validate_and_trade(chat_id, token_address, 'eth')
+            await asyncio.sleep(5)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur sniping Ethereum: {str(e)}")
-            logger.error(f"Erreur sniping Ethereum connexion: {str(e)}")
-            await asyncio.sleep(5)
+            logger.error(f"Erreur sniping Ethereum: {str(e)}")
+            await asyncio.sleep(10)
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
 async def snipe_solana_pools(chat_id):
@@ -337,19 +316,18 @@ async def snipe_solana_pools(chat_id):
 
 async def detect_bsc_blocks(chat_id):
     last_block = 0
-    loop = asyncio.get_event_loop()
     while trade_active:
-        if not w3_bsc or not w3_bsc.is_connected():
-            initialize_bot(chat_id)
-            if not w3_bsc:
-                await asyncio.sleep(30)
-                continue
         try:
-            latest_block = await loop.run_in_executor(None, w3_bsc.eth.block_number)
+            if not w3_bsc or not w3_bsc.is_connected():
+                initialize_bot(chat_id)
+                if not w3_bsc:
+                    await asyncio.sleep(30)
+                    continue
+            latest_block = w3_bsc.eth.block_number
             if last_block == 0:
                 last_block = latest_block - 10
             for block_num in range(last_block + 1, latest_block + 1):
-                block = await loop.run_in_executor(None, lambda: w3_bsc.eth.get_block(block_num, full_transactions=True))
+                block = w3_bsc.eth.get_block(block_num, full_transactions=True)
                 for tx in block['transactions']:
                     if 'to' in tx and tx['to'] and validate_address(tx['to'], 'bsc'):
                         token_address = tx['to']
@@ -367,19 +345,18 @@ async def detect_bsc_blocks(chat_id):
 
 async def detect_eth_blocks(chat_id):
     last_block = 0
-    loop = asyncio.get_event_loop()
     while trade_active:
-        if not w3_eth or not w3_eth.is_connected():
-            initialize_bot(chat_id)
-            if not w3_eth:
-                await asyncio.sleep(30)
-                continue
         try:
-            latest_block = await loop.run_in_executor(None, w3_eth.eth.block_number)
+            if not w3_eth or not w3_eth.is_connected():
+                initialize_bot(chat_id)
+                if not w3_eth:
+                    await asyncio.sleep(30)
+                    continue
+            latest_block = w3_eth.eth.block_number
             if last_block == 0:
                 last_block = latest_block - 10
             for block_num in range(last_block + 1, latest_block + 1):
-                block = await loop.run_in_executor(None, lambda: w3_eth.eth.get_block(block_num, full_transactions=True))
+                block = w3_eth.eth.get_block(block_num, full_transactions=True)
                 for tx in block['transactions']:
                     if 'to' in tx and tx['to'] and validate_address(tx['to'], 'eth'):
                         token_address = tx['to']
@@ -440,8 +417,11 @@ async def detect_birdeye(chat_id):
             )
             response.raise_for_status()
             data = response.json()
-            if 'data' not in data or 'tokens' not in data['data']:
-                raise ValueError("Réponse Birdeye invalide")
+            if not data or 'data' not in data or 'tokens' not in data['data']:
+                bot.send_message(chat_id, "⚠️ Réponse Birdeye vide ou invalide")
+                logger.error(f"Réponse Birdeye invalide: {data}")
+                await asyncio.sleep(10)
+                continue
             tokens = data['data']['tokens']
             for token in tokens:
                 token_address = token.get('address')
@@ -451,6 +431,10 @@ async def detect_birdeye(chat_id):
                 logger.info(f"Détection Birdeye: {token_address}")
                 await validate_and_trade(chat_id, token_address, 'solana')
             await asyncio.sleep(5)
+        except requests.exceptions.HTTPError as e:
+            bot.send_message(chat_id, f"⚠️ Erreur Birdeye HTTP: {e.response.status_code} - {e.response.text}")
+            logger.error(f"Erreur Birdeye HTTP: {str(e)}")
+            await asyncio.sleep(10)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur Birdeye: {str(e)}")
             logger.error(f"Erreur Birdeye: {str(e)}")
@@ -458,13 +442,13 @@ async def detect_birdeye(chat_id):
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
 async def monitor_twitter(chat_id):
-    headers = {"X-API-Key": TWITTERAPI_KEY}  # Utilisation de l’en-tête comme recommandé par twitterapi.io
+    headers = {"X-API-Key": TWITTERAPI_KEY}
     while trade_active:
         try:
             response = session.get(
                 "https://api.twitterapi.io/v1/tweets/search",
                 headers=headers,
-                params={"query": '"contract address" OR CA OR launch OR pump', "id": TWITTERAPI_ID},
+                params={"query": '"contract address" OR CA OR launch OR pump'},
                 timeout=5
             )
             response.raise_for_status()
@@ -484,14 +468,16 @@ async def monitor_twitter(chat_id):
                             await validate_and_trade(chat_id, word, chain)
             await asyncio.sleep(3)
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                bot.send_message(chat_id, "⚠️ Twitter API: Clé invalide ou quota dépassé. Vérifiez TWITTERAPI_ID et TWITTERAPI_KEY.")
-                logger.error(f"Twitter API: 401 Unauthorized - {e.response.text}")
-                await asyncio.sleep(60)  # Pause longue pour éviter spam
+            if e.response.status_code == 404:
+                bot.send_message(chat_id, "⚠️ Twitter API IO: Endpoint invalide. Vérifiez l’URL ou contactez twitterapi.io.")
+                logger.error(f"Twitter API 404: {e.response.text}")
+            elif e.response.status_code == 401:
+                bot.send_message(chat_id, "⚠️ Twitter API IO: Clé invalide ou quota dépassé. Vérifiez TWITTERAPI_KEY.")
+                logger.error(f"Twitter API 401: {e.response.text}")
             else:
-                bot.send_message(chat_id, f"⚠️ Erreur Twitter API: {str(e)}")
-                logger.error(f"Erreur Twitter: {str(e)}")
-                await asyncio.sleep(10)
+                bot.send_message(chat_id, f"⚠️ Erreur Twitter API: {e.response.status_code} - {e.response.text}")
+                logger.error(f"Erreur Twitter HTTP: {str(e)}")
+            await asyncio.sleep(60)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur Twitter API: {str(e)}")
             logger.error(f"Erreur Twitter: {str(e)}")
@@ -502,30 +488,34 @@ async def monitor_telegram(chat_id):
         bot.send_message(chat_id, "⚠️ Telegram API non configurée")
         logger.error("Telegram API non configurée")
         return
-    await telegram_client.start()
-    bot.send_message(chat_id, "🔄 Monitoring Telegram actif")
-    logger.info("Monitoring Telegram démarré")
+    try:
+        await telegram_client.start()
+        bot.send_message(chat_id, "🔄 Monitoring Telegram actif")
+        logger.info("Monitoring Telegram démarré")
 
-    @telegram_client.on(events.NewMessage)
-    async def handler(event):
-        try:
-            text = event.message.text.lower()
-            words = text.split()
-            for word in words:
-                chain = 'bsc' if word.startswith("0x") and len(word) == 42 else 'solana' if len(word) in [32, 44] else 'eth'
-                if word in BLACKLISTED_TOKENS or word in portfolio or (word in rejected_tokens and (time.time() - rejected_tokens[word]) / 3600 <= 6):
-                    continue
-                if validate_address(word, chain):
-                    sender = await event.get_sender()
-                    if sender and hasattr(sender, 'participants_count') and sender.participants_count > 1000:
-                        bot.send_message(chat_id, f'🔍 Détection Telegram (@{sender.username}): {word} ({chain})')
-                        logger.info(f"Détection Telegram: {word}")
-                        await validate_and_trade(chat_id, word, chain)
-        except Exception as e:
-            bot.send_message(chat_id, f"⚠️ Erreur Telegram: {str(e)}")
-            logger.error(f"Erreur Telegram: {str(e)}")
+        @telegram_client.on(events.NewMessage)
+        async def handler(event):
+            try:
+                text = event.message.text.lower()
+                words = text.split()
+                for word in words:
+                    chain = 'bsc' if word.startswith("0x") and len(word) == 42 else 'solana' if len(word) in [32, 44omycin) else 'eth'
+                    if word in BLACKLISTED_TOKENS or word in portfolio or (word in rejected_tokens and (time.time() - rejected_tokens[word]) / 3600 <= 6):
+                        continue
+                    if validate_address(word, chain):
+                        sender = await event.get_sender()
+                        if sender and hasattr(sender, 'participants_count') and sender.participants_count > 1000:
+                            bot.send_message(chat_id, f'🔍 Détection Telegram (@{sender.username}): {word} ({chain})')
+                            logger.info(f"Détection Telegram: {word}")
+                            await validate_and_trade(chat_id, word, chain)
+            except Exception as e:
+                bot.send_message(chat_id, f"⚠️ Erreur Telegram: {str(e)}")
+                logger.error(f"Erreur Telegram: {str(e)}")
 
-    await telegram_client.run_until_disconnected()
+        await telegram_client.run_until_disconnected()
+    except Exception as e:
+        bot.send_message(chat_id, f"⚠️ Erreur démarrage Telegram: {str(e)}")
+        logger.error(f"Erreur démarrage Telegram: {str(e)}")
 
 async def validate_and_trade(chat_id, token_address, chain):
     try:
@@ -644,56 +634,35 @@ async def buy_token_eth(chat_id, contract_address, amount):
             initialize_bot(chat_id)
             if not w3_eth.is_connected():
                 raise Exception("Ethereum non connecté")
-        
-        # Vérification de la clé privée
         if not isinstance(PRIVATE_KEY, str) or not PRIVATE_KEY.startswith('0x') or len(PRIVATE_KEY) != 66:
             raise ValueError("Clé privée Ethereum invalide (doit être une chaîne de 64 caractères avec préfixe '0x')")
-        
         router = w3_eth.eth.contract(address=UNISWAP_ROUTER_ADDRESS, abi=PANCAKE_ROUTER_ABI)
         amount_in = w3_eth.to_wei(amount, 'ether')
         amount_out_min = int(amount_in * (1 - slippage_max))
-        
-        # Construire la transaction
         tx = router.functions.swapExactETHForTokens(
             amount_out_min,
             [w3_eth.to_checksum_address('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'), w3_eth.to_checksum_address(contract_address)],
             w3_eth.to_checksum_address(WALLET_ADDRESS),
             int(time.time()) + 30
         ).build_transaction({
-            'from': WALLET_ADDRESS,
-            'value': amount_in,
-            'gas': 250000,
-            'gasPrice': w3_eth.to_wei(gas_fee, 'gwei'),
-            'nonce': w3_eth.eth.get_transaction_count(WALLET_ADDRESS)
+            'from': WALLET_ADDRESS, 'value': amount_in, 'gas': 250000,
+            'gasPrice': w3_eth.to_wei(gas_fee, 'gwei'), 'nonce': w3_eth.eth.get_transaction_count(WALLET_ADDRESS)
         })
-        
-        # Signature et envoi
         signed_tx = w3_eth.eth.account.sign_transaction(tx, PRIVATE_KEY)
         tx_hash = w3_eth.eth.send_raw_transaction(signed_tx.rawTransaction)
         bot.send_message(chat_id, f'⏳ Achat Ethereum {amount} ETH : {contract_address}, TX: {tx_hash.hex()}')
-        
-        # Attente de la confirmation
         receipt = w3_eth.eth.wait_for_transaction_receipt(tx_hash, timeout=20)
         if receipt.status == 1:
             entry_price = detected_tokens[contract_address]['price']
             portfolio[contract_address] = {
-                'amount': amount,
-                'chain': 'eth',
-                'entry_price': entry_price,
+                'amount': amount, 'chain': 'eth', 'entry_price': entry_price,
                 'market_cap_at_buy': detected_tokens[contract_address]['market_cap'],
                 'current_market_cap': detected_tokens[contract_address]['market_cap'],
-                'price_history': [entry_price],
-                'highest_price': entry_price,
-                'profit': 0.0,
+                'price_history': [entry_price], 'highest_price': entry_price, 'profit': 0.0,
                 'buy_time': time.time()
             }
             bot.send_message(chat_id, f'✅ Achat réussi : {amount} ETH de {contract_address} (Uniswap)')
-            daily_trades['buys'].append({
-                'token': contract_address,
-                'chain': 'eth',
-                'amount': amount,
-                'timestamp': datetime.now().strftime('%H:%M:%S')
-            })
+            daily_trades['buys'].append({'token': contract_address, 'chain': 'eth', 'amount': amount, 'timestamp': datetime.now().strftime('%H:%M:%S')})
         else:
             raise Exception("Transaction échouée")
     except ValueError as ve:
@@ -964,7 +933,7 @@ async def sell_token_immediate(chat_id, token):
         if token not in portfolio:
             bot.send_message(chat_id, f'⚠️ Vente impossible : {token} n\'est pas dans le portefeuille')
             return
-        amount = portfolio[token]["amount"]
+        amount = portfolio[token]['amount']
         chain = portfolio[token]['chain']
         current_price = get_token_data(token, chain)['market_cap'] / detected_tokens.get(token, {}).get('supply', 1)
         await sell_token(chat_id, token, amount, chain, current_price)
@@ -1086,9 +1055,12 @@ def initialize_and_run_threads(chat_id):
             tasks = [
                 snipe_new_pairs_bsc, snipe_new_pairs_eth, snipe_solana_pools,
                 detect_bsc_blocks, detect_eth_blocks, detect_bscscan,
-                detect_birdeye, monitor_twitter, monitor_telegram, monitor_and_sell
+                detect_birdeye, monitor_twitter, monitor_and_sell
             ]
-            with ThreadPoolExecutor(max_workers=10) as executor:
+            # Lancer Telegram dans le même event loop
+            loop = asyncio.get_event_loop()
+            loop.create_task(monitor_telegram(chat_id))
+            with ThreadPoolExecutor(max_workers=9) as executor:
                 for task in tasks:
                     executor.submit(run_task_in_thread, task, chat_id)
                     logger.info(f"Tâche {task.__name__} lancée")
