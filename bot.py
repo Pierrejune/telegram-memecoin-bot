@@ -48,9 +48,10 @@ last_twitter_request_time = 0
 daily_trades = {'buys': [], 'sells': []}
 rejected_tokens = {}
 trade_active = False
-pause_auto_sell = False  # Pour désactiver les ventes automatiques
+pause_auto_sell = False
 portfolio = {}
 detected_tokens = {}
+executor_futures = []  # Pour gérer les threads
 BLACKLISTED_TOKENS = {"So11111111111111111111111111111111111111112"}
 
 # Variables d’environnement
@@ -87,9 +88,9 @@ mise_depart_eth = 0.05
 gas_fee = 15
 stop_loss_threshold = 15
 trailing_stop_percentage = 5
-take_profit_steps = [1.2, 2, 10, 100, 500]  # Optimisé pour x1000
+take_profit_steps = [1.2, 2, 10, 100, 500]
 max_positions = 5
-profit_reinvestment_ratio = 0.9  # 90% initialement
+profit_reinvestment_ratio = 0.9
 slippage_max = 0.05
 
 MIN_VOLUME_SOL = 100
@@ -224,11 +225,11 @@ def calculate_buy_amount(chain, liquidity):
         return base_amount * 1.5
     return base_amount
 
-@backoff.on_exception(backoff.expo, Exception, max_tries=5)
+@backoff.on_exception(backoff.expo, Exception, max_tries=3)
 def get_token_data(token_address, chain):
-    for _ in range(5):
+    for _ in range(3):
         try:
-            response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=10)
+            response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=15)
             response.raise_for_status()
             pairs = response.json().get('pairs', [])
             if not pairs or pairs[0].get('chainId') != chain:
@@ -249,23 +250,6 @@ def get_token_data(token_address, chain):
         except Exception as e:
             logger.error(f"Erreur DexScreener pour {token_address}: {str(e)}")
             time.sleep(1)
-    if chain == 'solana':
-        try:
-            response = session.get(f"https://api.dextools.io/v1/token?chain=solana&address={token_address}", headers={"X-API-Key": os.getenv("DEXTOOLS_API_KEY", "YOUR_DEXTOOLS_API_KEY")}, timeout=10)
-            data = response.json()['data']
-            age_hours = (time.time() - data.get('createdAt', time.time()) / 1000) / 3600
-            if age_hours > MAX_TOKEN_AGE_HOURS:
-                return None
-            return {
-                'volume_24h': data.get('volume24h', 0),
-                'liquidity': data.get('liquidity', 0),
-                'market_cap': data.get('marketCap', 0),
-                'price': data.get('price', 0),
-                'buy_sell_ratio': 1,
-                'pair_created_at': data.get('createdAt', time.time()) / 1000
-            }
-        except:
-            pass
     w3 = w3_bsc if chain == 'bsc' else w3_eth if chain == 'eth' else None
     if w3 and w3.is_connected():
         try:
@@ -318,7 +302,7 @@ async def get_twitter_mentions(token_address, chat_id):
     global last_twitter_request_time
     try:
         current_time = time.time()
-        if 'last_twitter_request_time' not in globals() or (current_time - last_twitter_request_time) >= 900:
+        if 'last_twitter_request_time' not in globals() or (current_time - last_twitter_request_time) >= 1800:  # 30min
             headers = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
             response = session.get(
                 "https://api.twitter.com/2/tweets/search/recent",
@@ -440,12 +424,12 @@ async def snipe_solana_pools(chat_id):
                 while trade_active:
                     try:
                         msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+                        logger.info(f"Données Solana WebSocket: {msg}")
                         if 'result' not in msg or 'params' not in msg:
                             continue
                         data = msg['params']['result']['value']['account']['data'][0]
-                        logger.info(f"Données Solana reçues: {data}")
                         for acc in data.split():
-                            if validate_address(acc, 'solana') and acc not in BLACKLISTED_TOKENS and acc not in [str(RAYDIUM_PROGRAM_ID), str(PUMP_FUN_PROGRAM_ID), str(TOKEN_PROGRAM_ID)] and acc not in portfolio:
+                            if validate_address(acc, 'solana') and acc not in BLACKLISTED_TOKENS and acc not in portfolio:
                                 token_address = acc
                                 response = session.post(QUICKNODE_SOL_URL, json={
                                     "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo", "params": [token_address]
@@ -466,24 +450,39 @@ async def snipe_solana_pools(chat_id):
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
 async def detect_pump_fun(chat_id):
-    while trade_active:
-        try:
-            response = session.get("https://api.pump.fun/v1/tokens/recent", timeout=10)
-            response.raise_for_status()
-            tokens = response.json().get('tokens', [])
-            for token in tokens:
-                token_address = token.get('address')
-                age_hours = (time.time() - token.get('created_at', time.time()) / 1000) / 3600
-                if not token_address or age_hours > MAX_TOKEN_AGE_HOURS or token_address in BLACKLISTED_TOKENS or token_address in portfolio:
-                    continue
-                queue_message(chat_id, f'🔍 Détection Pump.fun : {token_address} (Solana)')
-                logger.info(f"Détection Pump.fun: {token_address}")
-                await validate_and_trade(chat_id, token_address, 'solana')
-            await asyncio.sleep(1)
-        except Exception as e:
-            queue_message(chat_id, f"⚠️ Erreur Pump.fun: {str(e)}")
-            logger.error(f"Erreur Pump.fun: {str(e)}")
+    queue_message(chat_id, "⚠️ Pump.fun API désactivée : endpoint 404")
+    logger.info("Pump.fun désactivé en attendant un endpoint valide")
+    return
+
+@backoff.on_exception(backoff.expo, Exception, max_tries=5)
+async def detect_birdeye(chat_id):
+    try:
+        response = session.get(
+            f"https://public-api.birdeye.so/v1/token/list?sort_by=mc&sort_type=desc&limit=50",
+            headers={"X-API-KEY": BIRDEYE_API_KEY},
+            timeout=15
+        )
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"Birdeye réponse: {data}")
+        if not data or 'data' not in data or 'tokens' not in data['data']:
+            logger.error(f"Réponse Birdeye invalide: {data}")
             await asyncio.sleep(10)
+            return
+        tokens = data['data']['tokens']
+        for token in tokens:
+            token_address = token.get('address')
+            age_hours = (time.time() - token.get('created_at', time.time()) / 1000) / 3600
+            if not token_address or age_hours > MAX_TOKEN_AGE_HOURS or token_address in BLACKLISTED_TOKENS or token_address in portfolio:
+                continue
+            queue_message(chat_id, f'🔍 Détection Birdeye : {token_address} (Solana)')
+            logger.info(f"Détection Birdeye: {token_address}")
+            await validate_and_trade(chat_id, token_address, 'solana')
+        await asyncio.sleep(5)
+    except Exception as e:
+        queue_message(chat_id, f"⚠️ Erreur Birdeye: {str(e)}")
+        logger.error(f"Erreur Birdeye: {str(e)}")
+        await asyncio.sleep(10)
 
 async def detect_bsc_blocks(chat_id):
     last_block = 0
@@ -577,40 +576,6 @@ async def detect_bscscan(chat_id):
         except Exception as e:
             queue_message(chat_id, f"⚠️ Erreur BscScan: {str(e)}")
             logger.error(f"Erreur BscScan: {str(e)}")
-            await asyncio.sleep(10)
-
-@backoff.on_exception(backoff.expo, Exception, max_tries=5)
-async def detect_birdeye(chat_id):
-    if not BIRDEYE_API_KEY or BIRDEYE_API_KEY == "your_birdeye_api_key":
-        queue_message(chat_id, "⚠️ Clé Birdeye invalide. Configurez BIRDEYE_API_KEY.")
-        logger.error("Clé Birdeye manquante")
-        return
-    while trade_active:
-        try:
-            response = session.get(
-                f"https://public-api.birdeye.so/v1/token/list?sort_by=mc&sort_type=desc&limit=50",
-                headers={"X-API-KEY": BIRDEYE_API_KEY},
-                timeout=10
-            )
-            response.raise_for_status()
-            data = response.json()
-            if not data or 'data' not in data or 'tokens' not in data['data']:
-                logger.error(f"Réponse Birdeye invalide: {data}")
-                await asyncio.sleep(10)
-                continue
-            tokens = data['data']['tokens']
-            for token in tokens:
-                token_address = token.get('address')
-                age_hours = (time.time() - token.get('created_at', time.time()) / 1000) / 3600
-                if not token_address or age_hours > MAX_TOKEN_AGE_HOURS or token_address in BLACKLISTED_TOKENS or token_address in portfolio or (token_address in rejected_tokens and (time.time() - rejected_tokens[token_address]) / 3600 <= 6):
-                    continue
-                queue_message(chat_id, f'🔍 Détection Birdeye : {token_address} (Solana)')
-                logger.info(f"Détection Birdeye: {token_address}")
-                await validate_and_trade(chat_id, token_address, 'solana')
-            await asyncio.sleep(5)
-        except Exception as e:
-            queue_message(chat_id, f"⚠️ Erreur Birdeye: {str(e)}")
-            logger.error(f"Erreur Birdeye: {str(e)}")
             await asyncio.sleep(10)
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
@@ -756,7 +721,7 @@ async def validate_and_trade(chat_id, token_address, chain):
             queue_message(chat_id, f'⚠️ {token_address} rejeté : Hype insuffisant ({twitter_mentions} mentions Twitter)')
             return
 
-        if buy_sell_ratio > 2 and age_hours < 0.083:  # < 5min
+        if buy_sell_ratio > 2 and age_hours < 0.083:
             queue_message(chat_id, f'🚀 Pump potentiel détecté : {token_address} (Ratio A/V: {buy_sell_ratio})')
 
         exchange = 'PancakeSwap' if chain == 'bsc' else 'Uniswap' if chain == 'eth' else 'Raydium' if 'Raydium' in token_address else 'Pump.fun'
@@ -899,11 +864,11 @@ async def buy_token_solana(chat_id, contract_address, amount):
         logger.error(f"Échec achat Solana: {str(e)}")
 
 def get_dynamic_trailing_stop(profit_pct):
-    if profit_pct < 1000:  # < x10
+    if profit_pct < 1000:
         return 5
-    elif profit_pct < 10000:  # < x100
+    elif profit_pct < 10000:
         return 10
-    else:  # > x100
+    else:
         return 20
 
 async def sell_token(chat_id, contract_address, amount, chain, current_price):
@@ -1074,16 +1039,16 @@ async def monitor_and_sell(chat_id):
                     data['alerted_x100'] = True
 
                 if not pause_auto_sell:
-                    if profit_pct >= take_profit_steps[4] * 100:  # x500
+                    if profit_pct >= take_profit_steps[4] * 100:
                         await sell_token(chat_id, contract_address, amount * 0.5, chain, current_price)
                         queue_message(chat_id, f'💰 Vente 50% à x500 : {contract_address} (+{profit_pct:.2f}%)')
-                    elif profit_pct >= take_profit_steps[3] * 100:  # x100
+                    elif profit_pct >= take_profit_steps[3] * 100:
                         await sell_token(chat_id, contract_address, amount * 0.25, chain, current_price)
-                    elif profit_pct >= take_profit_steps[2] * 100:  # x10
+                    elif profit_pct >= take_profit_steps[2] * 100:
                         await sell_token(chat_id, contract_address, amount * 0.2, chain, current_price)
-                    elif profit_pct >= take_profit_steps[1] * 100:  # x2
+                    elif profit_pct >= take_profit_steps[1] * 100:
                         await sell_token(chat_id, contract_address, amount * 0.15, chain, current_price)
-                    elif profit_pct >= take_profit_steps[0] * 100:  # x1.2
+                    elif profit_pct >= take_profit_steps[0] * 100:
                         await sell_token(chat_id, contract_address, amount * 0.1, chain, current_price)
                     elif current_price <= trailing_stop_price or loss_pct >= stop_loss_threshold or current_data.get('buy_sell_ratio', 1) < 0.5:
                         await sell_token(chat_id, contract_address, amount, chain, current_price)
@@ -1230,7 +1195,7 @@ async def adjust_take_profit(message):
     chat_id = message.chat.id
     try:
         new_tp = [float(x) for x in message.text.split(",")]
-        if len(new_tp) == 5 and all(x > 0 for x in new_tp):  # Ajusté pour 5 paliers
+        if len(new_tp) == 5 and all(x > 0 for x in new_tp):
             take_profit_steps = new_tp
             queue_message(chat_id, f'✅ Take-Profit mis à jour à x{take_profit_steps[0]}, x{take_profit_steps[1]}, x{take_profit_steps[2]}, x{take_profit_steps[3]}, x{take_profit_steps[4]}')
         else:
@@ -1265,7 +1230,7 @@ def run_task_in_thread(task, *args):
         queue_message(args[0], f"⚠️ Erreur thread {task.__name__}: {str(e)}")
 
 def initialize_and_run_threads(chat_id):
-    global trade_active, chat_id_global
+    global trade_active, chat_id_global, executor_futures
     chat_id_global = chat_id
     try:
         initialize_bot(chat_id)
@@ -1279,8 +1244,8 @@ def initialize_and_run_threads(chat_id):
                 detect_birdeye, detect_pump_fun, monitor_twitter, monitor_telegram, monitor_and_sell
             ]
             with ThreadPoolExecutor(max_workers=11) as executor:
+                executor_futures = [executor.submit(run_task_in_thread, task, chat_id) for task in tasks]
                 for task in tasks:
-                    executor.submit(run_task_in_thread, task, chat_id)
                     logger.info(f"Tâche {task.__name__} lancée")
         else:
             queue_message(chat_id, "⚠️ Échec initialisation : Connexion(s) manquante(s)")
@@ -1334,10 +1299,16 @@ def resume_auto_sell_handler(message):
 
 @bot.message_handler(commands=['stop'])
 def stop_trading_handler(message):
-    global trade_active
+    global trade_active, executor_futures
     chat_id = message.chat.id
     trade_active = False
+    logger.info("Commande /stop reçue, trade_active mis à False")
     queue_message(chat_id, "⏹️ Trading arrêté complètement.")
+    for future in executor_futures:
+        if not future.done():
+            future.cancel()
+    executor_futures.clear()
+    time.sleep(2)
 
 async def show_main_menu(chat_id):
     markup = InlineKeyboardMarkup()
