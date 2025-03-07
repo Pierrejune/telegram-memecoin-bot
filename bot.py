@@ -21,26 +21,25 @@ from waitress import serve
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Configuration du logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Configuration de la session HTTP
 session = requests.Session()
 session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
-retry_strategy = Retry(total=5, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+retry_strategy = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 
 # Variables globales
 last_x_call = 0
 x_last_reset = time.time()
-x_requests_remaining = 100  # Limite quotidienne approximative pour API X gratuite
+x_requests_remaining = 100
 daily_trades = {'buys': [], 'sells': []}
 rejected_tokens = {}
 trade_active = False
 portfolio = {}
 detected_tokens = {}
+BLACKLISTED_TOKENS = {"So11111111111111111111111111111111111111112"}  # Tokens à ignorer
 
 # Variables d’environnement
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "default_token")
@@ -57,7 +56,6 @@ PORT = int(os.getenv("PORT", 8080))
 
 TWITTER_HEADERS = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
 
-# Initialisation Flask et Telebot
 app = Flask(__name__)
 bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 
@@ -110,7 +108,7 @@ def initialize_bot():
         w3_bsc = Web3(Web3.HTTPProvider(QUICKNODE_BSC_URL))
         w3_bsc.middleware_onion.inject(geth_poa_middleware, layer=0)
         if w3_bsc.is_connected():
-            logger.info("Connexion BSC réussie via QuickNode")
+            logger.info("Connexion BSC réussie")
             bot.send_message(chat_id_global, "✅ Connexion BSC établie : QuickNode")
         else:
             raise Exception("Échec de connexion")
@@ -122,7 +120,7 @@ def initialize_bot():
     try:
         w3_eth = Web3(Web3.HTTPProvider(QUICKNODE_ETH_URL))
         if w3_eth.is_connected():
-            logger.info("Connexion Ethereum réussie via QuickNode")
+            logger.info("Connexion Ethereum réussie")
             bot.send_message(chat_id_global, "✅ Connexion Ethereum établie : QuickNode")
         else:
             raise Exception("Échec de connexion")
@@ -163,36 +161,28 @@ def validate_address(token_address, chain):
     return False
 
 def get_token_data(token_address, chain):
-    for attempt in range(5):
-        try:
-            response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=5)
-            response.raise_for_status()
-            data = response.json()['pairs'][0] if response.json()['pairs'] else {}
-            if not data or data.get('chainId') != chain:
-                logger.warning(f"DexScreener: Pas de données pour {token_address} sur {chain}")
-                return None
-            
-            volume_24h = float(data.get('volume', {}).get('h24', 0))
-            liquidity = float(data.get('liquidity', {}).get('usd', 0))
-            market_cap = float(data.get('marketCap', 0))
-            price = float(data.get('priceUsd', 0))
-            buy_count_5m = float(data.get('txns', {}).get('m5', {}).get('buys', 0))
-            sell_count_5m = float(data.get('txns', {}).get('m5', {}).get('sells', 0))
-            buy_sell_ratio = buy_count_5m / max(sell_count_5m, 1)
-            pair_created_at = data.get('pairCreatedAt', 0) / 1000 if data.get('pairCreatedAt') else time.time() - 3600
-            
-            logger.info(f"DexScreener OK: {token_address} - Vol: ${volume_24h}, Liq: ${liquidity}, MC: ${market_cap}")
-            return {
-                'volume_24h': volume_24h, 'liquidity': liquidity, 'market_cap': market_cap,
-                'price': price, 'buy_sell_ratio': buy_sell_ratio, 'pair_created_at': pair_created_at
-            }
-        except Exception as e:
-            logger.error(f"Erreur DexScreener {token_address}, tentative {attempt + 1}/5: {str(e)}")
-            if attempt < 4:
-                time.sleep(0.5 ** attempt)
-            else:
-                logger.error(f"DexScreener échec définitif pour {token_address}")
-                return None
+    try:
+        response = session.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=1)
+        response.raise_for_status()
+        data = response.json()['pairs'][0] if response.json()['pairs'] else {}
+        if not data or data.get('chainId') != chain:
+            return None
+        
+        volume_24h = float(data.get('volume', {}).get('h24', 0))
+        liquidity = float(data.get('liquidity', {}).get('usd', 0))
+        market_cap = float(data.get('marketCap', 0))
+        price = float(data.get('priceUsd', 0))
+        buy_count_5m = float(data.get('txns', {}).get('m5', {}).get('buys', 0))
+        sell_count_5m = float(data.get('txns', {}).get('m5', {}).get('sells', 0))
+        buy_sell_ratio = buy_count_5m / max(sell_count_5m, 1)
+        pair_created_at = data.get('pairCreatedAt', 0) / 1000 if data.get('pairCreatedAt') else time.time() - 3600
+        
+        return {
+            'volume_24h': volume_24h, 'liquidity': liquidity, 'market_cap': market_cap,
+            'price': price, 'buy_sell_ratio': buy_sell_ratio, 'pair_created_at': pair_created_at
+        }
+    except Exception:
+        return None
 
 def snipe_new_pairs_bsc(chat_id):
     global w3_bsc
@@ -212,18 +202,23 @@ def snipe_new_pairs_bsc(chat_id):
                     'address': PANCAKE_FACTORY_ADDRESS
                 })
                 for log in logs:
-                    if log['topics'][0].hex() == Web3.keccak(text="PairCreated(address,address,address,uint256)").hex():
-                        token0 = w3_bsc.to_checksum_address(log['data'][2:66][-40:])
-                        token1 = w3_bsc.to_checksum_address(log['data'][66:130][-40:])
+                    if log['topics'][0].hex() != Web3.keccak(text="PairCreated(address,address,address,uint256)").hex():
+                        continue
+                    try:
+                        token0 = w3_bsc.to_checksum_address('0x' + log['data'][26:66])
+                        token1 = w3_bsc.to_checksum_address('0x' + log['data'][90:130])
                         token_address = token0 if token0 != "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" else token1
-                        if token_address not in portfolio and (token_address not in rejected_tokens or (time.time() - rejected_tokens[token_address]) / 3600 > 12):
-                            bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (BSC - PancakeSwap)')
-                            validate_and_trade(chat_id, token_address, 'bsc')
+                        if token_address in BLACKLISTED_TOKENS or token_address in portfolio or (token_address in rejected_tokens and (time.time() - rejected_tokens[token_address]) / 3600 <= 12):
+                            continue
+                        bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (BSC - PancakeSwap)')
+                        validate_and_trade(chat_id, token_address, 'bsc')
+                    except ValueError:
+                        continue
                 last_block = current_block
-            time.sleep(0.1)
+            time.sleep(0.01)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur sniping BSC: {str(e)}")
-            time.sleep(2)
+            time.sleep(1)
 
 def snipe_new_pairs_eth(chat_id):
     global w3_eth
@@ -243,21 +238,26 @@ def snipe_new_pairs_eth(chat_id):
                     'address': UNISWAP_FACTORY_ADDRESS
                 })
                 for log in logs:
-                    if log['topics'][0].hex() == Web3.keccak(text="PairCreated(address,address,address,uint256)").hex():
-                        token0 = w3_eth.to_checksum_address(log['data'][2:66][-40:])
-                        token1 = w3_eth.to_checksum_address(log['data'][66:130][-40:])
+                    if log['topics'][0].hex() != Web3.keccak(text="PairCreated(address,address,address,uint256)").hex():
+                        continue
+                    try:
+                        token0 = w3_eth.to_checksum_address('0x' + log['data'][26:66])
+                        token1 = w3_eth.to_checksum_address('0x' + log['data'][90:130])
                         token_address = token0 if token0 != "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" else token1
-                        if token_address not in portfolio and (token_address not in rejected_tokens or (time.time() - rejected_tokens[token_address]) / 3600 > 12):
-                            bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Ethereum - Uniswap)')
-                            validate_and_trade(chat_id, token_address, 'eth')
+                        if token_address in BLACKLISTED_TOKENS or token_address in portfolio or (token_address in rejected_tokens and (time.time() - rejected_tokens[token_address]) / 3600 <= 12):
+                            continue
+                        bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Ethereum - Uniswap)')
+                        validate_and_trade(chat_id, token_address, 'eth')
+                    except ValueError:
+                        continue
                 last_block = current_block
-            time.sleep(0.1)
+            time.sleep(0.01)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur sniping Ethereum: {str(e)}")
-            time.sleep(2)
+            time.sleep(1)
 
 def snipe_4meme_bsc_with_bscscan(chat_id):
-    last_timestamp = int(time.time()) - 600  # Dernières 10 minutes
+    last_timestamp = int(time.time()) - 600
     while trade_active:
         try:
             if w3_bsc is None or not w3_bsc.is_connected():
@@ -265,29 +265,32 @@ def snipe_4meme_bsc_with_bscscan(chat_id):
             if not w3_bsc or not w3_bsc.is_connected():
                 bot.send_message(chat_id, "⚠️ BSC non connecté, sniping 4Meme désactivé")
                 return
-
             response = session.get(
                 f"https://api.bscscan.com/api?module=account&action=tokentx&sort=desc&apikey={BSCSCAN_API_KEY}&startblock=0&endblock=99999999",
-                timeout=5
+                timeout=1
             )
             response.raise_for_status()
             txs = response.json().get('result', [])
-            
+            if not isinstance(txs, list):
+                time.sleep(1)
+                continue
             for tx in txs:
+                if not isinstance(tx, dict) or 'timeStamp' not in tx or 'contractAddress' not in tx:
+                    continue
                 timestamp = int(tx['timeStamp'])
                 if timestamp <= last_timestamp:
                     continue
                 token_address = tx['contractAddress']
-                if validate_address(token_address, 'bsc') and token_address not in portfolio and (token_address not in rejected_tokens or (time.time() - rejected_tokens[token_address]) / 3600 > 12):
-                    data = get_token_data(token_address, 'bsc')
-                    if data and data['volume_24h'] < 1000 and data['liquidity'] >= MIN_LIQUIDITY and data['market_cap'] < 50000:
-                        bot.send_message(chat_id, f'🎯 Snipe détecté via BscScan : {token_address} (BSC - 4Meme probable)')
-                        validate_and_trade(chat_id, token_address, 'bsc')
+                if token_address in BLACKLISTED_TOKENS or token_address in portfolio or (token_address in rejected_tokens and (time.time() - rejected_tokens[token_address]) / 3600 <= 12):
+                    continue
+                if validate_address(token_address, 'bsc'):
+                    bot.send_message(chat_id, f'🎯 Snipe détecté via BscScan : {token_address} (BSC - 4Meme probable)')
+                    validate_and_trade(chat_id, token_address, 'bsc')
             last_timestamp = int(time.time())
-            time.sleep(1)
+            time.sleep(0.01)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur sniping 4Meme via BscScan: {str(e)}")
-            time.sleep(5)
+            time.sleep(1)
 
 def snipe_solana_pools(chat_id):
     last_signature_raydium = None
@@ -309,7 +312,9 @@ def snipe_solana_pools(chat_id):
                 if 'result' in tx and tx['result']:
                     for account in tx['result']['transaction']['message']['accountKeys']:
                         token_address = account['pubkey']
-                        if validate_address(token_address, 'solana') and token_address not in [str(RAYDIUM_PROGRAM_ID), str(TOKEN_PROGRAM_ID), "ComputeBudget111111111111111111111111111111"] and token_address not in portfolio:
+                        if token_address in BLACKLISTED_TOKENS or token_address in [str(RAYDIUM_PROGRAM_ID), str(TOKEN_PROGRAM_ID), "ComputeBudget111111111111111111111111111111"] or token_address in portfolio:
+                            continue
+                        if validate_address(token_address, 'solana'):
                             bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Solana - Raydium)')
                             validate_and_trade(chat_id, token_address, 'solana')
             if signatures:
@@ -330,22 +335,24 @@ def snipe_solana_pools(chat_id):
                 if 'result' in tx and tx['result']:
                     for account in tx['result']['transaction']['message']['accountKeys']:
                         token_address = account['pubkey']
-                        if validate_address(token_address, 'solana') and token_address not in [str(PUMP_FUN_PROGRAM_ID), str(TOKEN_PROGRAM_ID), "ComputeBudget111111111111111111111111111111"] and token_address not in portfolio:
+                        if token_address in BLACKLISTED_TOKENS or token_address in [str(PUMP_FUN_PROGRAM_ID), str(TOKEN_PROGRAM_ID), "ComputeBudget111111111111111111111111111111"] or token_address in portfolio:
+                            continue
+                        if validate_address(token_address, 'solana'):
                             bot.send_message(chat_id, f'🎯 Snipe détecté : {token_address} (Solana - Pump.fun)')
                             validate_and_trade(chat_id, token_address, 'solana')
             if signatures:
                 last_signature_pump = signatures[0]['signature']
-            time.sleep(0.1)
+            time.sleep(0.01)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur sniping Solana: {str(e)}")
-            time.sleep(2)
+            time.sleep(1)
 
 def monitor_x(chat_id):
     global x_requests_remaining, x_last_reset, last_x_call
     while trade_active:
         try:
             current_time = time.time()
-            if current_time - x_last_reset >= 86400:  # Reset quotidien (24h)
+            if current_time - x_last_reset >= 86400:
                 x_requests_remaining = 100
                 x_last_reset = current_time
                 bot.send_message(chat_id, "ℹ️ Quota X réinitialisé : 100 requêtes restantes")
@@ -356,19 +363,20 @@ def monitor_x(chat_id):
                 time.sleep(wait_time)
                 continue
 
-            if current_time - last_x_call < 900:  # 15 minutes
-                time.sleep(900 - (current_time - last_x_call))
+            time_since_last = current_time - last_x_call
+            if time_since_last < 900:
+                time.sleep(900 - time_since_last)
                 continue
 
             response = session.get(
                 "https://api.twitter.com/2/tweets/search/recent",
                 headers=TWITTER_HEADERS,
                 params={"query": "\"contract address\" OR CA OR launch OR pump -is:retweet", "max_results": 100, "expansions": "author_id", "user.fields": "public_metrics"},
-                timeout=5
+                timeout=1
             )
             response.raise_for_status()
             x_requests_remaining -= 1
-            last_x_call = current_time
+            last_x_call = time.time()
             data = response.json()
             tweets = data.get('data', [])
             users = {u['id']: u for u in data.get('includes', {}).get('users', [])}
@@ -381,26 +389,31 @@ def monitor_x(chat_id):
                     words = text.split()
                     for word in words:
                         chain = 'bsc' if word.startswith("0x") and len(word) == 42 else 'solana' if len(word) in [32, 44] else 'eth'
-                        if validate_address(word, chain) and word not in portfolio:
-                            if word in rejected_tokens and (time.time() - rejected_tokens[word]) / 3600 < 12:
-                                continue
+                        if word in BLACKLISTED_TOKENS or word in portfolio or (word in rejected_tokens and (time.time() - rejected_tokens[word]) / 3600 <= 12):
+                            continue
+                        if validate_address(word, chain):
                             bot.send_message(chat_id, f'🔍 Token détecté via X (@{user["username"]}, {followers} abonnés): {word} ({chain})')
                             validate_and_trade(chat_id, word, chain)
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                bot.send_message(chat_id, "⚠️ Limite X atteinte, attente 15 min")
+                time.sleep(900)
+            else:
+                bot.send_message(chat_id, f"⚠️ Erreur X: {str(e)}")
+                time.sleep(60)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Erreur X: {str(e)}")
-            time.sleep(900)
+            time.sleep(60)
 
 def validate_and_trade(chat_id, token_address, chain):
     try:
-        if chain == 'solana' and token_address in [str(TOKEN_PROGRAM_ID), str(RAYDIUM_PROGRAM_ID), str(PUMP_FUN_PROGRAM_ID), "ComputeBudget111111111111111111111111111111"]:
-            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Programme système détecté')
-            rejected_tokens[token_address] = time.time()
-            return
+        if token_address in BLACKLISTED_TOKENS:
+            return  # Ignorer immédiatement
 
         data = get_token_data(token_address, chain)
         if data is None:
-            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Échec récupération données DexScreener')
             rejected_tokens[token_address] = time.time()
+            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Pas de données DexScreener')
             return
 
         volume_24h = data['volume_24h']
@@ -409,47 +422,21 @@ def validate_and_trade(chat_id, token_address, chain):
         buy_sell_ratio = data['buy_sell_ratio']
         price = data['price']
         pair_created_at = data['pair_created_at']
-
         age_hours = (time.time() - pair_created_at) / 3600
+
         min_volume = MIN_VOLUME_BSC if chain == 'bsc' else MIN_VOLUME_ETH if chain == 'eth' else MIN_VOLUME_SOL
         max_volume = MAX_VOLUME_BSC if chain == 'bsc' else MAX_VOLUME_ETH if chain == 'eth' else MAX_VOLUME_SOL
         min_market_cap = MIN_MARKET_CAP_BSC if chain == 'bsc' else MIN_MARKET_CAP_ETH if chain == 'eth' else MIN_MARKET_CAP_SOL
         max_market_cap = MAX_MARKET_CAP_BSC if chain == 'bsc' else MAX_MARKET_CAP_ETH if chain == 'eth' else MAX_MARKET_CAP_SOL
 
-        if len(portfolio) >= max_positions:
-            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Limite de {max_positions} positions atteinte')
-            return
-        if age_hours > MAX_TOKEN_AGE_HOURS or age_hours < 0:
-            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Âge {age_hours:.2f}h > {MAX_TOKEN_AGE_HOURS}h')
-            rejected_tokens[token_address] = time.time()
-            return
-        if liquidity < MIN_LIQUIDITY:
-            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Liquidité ${liquidity:.2f} < ${MIN_LIQUIDITY}')
-            rejected_tokens[token_address] = time.time()
-            return
-        if volume_24h < min_volume:
-            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Volume ${volume_24h:.2f} < ${min_volume}')
-            rejected_tokens[token_address] = time.time()
-            return
-        if volume_24h > max_volume:
-            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Volume ${volume_24h:.2f} > ${max_volume}')
-            rejected_tokens[token_address] = time.time()
-            return
-        if market_cap < min_market_cap:
-            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Market Cap ${market_cap:.2f} < ${min_market_cap}')
-            rejected_tokens[token_address] = time.time()
-            return
-        if market_cap > max_market_cap:
-            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Market Cap ${market_cap:.2f} > ${max_market_cap}')
-            rejected_tokens[token_address] = time.time()
-            return
-        if buy_sell_ratio < MIN_BUY_SELL_RATIO and age_hours > 0.5:
-            bot.send_message(chat_id, f'⚠️ {token_address} rejeté : Ratio A/V {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO}')
+        if len(portfolio) >= max_positions or age_hours > MAX_TOKEN_AGE_HOURS or liquidity < MIN_LIQUIDITY or \
+           volume_24h < min_volume or volume_24h > max_volume or market_cap < min_market_cap or \
+           market_cap > max_market_cap or (buy_sell_ratio < MIN_BUY_SELL_RATIO and age_hours > 0.5):
             rejected_tokens[token_address] = time.time()
             return
 
         exchange = 'PancakeSwap' if chain == 'bsc' and token_address in snipe_new_pairs_bsc.__code__.co_consts else '4Meme' if chain == 'bsc' else 'Uniswap' if chain == 'eth' else 'Raydium' if token_address in snipe_solana_pools.__code__.co_consts else 'Pump.fun'
-        bot.send_message(chat_id, f'✅ Token validé : {token_address} ({chain} - {exchange}) - Vol: ${volume_24h:.2f}, Liq: ${liquidity:.2f}, MC: ${market_cap:.2f}')
+        bot.send_message(chat_id, f'✅ Token validé : {token_address} ({chain} - {exchange})')
         detected_tokens[token_address] = {
             'address': token_address, 'volume': volume_24h, 'liquidity': liquidity,
             'market_cap': market_cap, 'supply': market_cap / price if price > 0 else 0, 'price': price,
