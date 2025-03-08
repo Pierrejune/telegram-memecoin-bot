@@ -42,7 +42,7 @@ trade_active = False
 bot_active = True
 portfolio = {}
 detected_tokens = {}
-last_detection_time = {}  # Pour limiter les doublons dans un court laps de temps
+last_detection_time = {}
 BLACKLISTED_TOKENS = {"So11111111111111111111111111111111111111112"}
 pause_auto_sell = False
 chat_id_global = None
@@ -67,15 +67,15 @@ profit_reinvestment_ratio = 0.9
 slippage_max = 0.05
 MIN_VOLUME_SOL = 100
 MAX_VOLUME_SOL = 2000000
-MIN_LIQUIDITY = 5000  # Filtrer strictement > 5000 $
+MIN_LIQUIDITY = 5000
 MIN_MARKET_CAP_SOL = 1000
 MAX_MARKET_CAP_SOL = 5000000
 MIN_BUY_SELL_RATIO = 1.5
 MAX_TOKEN_AGE_HOURS = 6
 MIN_SOCIAL_MENTIONS = 5
-MIN_SOL_AMOUNT = 0.1  # Montant minimum en SOL pour une transaction
-MIN_ACCOUNTS_IN_TX = 3  # Nombre minimum de comptes dans une transaction
-DETECTION_COOLDOWN = 60  # Délai en secondes entre détections du même token
+MIN_SOL_AMOUNT = 0.1
+MIN_ACCOUNTS_IN_TX = 3
+DETECTION_COOLDOWN = 60
 
 # Constantes Solana
 RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
@@ -84,7 +84,6 @@ TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5
 
 app = Flask(__name__)
 bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
-
 solana_keypair = None
 
 def send_message_worker():
@@ -146,8 +145,8 @@ def validate_address(token_address):
 @app.route("/quicknode-webhook", methods=['POST'])
 def quicknode_webhook():
     global chat_id_global
-    if not bot_active:
-        logger.info("Webhook reçu mais bot inactif")
+    if not bot_active or not trade_active:
+        logger.info("Webhook reçu mais bot ou trading inactif")
         return 'Bot stopped', 503
     if request.method == "POST":
         content_type = request.headers.get("Content-Type", "")
@@ -171,7 +170,7 @@ def quicknode_webhook():
                     accounts = tx.get('info', {}).get('accounts', {})
                     num_accounts = len([k for k, v in accounts.items() if v])
 
-                    # Pré-filtres avant appel RPC
+                    # Pré-filtres
                     if not token_address or token_address in BLACKLISTED_TOKENS or token_address in detected_tokens:
                         continue
                     if not validate_address(token_address):
@@ -191,12 +190,11 @@ def quicknode_webhook():
                         logger.info(f"Token {token_address} ignoré : Détection trop récente")
                         continue
 
-                    # Vérifier liquidité avec QuickNode
                     token_data = get_token_data_quicknode(token_address)
-                    if token_data and token_data.get('liquidity', 0) > MIN_LIQUIDITY:  # Strictement > 5000
+                    if token_data and token_data.get('liquidity', 0) > MIN_LIQUIDITY:
                         if validate_token(chat_id_global, token_address, token_data):
-                            queue_message(chat_id_global, f"🎯 Token détecté via webhook : `{token_address}` (Solana - QuickNode)")
-                            logger.info(f"Token détecté via webhook: {token_address}")
+                            queue_message(chat_id_global, f"🎯 Token détecté : `{token_address}` (Solana - QuickNode)")
+                            logger.info(f"Token détecté : {token_address}")
                             detected_tokens[token_address] = True
                             last_detection_time[token_address] = time.time()
                             asyncio.run(buy_token_solana(chat_id_global, token_address, mise_depart_sol))
@@ -214,7 +212,6 @@ def quicknode_webhook():
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
 def get_token_data_quicknode(token_address):
     try:
-        # Vérifier le compte du token via QuickNode
         response = session.post(
             QUICKNODE_SOL_URL,
             json={
@@ -227,8 +224,7 @@ def get_token_data_quicknode(token_address):
         )
         response.raise_for_status()
         account_info = response.json().get('result', {}).get('value', {})
-        
-        # Vérifier la supply
+
         supply_response = session.post(
             QUICKNODE_SOL_URL,
             json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token_address]},
@@ -237,13 +233,12 @@ def get_token_data_quicknode(token_address):
         supply_data = supply_response.json().get('result', {}).get('value', {})
         supply = float(supply_data.get('amount', '0')) / 10**9
 
-        # Estimation de liquidité basée sur lamports (approximation)
         lamports = account_info.get('lamports', 0) if account_info else 0
-        liquidity = lamports / 10**9 * 1000  # Conversion approximative (1 SOL ≈ 1000 $)
-        has_liquidity = liquidity > MIN_LIQUIDITY  # Strictement > 5000
+        liquidity = lamports / 10**9 * 1000  # Approximation : 1 SOL ≈ 1000 $
+        has_liquidity = liquidity > MIN_LIQUIDITY
 
         return {
-            'volume_24h': 0,  # Pas disponible via RPC brut
+            'volume_24h': 0,
             'liquidity': liquidity if has_liquidity else 0,
             'market_cap': 0,
             'price': 0,
@@ -270,7 +265,7 @@ def validate_token(chat_id, token_address, data):
         if age_hours > MAX_TOKEN_AGE_HOURS:
             queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Âge {age_hours:.2f}h > {MAX_TOKEN_AGE_HOURS}h")
             return False
-        if liquidity <= MIN_LIQUIDITY:  # <= pour cohérence, mais filtré en amont
+        if liquidity <= MIN_LIQUIDITY:
             queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Liquidité ${liquidity:.2f} <= ${MIN_LIQUIDITY}")
             return False
         if volume_24h < MIN_VOLUME_SOL or volume_24h > MAX_VOLUME_SOL:
@@ -302,7 +297,7 @@ async def buy_token_solana(chat_id, contract_address, amount):
         tx = Transaction()
         tx.recent_blockhash = Pubkey.from_string(blockhash)
         instruction = Instruction(
-            program_id=RAYDIUM_PROGRAM_ID if 'Raydium' in contract_address else PUMP_FUN_PROGRAM_ID,
+            program_id=PUMP_FUN_PROGRAM_ID,  # Simplifié pour Pump.fun
             accounts=[
                 {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
                 {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
@@ -345,7 +340,7 @@ async def sell_token(chat_id, contract_address, amount, current_price):
         tx = Transaction()
         tx.recent_blockhash = Pubkey.from_string(blockhash)
         instruction = Instruction(
-            program_id=RAYDIUM_PROGRAM_ID if 'Raydium' in contract_address else PUMP_FUN_PROGRAM_ID,
+            program_id=PUMP_FUN_PROGRAM_ID,
             accounts=[
                 {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
                 {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
