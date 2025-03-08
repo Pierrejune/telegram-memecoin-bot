@@ -68,7 +68,7 @@ PORT = int(os.getenv("PORT", 8080))
 cipher_suite = Fernet(Fernet.generate_key())
 encrypted_private_key = cipher_suite.encrypt(SOLANA_PRIVATE_KEY.encode()).decode() if SOLANA_PRIVATE_KEY else "N/A"
 
-# Paramètres de trading (inchangés pour sécurité)
+# Paramètres de trading
 mise_depart_sol = 0.37
 stop_loss_threshold = 15
 trailing_stop_percentage = 5
@@ -81,16 +81,16 @@ MAX_VOLUME_SOL = 2000000
 MIN_LIQUIDITY = 5000
 MIN_MARKET_CAP_SOL = 1000
 MAX_MARKET_CAP_SOL = 5000000
-MIN_BUY_SELL_RATIO = 1.5
-MAX_TOKEN_AGE_HOURS = 6
+MIN_BUY_SELL_RATIO = 2  # Ratio A/V minimum pour détecter les pumps
+MAX_TOKEN_AGE_HOURS = 1  # Focus sur tokens <1h
 MIN_SOCIAL_MENTIONS = 5
 MIN_SOL_AMOUNT = 0.1
 MIN_ACCOUNTS_IN_TX = 3
 DETECTION_COOLDOWN = 60
 MIN_SOL_BALANCE = 0.05
 TWITTER_CHECK_INTERVAL = 900
-POLLING_INTERVAL = 60
-HOLDER_CONCENTRATION_THRESHOLD = 0.5
+POLLING_INTERVAL = 30  # Polling toutes les 30s
+HOLDER_CONCENTRATION_THRESHOLD = 0.75  # Tolérance à 75%
 
 # Constantes Solana
 PUMP_FUN_PROGRAM_ID = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfH43SboMiMEWCPkDPk")
@@ -218,12 +218,7 @@ async def get_token_data(token_address):
             # QuickNode pour métadonnées
             quicknode_response = await async_session.post(
                 QUICKNODE_SOL_URL,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "getAccountInfo",
-                    "params": [token_address, {"encoding": "jsonParsed"}]
-                },
+                json={"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo", "params": [token_address, {"encoding": "jsonParsed"}]},
                 timeout=10
             )
             quicknode_data = await quicknode_response.json()
@@ -235,7 +230,7 @@ async def get_token_data(token_address):
                 timeout=10
             )
             supply_data = await supply_response.json()
-            supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**6  # Ajustement décimales
+            supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**6
 
             holders_response = await async_session.post(
                 QUICKNODE_SOL_URL,
@@ -244,42 +239,44 @@ async def get_token_data(token_address):
             )
             holders_data = await holders_response.json()
             top_holders = holders_data.get('result', {}).get('value', [])
-            total_top_held = sum(float(h.get('amount', 0)) / 10**6 for h in top_holders[:5])  # Ajustement décimales
+            total_top_held = sum(float(h.get('amount', 0)) / 10**6 for h in top_holders[:5])
             top_holder_ratio = total_top_held / supply if supply > 0 else 0
-            top_holder_ratio = min(top_holder_ratio, 1.0)  # Limiter à 100%
+            top_holder_ratio = min(top_holder_ratio, 1.0)
 
-            # Birdeye pour prix et volume
-            birdeye_url = f"https://public-api.birdeye.so/public/price?address={token_address}"
+            # Birdeye pour prix, volume, liquidité et ratio A/V
+            birdeye_url = f"https://public-api.birdeye.so/public/token_overview?address={token_address}"
             birdeye_response = await async_session.get(birdeye_url, headers={"X-API-KEY": BIRDEYE_API_KEY})
             birdeye_data = await birdeye_response.json()
-            price = birdeye_data.get('data', {}).get('value', 0)
+            price = birdeye_data.get('data', {}).get('price', 0)
             volume_24h = birdeye_data.get('data', {}).get('volume', 0) / 1000
+            liquidity = birdeye_data.get('data', {}).get('liquidity', 0)
+            buy_volume = birdeye_data.get('data', {}).get('buyVolume', 0) / 1000
+            sell_volume = birdeye_data.get('data', {}).get('sellVolume', 0) / 1000
+            buy_sell_ratio = buy_volume / sell_volume if sell_volume > 0 else 1
+            pair_created_at = birdeye_data.get('data', {}).get('created_at', time.time())  # Ajout de l'âge réel
 
-            # Fallback DexScreener
-            if not price:
+            # Fallback DexScreener si Birdeye échoue
+            if not liquidity:
                 dexscreener_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
                 dexscreener_response = await async_session.get(dexscreener_url)
                 dexscreener_data = await dexscreener_response.json()
                 pair = dexscreener_data.get('pairs', [{}])[0]
+                liquidity = float(pair.get('liquidity', {}).get('usd', 0))
                 price = float(pair.get('priceUsd', 0))
                 volume_24h = float(pair.get('volume', {}).get('h24', 0)) / 1000
+                buy_sell_ratio = 1  # DexScreener ne fournit pas buy/sell séparément
 
-        lamports = account_info.get('lamports', 0) if account_info else 0
-        liquidity = lamports / 10**9 * 1000
-        has_liquidity = liquidity > MIN_LIQUIDITY
         market_cap = supply * price if price > 0 else 0
-        pair_created_at = time.time()  # Simplification temporaire
-
-        logger.info(f"Token {token_address} - Prix: {price}, Volume: {volume_24h}, Liquidité: {liquidity}, Market Cap: {market_cap}, Top Holder Ratio: {top_holder_ratio:.2%}")
+        logger.info(f"Token {token_address} - Prix: {price}, Volume: {volume_24h}, Liquidité: {liquidity}, Market Cap: {market_cap}, Ratio A/V: {buy_sell_ratio:.2f}, Top Holder Ratio: {top_holder_ratio:.2%}, Âge: {(time.time() - pair_created_at) / 3600:.2f}h")
         return {
             'volume_24h': volume_24h,
-            'liquidity': liquidity if has_liquidity else 0,
+            'liquidity': liquidity,
             'market_cap': market_cap,
             'price': price,
-            'buy_sell_ratio': 1,
+            'buy_sell_ratio': buy_sell_ratio,
             'pair_created_at': pair_created_at,
             'supply': supply,
-            'has_liquidity': has_liquidity,
+            'has_liquidity': liquidity > MIN_LIQUIDITY,
             'top_holder_ratio': top_holder_ratio
         }
     except Exception as e:
@@ -303,7 +300,6 @@ async def validate_token(chat_id, token_address, data):
             queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Concentration holders trop élevée ({top_holder_ratio:.2%})")
             dynamic_blacklist.add(token_address)
             return False
-
         if len(portfolio) >= max_positions:
             queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Limite de {max_positions} positions atteinte")
             return False
@@ -504,7 +500,6 @@ async def poll_new_tokens(chat_id):
         if time.time() - last_polling_check < POLLING_INTERVAL:
             return
         async with aiohttp.ClientSession() as async_session:
-            # Polling Birdeye pour nouveaux tokens
             birdeye_url = "https://public-api.birdeye.so/public/tokenlist?sort_by=volume&sort_type=desc&offset=0&limit=50"
             birdeye_response = await async_session.get(birdeye_url, headers={"X-API-KEY": BIRDEYE_API_KEY})
             birdeye_data = await birdeye_response.json()
@@ -648,7 +643,7 @@ async def adjust_detection_criteria(message):
     try:
         criteria = message.text.split(",")
         if len(criteria) != 7:
-            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 100,2000000,5000,1000,5000000,1.5,6)")
+            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 100,2000000,5000,1000,5000000,2,1)")
             return
         min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age = map(float, criteria)
         if min_vol < 0 or max_vol < min_vol or min_liq < 0 or min_mc < 0 or max_mc < min_mc or min_ratio < 0 or max_age < 0:
@@ -670,7 +665,7 @@ async def adjust_detection_criteria(message):
             f"Âge max : {MAX_TOKEN_AGE_HOURS} h"
         ))
     except ValueError:
-        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 100,2000000,5000,1000,5000000,1.5,6)")
+        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 100,2000000,5000,1000,5000000,2,1)")
 
 async def run_tasks(chat_id):
     await asyncio.gather(
@@ -862,7 +857,7 @@ def callback_query(call):
             queue_message(chat_id, "Entrez le nouveau ratio de réinvestissement (ex. : 0.9) :")
             bot.register_next_step_handler(call.message, adjust_reinvestment_ratio)
         elif call.data == "adjust_detection_criteria":
-            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age) ex. : 100,2000000,5000,1000,5000000,1.5,6 :")
+            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age) ex. : 100,2000000,5000,1000,5000000,2,1 :")
             bot.register_next_step_handler(call.message, adjust_detection_criteria)
         elif call.data.startswith("sell_pct_"):
             parts = call.data.split("_")
