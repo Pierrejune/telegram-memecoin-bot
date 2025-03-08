@@ -144,10 +144,11 @@ def validate_address(token_address):
 
 @app.route("/quicknode-webhook", methods=['POST'])
 def quicknode_webhook():
-    global chat_id_global
-    if not bot_active or not trade_active:
-        logger.info("Webhook reçu mais bot ou trading inactif")
-        return 'Bot stopped', 503
+    global chat_id_global, trade_active
+    logger.info(f"Webhook QuickNode appelé, trade_active={trade_active}")
+    if not trade_active:
+        logger.info("Webhook reçu mais trading inactif")
+        return 'Trading stopped', 503
     if request.method == "POST":
         content_type = request.headers.get("Content-Type", "")
         try:
@@ -170,7 +171,6 @@ def quicknode_webhook():
                     accounts = tx.get('info', {}).get('accounts', {})
                     num_accounts = len([k for k, v in accounts.items() if v])
 
-                    # Pré-filtres
                     if not token_address or token_address in BLACKLISTED_TOKENS or token_address in detected_tokens:
                         continue
                     if not validate_address(token_address):
@@ -297,7 +297,7 @@ async def buy_token_solana(chat_id, contract_address, amount):
         tx = Transaction()
         tx.recent_blockhash = Pubkey.from_string(blockhash)
         instruction = Instruction(
-            program_id=PUMP_FUN_PROGRAM_ID,  # Simplifié pour Pump.fun
+            program_id=PUMP_FUN_PROGRAM_ID,
             accounts=[
                 {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
                 {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
@@ -560,17 +560,17 @@ def run_task_in_thread(task, *args):
 
 def initialize_and_run_threads(chat_id):
     global trade_active, chat_id_global, active_threads, bot_active
-    if not bot_active:
-        queue_message(chat_id, "⚠️ Bot déjà arrêté !")
-        return
     chat_id_global = chat_id
+    if not bot_active:
+        queue_message(chat_id, "⚠️ Bot arrêté, relancez avec /start")
+        return
     try:
         initialize_bot(chat_id)
         if solana_keypair:
             trade_active = True
             stop_event.clear()
             queue_message(chat_id, "▶️ Trading Solana lancé avec succès!")
-            logger.info("Trading démarré")
+            logger.info(f"Trading démarré pour chat_id {chat_id}, trade_active={trade_active}")
             tasks = [monitor_and_sell]
             active_threads = []
             for task in tasks:
@@ -741,19 +741,19 @@ def callback_query(call):
             asyncio.run(show_daily_summary(chat_id))
         elif call.data == "adjust_mise_sol":
             queue_message(chat_id, "Entrez la nouvelle mise Solana (ex. : 0.37) :")
-            bot.register_next_step_handler_by_chat_id(chat_id, adjust_mise_sol)
+            bot.register_next_step_handler(call.message, adjust_mise_sol)
         elif call.data == "adjust_stop_loss":
             queue_message(chat_id, "Entrez le nouveau Stop-Loss (ex. : 15) :")
-            bot.register_next_step_handler_by_chat_id(chat_id, adjust_stop_loss)
+            bot.register_next_step_handler(call.message, adjust_stop_loss)
         elif call.data == "adjust_take_profit":
             queue_message(chat_id, "Entrez les nouveaux Take-Profit (ex. : 1.2,2,10,100,500) :")
-            bot.register_next_step_handler_by_chat_id(chat_id, adjust_take_profit)
+            bot.register_next_step_handler(call.message, adjust_take_profit)
         elif call.data == "adjust_reinvestment":
             queue_message(chat_id, "Entrez le nouveau ratio de réinvestissement (ex. : 0.9) :")
-            bot.register_next_step_handler_by_chat_id(chat_id, adjust_reinvestment_ratio)
+            bot.register_next_step_handler(call.message, adjust_reinvestment_ratio)
         elif call.data == "adjust_detection_criteria":
             queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age) ex. : 100,2000000,5000,1000,5000000,1.5,6 :")
-            bot.register_next_step_handler_by_chat_id(chat_id, adjust_detection_criteria)
+            bot.register_next_step_handler(call.message, adjust_detection_criteria)
         elif call.data.startswith("sell_pct_"):
             parts = call.data.split("_")
             contract_address, pct = parts[2], int(parts[3]) / 100
