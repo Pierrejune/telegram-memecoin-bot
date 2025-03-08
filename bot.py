@@ -78,7 +78,6 @@ MIN_ACCOUNTS_IN_TX = 3
 DETECTION_COOLDOWN = 60
 
 # Constantes Solana
-RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
 PUMP_FUN_PROGRAM_ID = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfH43SboMiMEWCPkDPk")
 TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
@@ -144,11 +143,8 @@ def validate_address(token_address):
 
 @app.route("/quicknode-webhook", methods=['POST'])
 def quicknode_webhook():
-    global chat_id_global, trade_active
-    logger.info(f"Webhook QuickNode appelé, trade_active={trade_active}")
-    if not trade_active:
-        logger.info("Webhook reçu mais trading inactif")
-        return 'Trading stopped', 503
+    global chat_id_global
+    logger.info("Webhook QuickNode appelé")
     if request.method == "POST":
         content_type = request.headers.get("Content-Type", "")
         try:
@@ -561,16 +557,13 @@ def run_task_in_thread(task, *args):
 def initialize_and_run_threads(chat_id):
     global trade_active, chat_id_global, active_threads, bot_active
     chat_id_global = chat_id
-    if not bot_active:
-        queue_message(chat_id, "⚠️ Bot arrêté, relancez avec /start")
-        return
     try:
         initialize_bot(chat_id)
         if solana_keypair:
             trade_active = True
             stop_event.clear()
             queue_message(chat_id, "▶️ Trading Solana lancé avec succès!")
-            logger.info(f"Trading démarré pour chat_id {chat_id}, trade_active={trade_active}")
+            logger.info(f"Trading démarré pour chat_id {chat_id}")
             tasks = [monitor_and_sell]
             active_threads = []
             for task in tasks:
@@ -589,9 +582,6 @@ def initialize_and_run_threads(chat_id):
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
-    if not bot_active:
-        logger.info("Webhook Telegram reçu mais bot inactif")
-        return 'Bot stopped', 503
     if request.method == "POST" and request.headers.get("content-type") == "application/json":
         update_json = request.get_json()
         logger.info(f"Webhook Telegram reçu: {json.dumps(update_json)}")
@@ -611,9 +601,7 @@ def start_message(message):
     global trade_active, bot_active
     chat_id = message.chat.id
     logger.info(f"Commande /start reçue de {chat_id}")
-    if not bot_active:
-        bot_active = True
-        queue_message(chat_id, "✅ Bot redémarré!")
+    bot_active = True
     if not trade_active:
         queue_message(chat_id, "✅ Bot démarré!")
         initialize_and_run_threads(chat_id)
@@ -699,9 +687,6 @@ def callback_query(call):
     chat_id = call.message.chat.id
     logger.info(f"Callback reçu: {call.data} de {chat_id}")
     try:
-        if not bot_active:
-            queue_message(chat_id, "⚠️ Bot arrêté, relancez avec /start")
-            return
         if call.data == "status":
             sol_balance = asyncio.run(get_solana_balance(chat_id))
             queue_message(chat_id, (
