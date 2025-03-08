@@ -40,7 +40,7 @@ daily_trades = {'buys': [], 'sells': []}
 rejected_tokens = {}
 trade_active = False
 portfolio = {}
-detected_tokens = {}
+detected_tokens = {}  # Pour éviter les doublons de détection
 BLACKLISTED_TOKENS = {"So11111111111111111111111111111111111111112"}
 pause_auto_sell = False
 chat_id_global = None
@@ -52,11 +52,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")  # Clé Helius
-QUICKNODE_SOL_URL = os.getenv("QUICKNODE_SOL_URL")  # Votre endpoint QuickNode
+QUICKNODE_SOL_URL = os.getenv("QUICKNODE_SOL_URL")
 PORT = int(os.getenv("PORT", 8080))
 
-# Paramètres de trading (modifiables)
+# Paramètres de trading
 mise_depart_sol = 0.37
 stop_loss_threshold = 15
 trailing_stop_percentage = 5
@@ -138,61 +137,52 @@ def validate_address(token_address):
     except ValueError:
         return False
 
-@backoff.on_exception(backoff.expo, Exception, max_tries=5)
-async def detect_helius_tokens(chat_id):
-    while not stop_event.is_set():
-        if not solana_keypair:
-            initialize_bot(chat_id)
-            if not solana_keypair:
-                await asyncio.sleep(30)
-                continue
+@app.route("/quicknode-webhook", methods=['POST'])
+def quicknode_webhook():
+    global chat_id_global
+    if request.method == "POST":
+        data = request.get_json()
+        logger.info(f"Webhook QuickNode reçu: {json.dumps(data, indent=2)}")
         try:
-            response = session.get(
-                f"https://api.helius.xyz/v1/tokens/new?api-key={HELIUS_API_KEY}&chain=solana",
-                timeout=10
-            )
-            response.raise_for_status()
-            tokens = response.json().get('tokens', [])
-            queue_message(chat_id, "🔄 Détection Helius active")
-            logger.info("Détection Helius démarrée")
-            for token in tokens:
-                token_address = token.get('address')
-                if not validate_address(token_address) or token_address in BLACKLISTED_TOKENS or token_address in portfolio:
-                    continue
-                token_data = get_token_data_helius(token_address)
-                if token_data and validate_token(chat_id, token_address, token_data):
-                    queue_message(chat_id, f"🎯 Token détecté : `{token_address}` (Solana - Helius)")
-                    logger.info(f"Token détecté: {token_address}")
-                    await buy_token_solana(chat_id, token_address, mise_depart_sol)
-            await asyncio.sleep(5)
+            for block in data:
+                for tx in block.get('transactions', []):
+                    token_address = tx.get('info', {}).get('tokenAddress')
+                    operation = tx.get('operation')
+                    if token_address and operation in ['buy', 'mint'] and validate_address(token_address) and token_address not in BLACKLISTED_TOKENS and token_address not in detected_tokens:
+                        token_data = get_token_data_quicknode(token_address)
+                        if token_data and validate_token(chat_id_global, token_address, token_data):
+                            queue_message(chat_id_global, f"🎯 Token détecté via webhook : `{token_address}` (Solana - QuickNode)")
+                            logger.info(f"Token détecté via webhook: {token_address}")
+                            detected_tokens[token_address] = True
+                            asyncio.run(buy_token_solana(chat_id_global, token_address, mise_depart_sol))
+            return 'OK', 200
         except Exception as e:
-            queue_message(chat_id, f"⚠️ Erreur Helius: `{str(e)}`")
-            logger.error(f"Erreur Helius: {str(e)}")
-            await asyncio.sleep(10)
+            logger.error(f"Erreur traitement webhook QuickNode: {str(e)}")
+            queue_message(chat_id_global, f"⚠️ Erreur webhook QuickNode: `{str(e)}`")
+            return f"Erreur: {str(e)}", 500
+    return abort(403)
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
-def get_token_data_helius(token_address):
+def get_token_data_quicknode(token_address):
     try:
-        response = session.get(
-            f"https://api.helius.xyz/v1/tokens/meta?api-key={HELIUS_API_KEY}&addresses={token_address}",
+        response = session.post(
+            QUICKNODE_SOL_URL,
+            json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token_address]},
             timeout=10
         )
         response.raise_for_status()
-        data = response.json().get('data', [])[0]
-        age_hours = (time.time() - data.get('createdAt', time.time()) / 1000) / 3600
-        if age_hours > MAX_TOKEN_AGE_HOURS:
-            return None
+        data = response.json().get('result', {})
         return {
-            'volume_24h': data.get('volume24hUSD', 0),
-            'liquidity': data.get('liquidityUSD', 0),
-            'market_cap': data.get('marketCapUSD', 0),
-            'price': data.get('priceUSD', 0),
-            'buy_sell_ratio': data.get('buySellRatio', 1),
-            'pair_created_at': data.get('createdAt', time.time()) / 1000,
-            'supply': data.get('totalSupply', 0)
+            'volume_24h': 0,  # À compléter avec une API tierce si nécessaire
+            'liquidity': 0,
+            'market_cap': 0,
+            'price': 0,
+            'buy_sell_ratio': 1,
+            'pair_created_at': time.time(),
+            'supply': float(data.get('value', {}).get('amount', '0')) / 10**9
         }
     except Exception as e:
-        logger.error(f"Erreur Helius data pour {token_address}: {str(e)}")
+        logger.error(f"Erreur QuickNode data: {str(e)}")
         return None
 
 def validate_token(chat_id, token_address, data):
@@ -256,7 +246,7 @@ async def buy_token_solana(chat_id, contract_address, amount):
             "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
         }, timeout=5).json()['result']
         queue_message(chat_id, f"✅ Achat réussi : {amount} SOL de `{contract_address}` (TX: `{tx_hash}`)")
-        token_data = get_token_data_helius(contract_address)
+        token_data = get_token_data_quicknode(contract_address)
         entry_price = token_data.get('price', 0)
         portfolio[contract_address] = {
             'amount': amount, 'chain': 'solana', 'entry_price': entry_price,
@@ -319,7 +309,7 @@ async def monitor_and_sell(chat_id):
                 continue
             for contract_address, data in list(portfolio.items()):
                 amount = data['amount']
-                current_data = get_token_data_helius(contract_address)
+                current_data = get_token_data_quicknode(contract_address)
                 if not current_data:
                     continue
                 current_price = current_data.get('price', 0)
@@ -356,7 +346,7 @@ async def show_portfolio(chat_id):
         msg = f"💰 *Portefeuille:*\nSOL : {sol_balance:.4f}\n\n"
         markup = InlineKeyboardMarkup()
         for ca, data in portfolio.items():
-            current_price = get_token_data_helius(ca).get('price', 0)
+            current_price = get_token_data_quicknode(ca).get('price', 0)
             profit = (current_price - data['entry_price']) * data['amount']
             markup.add(
                 InlineKeyboardButton(f"💸 Sell 25% {ca[:6]}", callback_data=f"sell_pct_{ca}_25"),
@@ -512,7 +502,7 @@ def initialize_and_run_threads(chat_id):
             stop_event.clear()
             queue_message(chat_id, "▶️ Trading Solana lancé avec succès!")
             logger.info("Trading démarré")
-            tasks = [detect_helius_tokens, monitor_and_sell]
+            tasks = [monitor_and_sell]
             active_threads = []
             for task in tasks:
                 thread = threading.Thread(target=run_task_in_thread, args=(task, chat_id), daemon=True)
@@ -532,16 +522,16 @@ def initialize_and_run_threads(chat_id):
 def webhook():
     if request.method == "POST" and request.headers.get("content-type") == "application/json":
         update_json = request.get_json()
-        logger.info(f"Webhook reçu: {json.dumps(update_json)}")
+        logger.info(f"Webhook Telegram reçu: {json.dumps(update_json)}")
         try:
             update = telebot.types.Update.de_json(update_json)
             bot.process_new_updates([update])
             return 'OK', 200
         except Exception as e:
-            logger.error(f"Erreur traitement webhook: {str(e)}")
-            queue_message(chat_id_global, f"⚠️ Erreur webhook: `{str(e)}`")
+            logger.error(f"Erreur traitement webhook Telegram: {str(e)}")
+            queue_message(chat_id_global, f"⚠️ Erreur webhook Telegram: `{str(e)}`")
             return f"Erreur: {str(e)}", 500
-    logger.error("Requête webhook invalide")
+    logger.error("Requête webhook Telegram invalide")
     return abort(403)
 
 @bot.message_handler(commands=['start', 'Start', 'START'])
@@ -629,7 +619,7 @@ def show_main_menu(chat_id):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
-    global trade_active
+    global trade_active, active_threads
     chat_id = call.message.chat.id
     logger.info(f"Callback reçu: {call.data} de {chat_id}")
     try:
@@ -684,17 +674,32 @@ def callback_query(call):
         elif call.data == "adjust_detection_criteria":
             queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age) ex. : 100,2000000,5000,1000,5000000,1.5,6 :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_detection_criteria)
+        elif call.data.startswith("sell_pct_"):
+            parts = call.data.split("_")
+            contract_address, pct = parts[2], int(parts[3]) / 100
+            if contract_address in portfolio:
+                current_data = get_token_data_quicknode(contract_address)
+                if current_data:
+                    amount = portfolio[contract_address]['amount'] * pct
+                    asyncio.run(sell_token(chat_id, contract_address, amount, current_data['price']))
+        elif call.data.startswith("sell_"):
+            contract_address = call.data.split("_")[1]
+            if contract_address in portfolio:
+                current_data = get_token_data_quicknode(contract_address)
+                if current_data:
+                    amount = portfolio[contract_address]['amount']
+                    asyncio.run(sell_token(chat_id, contract_address, amount, current_data['price']))
     except Exception as e:
         queue_message(chat_id, f"⚠️ Erreur callback: `{str(e)}`")
         logger.error(f"Erreur callback: {str(e)}")
 
 if __name__ == "__main__":
-    if not all([TELEGRAM_TOKEN, WALLET_ADDRESS, SOLANA_PRIVATE_KEY, WEBHOOK_URL, HELIUS_API_KEY, QUICKNODE_SOL_URL]):
+    if not all([TELEGRAM_TOKEN, WALLET_ADDRESS, SOLANA_PRIVATE_KEY, WEBHOOK_URL, QUICKNODE_SOL_URL]):
         logger.error("Variables d’environnement manquantes")
         exit(1)
     if set_webhook():
-        logger.info("Webhook configuré, démarrage du serveur...")
+        logger.info("Webhook Telegram configuré, démarrage du serveur...")
         serve(app, host="0.0.0.0", port=PORT, threads=10)
     else:
-        logger.error("Échec du webhook, passage en mode polling")
+        logger.error("Échec du webhook Telegram, passage en mode polling")
         bot.polling(none_stop=True)
