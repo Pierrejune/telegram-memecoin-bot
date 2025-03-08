@@ -141,8 +141,20 @@ def validate_address(token_address):
 def quicknode_webhook():
     global chat_id_global
     if request.method == "POST":
-        data = request.get_json()
-        logger.info(f"Webhook QuickNode reçu: {json.dumps(data, indent=2)}")
+        # Récupérer le contenu brut et parser manuellement si nécessaire
+        content_type = request.headers.get("Content-Type", "")
+        try:
+            if "application/json" in content_type.lower():
+                data = request.get_json()
+            else:
+                # Si pas application/json, tenter de parser le corps brut comme JSON
+                raw_data = request.get_data(as_text=True)
+                data = json.loads(raw_data) if raw_data else []
+            logger.info(f"Webhook QuickNode reçu: {json.dumps(data, indent=2)}")
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Erreur parsing webhook QuickNode: {str(e)}")
+            return "Invalid JSON", 400
+
         try:
             for block in data:
                 for tx in block.get('transactions', []):
