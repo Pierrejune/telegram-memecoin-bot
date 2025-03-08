@@ -159,31 +159,22 @@ def quicknode_webhook():
             return "Invalid JSON", 400
 
         try:
+            if not chat_id_global:
+                logger.warning("chat_id_global non défini")
+                return "No chat ID", 400
             for block in data:
                 for tx in block.get('transactions', []):
                     token_address = tx.get('info', {}).get('tokenAddress')
                     operation = tx.get('operation')
-                    sol_change = abs(tx.get('info', {}).get('changes', {}).get('sol', 0))
-                    accounts = tx.get('info', {}).get('accounts', {})
-                    num_accounts = len([k for k, v in accounts.items() if v])
-
+                    logger.info(f"Traitement tx: token={token_address}, operation={operation}")
                     if not token_address or token_address in BLACKLISTED_TOKENS or token_address in detected_tokens:
+                        logger.info(f"Token {token_address} ignoré : blacklist ou déjà détecté")
                         continue
                     if not validate_address(token_address):
                         logger.info(f"Token {token_address} ignoré : Adresse invalide")
                         continue
                     if operation not in ['buy', 'mint']:
                         logger.info(f"Token {token_address} ignoré : Opération {operation} non pertinente")
-                        continue
-                    if sol_change < MIN_SOL_AMOUNT:
-                        logger.info(f"Token {token_address} ignoré : Montant SOL {sol_change} < {MIN_SOL_AMOUNT}")
-                        continue
-                    if num_accounts < MIN_ACCOUNTS_IN_TX:
-                        logger.info(f"Token {token_address} ignoré : {num_accounts} comptes < {MIN_ACCOUNTS_IN_TX}")
-                        continue
-                    last_time = last_detection_time.get(token_address, 0)
-                    if time.time() - last_time < DETECTION_COOLDOWN:
-                        logger.info(f"Token {token_address} ignoré : Détection trop récente")
                         continue
 
                     token_data = get_token_data_quicknode(token_address)
@@ -203,6 +194,7 @@ def quicknode_webhook():
             logger.error(f"Erreur traitement webhook QuickNode: {str(e)}")
             queue_message(chat_id_global, f"⚠️ Erreur webhook QuickNode: `{str(e)}`")
             return f"Erreur: {str(e)}", 500
+    logger.error("Requête invalide")
     return abort(403)
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
@@ -591,15 +583,17 @@ def webhook():
             return 'OK', 200
         except Exception as e:
             logger.error(f"Erreur traitement webhook Telegram: {str(e)}")
-            queue_message(chat_id_global, f"⚠️ Erreur webhook Telegram: `{str(e)}`")
+            if chat_id_global:
+                queue_message(chat_id_global, f"⚠️ Erreur webhook Telegram: `{str(e)}`")
             return f"Erreur: {str(e)}", 500
     logger.error("Requête webhook Telegram invalide")
     return abort(403)
 
 @bot.message_handler(commands=['start', 'Start', 'START'])
 def start_message(message):
-    global trade_active, bot_active
+    global trade_active, bot_active, chat_id_global
     chat_id = message.chat.id
+    chat_id_global = chat_id
     logger.info(f"Commande /start reçue de {chat_id}")
     bot_active = True
     if not trade_active:
@@ -620,21 +614,18 @@ def stop_message(message):
     global trade_active, active_threads, bot_active
     chat_id = message.chat.id
     logger.info(f"Commande /stop reçue de {chat_id}")
-    if trade_active or bot_active:
-        trade_active = False
-        bot_active = False
-        stop_event.set()
-        for thread in active_threads:
-            if thread.is_alive():
-                logger.info(f"Attente arrêt du thread {thread.name}")
-                thread.join(timeout=2)
-        active_threads = []
-        while not message_queue.empty():
-            message_queue.get()
-        queue_message(chat_id, "⏹️ Trading et bot arrêtés.")
-        logger.info("Trading et bot arrêtés, threads réinitialisés")
-    else:
-        queue_message(chat_id, "ℹ️ Trading déjà arrêté!")
+    trade_active = False
+    bot_active = False
+    stop_event.set()
+    for thread in active_threads:
+        if thread.is_alive():
+            logger.info(f"Attente arrêt du thread {thread.name}")
+            thread.join(timeout=2)
+    active_threads = []
+    while not message_queue.empty():
+        message_queue.get()
+    queue_message(chat_id, "⏹️ Trading et bot arrêtés.")
+    logger.info("Trading et bot arrêtés, threads réinitialisés")
 
 @bot.message_handler(commands=['pause', 'Pause', 'PAUSE'])
 def pause_auto_sell_handler(message):
@@ -705,21 +696,18 @@ def callback_query(call):
             else:
                 queue_message(chat_id, "ℹ️ Trading déjà actif!")
         elif call.data == "stop":
-            if trade_active or bot_active:
-                trade_active = False
-                bot_active = False
-                stop_event.set()
-                for thread in active_threads:
-                    if thread.is_alive():
-                        logger.info(f"Attente arrêt du thread {thread.name}")
-                        thread.join(timeout=2)
-                active_threads = []
-                while not message_queue.empty():
-                    message_queue.get()
-                queue_message(chat_id, "⏹️ Trading et bot arrêtés.")
-                logger.info("Trading et bot arrêtés via callback")
-            else:
-                queue_message(chat_id, "ℹ️ Trading déjà arrêté!")
+            trade_active = False
+            bot_active = False
+            stop_event.set()
+            for thread in active_threads:
+                if thread.is_alive():
+                    logger.info(f"Attente arrêt du thread {thread.name}")
+                    thread.join(timeout=2)
+            active_threads = []
+            while not message_queue.empty():
+                message_queue.get()
+            queue_message(chat_id, "⏹️ Trading et bot arrêtés.")
+            logger.info("Trading et bot arrêtés via callback")
         elif call.data == "portfolio":
             asyncio.run(show_portfolio(chat_id))
         elif call.data == "daily_summary":
