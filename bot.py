@@ -39,8 +39,9 @@ message_lock = threading.Lock()
 daily_trades = {'buys': [], 'sells': []}
 rejected_tokens = {}
 trade_active = False
+bot_active = True  # Contrôle global de l’état du bot
 portfolio = {}
-detected_tokens = {}  # Pour éviter les doublons de détection
+detected_tokens = {}
 BLACKLISTED_TOKENS = {"So11111111111111111111111111111111111111112"}
 pause_auto_sell = False
 chat_id_global = None
@@ -65,7 +66,7 @@ profit_reinvestment_ratio = 0.9
 slippage_max = 0.05
 MIN_VOLUME_SOL = 100
 MAX_VOLUME_SOL = 2000000
-MIN_LIQUIDITY = 5000
+MIN_LIQUIDITY = 5000  # On garde, mais on filtre avant
 MIN_MARKET_CAP_SOL = 1000
 MAX_MARKET_CAP_SOL = 5000000
 MIN_BUY_SELL_RATIO = 1.5
@@ -83,7 +84,7 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 solana_keypair = None
 
 def send_message_worker():
-    while True:
+    while bot_active:
         item = message_queue.get()
         chat_id, text = item[0], item[1]
         reply_markup = item[2] if len(item) > 2 else None
@@ -101,8 +102,9 @@ def send_message_worker():
 threading.Thread(target=send_message_worker, daemon=True).start()
 
 def queue_message(chat_id, text, reply_markup=None):
-    logger.info(f"Queueing message to {chat_id}: {text}")
-    message_queue.put((chat_id, text, reply_markup))
+    if bot_active:
+        logger.info(f"Queueing message to {chat_id}: {text}")
+        message_queue.put((chat_id, text, reply_markup))
 
 def initialize_bot(chat_id):
     global solana_keypair
@@ -140,14 +142,15 @@ def validate_address(token_address):
 @app.route("/quicknode-webhook", methods=['POST'])
 def quicknode_webhook():
     global chat_id_global
+    if not bot_active:
+        logger.info("Webhook reçu mais bot inactif")
+        return 'Bot stopped', 503
     if request.method == "POST":
-        # Récupérer le contenu brut et parser manuellement si nécessaire
         content_type = request.headers.get("Content-Type", "")
         try:
             if "application/json" in content_type.lower():
                 data = request.get_json()
             else:
-                # Si pas application/json, tenter de parser le corps brut comme JSON
                 raw_data = request.get_data(as_text=True)
                 data = json.loads(raw_data) if raw_data else []
             logger.info(f"Webhook QuickNode reçu: {json.dumps(data, indent=2)}")
@@ -161,12 +164,18 @@ def quicknode_webhook():
                     token_address = tx.get('info', {}).get('tokenAddress')
                     operation = tx.get('operation')
                     if token_address and operation in ['buy', 'mint'] and validate_address(token_address) and token_address not in BLACKLISTED_TOKENS and token_address not in detected_tokens:
+                        # Vérifier si le token a une activité/liquidité via QuickNode
                         token_data = get_token_data_quicknode(token_address)
-                        if token_data and validate_token(chat_id_global, token_address, token_data):
-                            queue_message(chat_id_global, f"🎯 Token détecté via webhook : `{token_address}` (Solana - QuickNode)")
-                            logger.info(f"Token détecté via webhook: {token_address}")
-                            detected_tokens[token_address] = True
-                            asyncio.run(buy_token_solana(chat_id_global, token_address, mise_depart_sol))
+                        if token_data and token_data.get('has_liquidity', False):  # Filtrer ici
+                            if validate_token(chat_id_global, token_address, token_data):
+                                queue_message(chat_id_global, f"🎯 Token détecté via webhook : `{token_address}` (Solana - QuickNode)")
+                                logger.info(f"Token détecté via webhook: {token_address}")
+                                detected_tokens[token_address] = True
+                                asyncio.run(buy_token_solana(chat_id_global, token_address, mise_depart_sol))
+                            else:
+                                logger.info(f"Token {token_address} rejeté par critères")
+                        else:
+                            logger.info(f"Token {token_address} ignoré : pas de liquidité détectée")
             return 'OK', 200
         except Exception as e:
             logger.error(f"Erreur traitement webhook QuickNode: {str(e)}")
@@ -177,24 +186,45 @@ def quicknode_webhook():
 @backoff.on_exception(backoff.expo, Exception, max_tries=5)
 def get_token_data_quicknode(token_address):
     try:
+        # Vérifier le compte du token via QuickNode
         response = session.post(
+            QUICKNODE_SOL_URL,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getAccountInfo",
+                "params": [token_address, {"encoding": "jsonParsed"}]
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        account_info = response.json().get('result', {}).get('value', {})
+        
+        # Vérifier la supply pour confirmer que le token existe
+        supply_response = session.post(
             QUICKNODE_SOL_URL,
             json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token_address]},
             timeout=10
         )
-        response.raise_for_status()
-        data = response.json().get('result', {})
+        supply_data = supply_response.json().get('result', {}).get('value', {})
+        supply = float(supply_data.get('amount', '0')) / 10**9
+
+        # Vérifier si le token a un compte de liquidité (simplifié)
+        has_liquidity = account_info is not None and account_info.get('lamports', 0) > 0
+        
+        # Placeholder pour des données complètes (à affiner si nécessaire)
         return {
-            'volume_24h': 0,  # À compléter avec une API tierce si nécessaire
-            'liquidity': 0,
+            'volume_24h': 0,  # Pas disponible via RPC brut
+            'liquidity': 1000 if has_liquidity else 0,  # Estimation minimale pour filtrer
             'market_cap': 0,
             'price': 0,
             'buy_sell_ratio': 1,
             'pair_created_at': time.time(),
-            'supply': float(data.get('value', {}).get('amount', '0')) / 10**9
+            'supply': supply,
+            'has_liquidity': has_liquidity
         }
     except Exception as e:
-        logger.error(f"Erreur QuickNode data: {str(e)}")
+        logger.error(f"Erreur QuickNode data pour {token_address}: {str(e)}")
         return None
 
 def validate_token(chat_id, token_address, data):
@@ -314,7 +344,7 @@ async def sell_token(chat_id, contract_address, amount, current_price):
         logger.error(f"Échec vente Solana: {str(e)}")
 
 async def monitor_and_sell(chat_id):
-    while not stop_event.is_set():
+    while not stop_event.is_set() and bot_active:
         try:
             if not portfolio:
                 await asyncio.sleep(2)
@@ -505,7 +535,10 @@ def run_task_in_thread(task, *args):
         queue_message(args[0], f"⚠️ Erreur thread `{task.__name__}`: `{str(e)}`")
 
 def initialize_and_run_threads(chat_id):
-    global trade_active, chat_id_global, active_threads
+    global trade_active, chat_id_global, active_threads, bot_active
+    if not bot_active:
+        queue_message(chat_id, "⚠️ Bot déjà arrêté !")
+        return
     chat_id_global = chat_id
     try:
         initialize_bot(chat_id)
@@ -532,6 +565,9 @@ def initialize_and_run_threads(chat_id):
 
 @app.route("/webhook", methods=['POST'])
 def webhook():
+    if not bot_active:
+        logger.info("Webhook Telegram reçu mais bot inactif")
+        return 'Bot stopped', 503
     if request.method == "POST" and request.headers.get("content-type") == "application/json":
         update_json = request.get_json()
         logger.info(f"Webhook Telegram reçu: {json.dumps(update_json)}")
@@ -548,9 +584,12 @@ def webhook():
 
 @bot.message_handler(commands=['start', 'Start', 'START'])
 def start_message(message):
-    global trade_active
+    global trade_active, bot_active
     chat_id = message.chat.id
     logger.info(f"Commande /start reçue de {chat_id}")
+    if not bot_active:
+        bot_active = True
+        queue_message(chat_id, "✅ Bot redémarré!")
     if not trade_active:
         queue_message(chat_id, "✅ Bot démarré!")
         initialize_and_run_threads(chat_id)
@@ -566,11 +605,12 @@ def menu_message(message):
 
 @bot.message_handler(commands=['stop', 'Stop', 'STOP'])
 def stop_message(message):
-    global trade_active, active_threads
+    global trade_active, active_threads, bot_active
     chat_id = message.chat.id
     logger.info(f"Commande /stop reçue de {chat_id}")
-    if trade_active:
+    if trade_active or bot_active:
         trade_active = False
+        bot_active = False  # Arrêt global
         stop_event.set()
         for thread in active_threads:
             if thread.is_alive():
@@ -578,9 +618,9 @@ def stop_message(message):
                 thread.join(timeout=2)
         active_threads = []
         while not message_queue.empty():
-            message_queue.get()
-        queue_message(chat_id, "⏹️ Trading arrêté.")
-        logger.info("Trading arrêté, threads réinitialisés")
+            message_queue.get()  # Vider la file
+        queue_message(chat_id, "⏹️ Trading et bot arrêtés.")
+        logger.info("Trading et bot arrêtés, threads réinitialisés")
     else:
         queue_message(chat_id, "ℹ️ Trading déjà arrêté!")
 
@@ -631,10 +671,13 @@ def show_main_menu(chat_id):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
-    global trade_active, active_threads
+    global trade_active, active_threads, bot_active
     chat_id = call.message.chat.id
     logger.info(f"Callback reçu: {call.data} de {chat_id}")
     try:
+        if not bot_active:
+            queue_message(chat_id, "⚠️ Bot arrêté, relancez avec /start")
+            return
         if call.data == "status":
             sol_balance = asyncio.run(get_solana_balance(chat_id))
             queue_message(chat_id, (
@@ -653,8 +696,9 @@ def callback_query(call):
             else:
                 queue_message(chat_id, "ℹ️ Trading déjà actif!")
         elif call.data == "stop":
-            if trade_active:
+            if trade_active or bot_active:
                 trade_active = False
+                bot_active = False
                 stop_event.set()
                 for thread in active_threads:
                     if thread.is_alive():
@@ -663,8 +707,8 @@ def callback_query(call):
                 active_threads = []
                 while not message_queue.empty():
                     message_queue.get()
-                queue_message(chat_id, "⏹️ Trading arrêté.")
-                logger.info("Trading arrêté via callback")
+                queue_message(chat_id, "⏹️ Trading et bot arrêtés.")
+                logger.info("Trading et bot arrêtés via callback")
             else:
                 queue_message(chat_id, "ℹ️ Trading déjà arrêté!")
         elif call.data == "portfolio":
