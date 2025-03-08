@@ -13,13 +13,13 @@ from solders.transaction import Transaction
 from solders.instruction import Instruction
 import threading
 import asyncio
-import aiohttp
-import websockets
 from datetime import datetime
 from waitress import serve
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from queue import Queue
+import aiohttp
+import websockets
 from cryptography.fernet import Fernet
 
 # Configuration logging
@@ -59,8 +59,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-QUICKNODE_WS_URL = os.getenv("QUICKNODE_WS_URL")  # WebSocket URL
-QUICKNODE_RPC_URL = os.getenv("QUICKNODE_RPC_URL")  # RPC URL
+QUICKNODE_SOL_URL = os.getenv("QUICKNODE_SOL_URL")  # RPC existant
+QUICKNODE_WS_URL = os.getenv("QUICKNODE_WS_URL")    # WebSocket
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "5be903b581bc47d29bbfb5ab859de2eb")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "0f7563a5bbd10275056bf3c2175823cd")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "AAAAAAAAAAAAAAAAAAAAAD6%2BzQEAAAAAaDN4Thznh7iGRdfqEhebMgWtohs%3DyuaSpNWBCnPcQv5gjERphqmZTIclzPiVqqnirPmdZt4fpRd96D")
@@ -83,7 +83,7 @@ MAX_VOLUME_SOL = 2000000
 MIN_LIQUIDITY = 5000
 MIN_MARKET_CAP_SOL = 1000
 MAX_MARKET_CAP_SOL = 5000000
-MIN_BUY_SELL_RATIO = 2
+MIN_BUY_SELL_RATIO = 1.5  # Réduit pour tester
 MAX_TOKEN_AGE_HOURS = 0.5  # 30 minutes
 MIN_SOCIAL_MENTIONS = 5
 MIN_SOL_AMOUNT = 0.1
@@ -92,7 +92,7 @@ DETECTION_COOLDOWN = 60
 MIN_SOL_BALANCE = 0.05
 TWITTER_CHECK_INTERVAL = 900
 POLLING_INTERVAL = 15  # Polling toutes les 15s
-HOLDER_CONCENTRATION_THRESHOLD = 0.75
+HOLDER_CONCENTRATION_THRESHOLD = 0.90  # Tolérance à 90%
 
 # Constantes Solana
 PUMP_FUN_PROGRAM_ID = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfH43SboMiMEWCPkDPk")
@@ -220,7 +220,7 @@ async def websocket_monitor(chat_id):
             "jsonrpc": "2.0",
             "id": 1,
             "method": "programSubscribe",
-            "params": [str(PUMP_FUN_PROGRAM_ID), {"encoding": "base64"}]
+            "params": [str(PUMP_FUN_PROGRAM_ID), {"encoding": "base64", "commitment": "confirmed"}]
         }))
         logger.info("WebSocket connecté à QuickNode pour Pump.fun")
         
@@ -234,38 +234,41 @@ async def websocket_monitor(chat_id):
                 message = await asyncio.wait_for(ws.recv(), timeout=1.0)
                 data = json.loads(message)
                 if 'result' not in data:
-                    tx = data.get('params', {}).get('result', {}).get('value', {})
-                    token_address = tx.get('account', {}).get('pubkey')
-                    if not token_address or token_address in detected_tokens or token_address in dynamic_blacklist:
+                    tx_data = data.get('params', {}).get('result', {}).get('value', {})
+                    if not tx_data or 'account' not in tx_data:
                         continue
 
-                    # Analyse transaction
-                    instruction = tx.get('instruction', {})
-                    if instruction.get('programId') == str(PUMP_FUN_PROGRAM_ID):
-                        amount = int.from_bytes(instruction.get('data', b'')[1:9], 'little') / 10**9
+                    token_address = tx_data['account']['pubkey']
+                    if token_address in detected_tokens or token_address in dynamic_blacklist:
+                        continue
+
+                    instruction = tx_data.get('instruction', {})
+                    if instruction and instruction.get('programId') == str(PUMP_FUN_PROGRAM_ID):
+                        data_bytes = base58.b58decode(instruction.get('data', ''))
+                        if len(data_bytes) < 9:
+                            continue
+                        amount = int.from_bytes(data_bytes[1:9], 'little') / 10**9
                         accounts = {acc['pubkey'] for acc in instruction.get('accounts', [])}
                         accounts_in_tx[token_address] = accounts_in_tx.get(token_address, set()).union(accounts)
 
-                        if instruction.get('data', b'')[0] == 2:  # Buy
+                        if data_bytes[0] == 2:  # Buy
                             buy_volume[token_address] = buy_volume.get(token_address, 0) + amount
                             token_timestamps[token_address] = token_timestamps.get(token_address, time.time())
-                        elif instruction.get('data', b'')[0] == 3:  # Sell
+                        elif data_bytes[0] == 3:  # Sell
                             sell_volume[token_address] = sell_volume.get(token_address, 0) + amount
 
-                        # Vérification rapide
                         age_hours = (time.time() - token_timestamps.get(token_address, time.time())) / 3600
                         if age_hours <= MAX_TOKEN_AGE_HOURS:
                             bv = buy_volume.get(token_address, 0)
                             sv = sell_volume.get(token_address, 0)
                             ratio = bv / sv if sv > 0 else (bv > 0 and 2 or 1)
+                            logger.info(f"Token {token_address} - Buy: {bv}, Sell: {sv}, Ratio A/V: {ratio:.2f}")
 
-                            # Anti-dump artificiel
                             if sv > bv * 0.5:
                                 dynamic_blacklist.add(token_address)
                                 queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Dump artificiel détecté")
                                 continue
 
-                            # Anti-rug : Minimum 3 comptes
                             if len(accounts_in_tx.get(token_address, set())) < MIN_ACCOUNTS_IN_TX:
                                 continue
 
@@ -277,7 +280,6 @@ async def websocket_monitor(chat_id):
                                     last_detection_time[token_address] = time.time()
                                     await buy_token_solana(chat_id, token_address, mise_depart_sol)
 
-                        # Réinitialisation après 15s
                         if time.time() - token_timestamps.get(token_address, 0) > 15:
                             buy_volume.pop(token_address, None)
                             sell_volume.pop(token_address, None)
@@ -307,7 +309,7 @@ async def get_token_data(token_address):
 
             # QuickNode pour supply et holders
             supply_response = await async_session.post(
-                QUICKNODE_RPC_URL,
+                QUICKNODE_SOL_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token_address]},
                 timeout=10
             )
@@ -315,7 +317,7 @@ async def get_token_data(token_address):
             supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**6
 
             holders_response = await async_session.post(
-                QUICKNODE_RPC_URL,
+                QUICKNODE_SOL_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_address]},
                 timeout=10
             )
@@ -324,15 +326,25 @@ async def get_token_data(token_address):
             top_holder_ratio = sum(float(h.get('amount', 0)) / 10**6 for h in top_holders[:5]) / supply if supply > 0 else 0
             top_holder_ratio = min(top_holder_ratio, 1.0)
 
-            # Fallback DexScreener
-            if not liquidity or not price:
+            # Fallback DexScreener si Birdeye échoue
+            if not liquidity:
                 dexscreener_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
                 dexscreener_response = await async_session.get(dexscreener_url)
                 dexscreener_data = await dexscreener_response.json()
                 pair = dexscreener_data.get('pairs', [{}])[0]
-                liquidity = float(pair.get('liquidity', {}).get('usd', 0))
-                price = float(pair.get('priceUsd', 0))
-                volume_24h = float(pair.get('volume', {}).get('h24', 0)) / 1000
+                liquidity = float(pair.get('liquidity', {}).get('usd', 0)) or liquidity
+                price = float(pair.get('priceUsd', 0)) or price
+                volume_24h = float(pair.get('volume', {}).get('h24', 0)) / 1000 or volume_24h
+
+            # Dernier recours via QuickNode si toujours pas de liquidité
+            if not liquidity:
+                account_info_response = await async_session.post(
+                    QUICKNODE_SOL_URL,
+                    json={"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo", "params": [token_address, {"encoding": "jsonParsed"}]},
+                )
+                account_info = (await account_info_response.json()).get('result', {}).get('value', {})
+                lamports = account_info.get('lamports', 0)
+                liquidity = lamports / 10**9 * price if price > 0 else 0
 
         market_cap = supply * price if price > 0 else 0
         logger.info(f"Token {token_address} - Prix: {price}, Volume: {volume_24h}, Liquidité: {liquidity}, Market Cap: {market_cap}, Top Holder Ratio: {top_holder_ratio:.2%}, Âge: {(time.time() - pair_created_at) / 3600:.2f}h")
@@ -341,7 +353,7 @@ async def get_token_data(token_address):
             'liquidity': liquidity,
             'market_cap': market_cap,
             'price': price,
-            'buy_sell_ratio': 1,  # Placeholder, calculé en temps réel via WebSocket
+            'buy_sell_ratio': 1,  # Calculé via WebSocket
             'pair_created_at': pair_created_at,
             'supply': supply,
             'has_liquidity': liquidity > MIN_LIQUIDITY,
@@ -412,14 +424,14 @@ async def validate_token_full(chat_id, token_address):
             return None
 
         supply_response = await session.post(
-            QUICKNODE_RPC_URL,
+            QUICKNODE_SOL_URL,
             json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token_address]},
         )
         supply_data = await supply_response.json()
         supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**6
 
         holders_response = await session.post(
-            QUICKNODE_RPC_URL,
+            QUICKNODE_SOL_URL,
             json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_address]},
         )
         holders_data = await holders_response.json()
@@ -454,7 +466,7 @@ async def buy_token_solana(chat_id, contract_address, amount):
             raise Exception(f"Solde SOL insuffisant: {sol_balance:.4f} < {MIN_SOL_AMOUNT + MIN_SOL_BALANCE:.4f}")
 
         amount_in = int(amount * 10**9)
-        response = session.post(QUICKNODE_RPC_URL, json={
+        response = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
             "params": [{"commitment": "finalized"}]
         }, timeout=5)
@@ -472,7 +484,7 @@ async def buy_token_solana(chat_id, contract_address, amount):
         )
         tx.add(instruction)
         tx.sign([solana_keypair])
-        tx_hash = session.post(QUICKNODE_RPC_URL, json={
+        tx_hash = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
             "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
         }, timeout=5).json()['result']
@@ -505,7 +517,7 @@ async def sell_token(chat_id, contract_address, amount, current_price):
                 raise Exception("Solana non initialisé")
 
         amount_out = int(amount * 10**9)
-        response = session.post(QUICKNODE_RPC_URL, json={
+        response = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
             "params": [{"commitment": "finalized"}]
         }, timeout=5)
@@ -523,7 +535,7 @@ async def sell_token(chat_id, contract_address, amount, current_price):
         )
         tx.add(instruction)
         tx.sign([solana_keypair])
-        tx_hash = session.post(QUICKNODE_RPC_URL, json={
+        tx_hash = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
             "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
         }, timeout=5).json()['result']
@@ -676,7 +688,7 @@ async def get_solana_balance(chat_id):
             initialize_bot(chat_id)
         if not solana_keypair:
             return 0
-        response = session.post(QUICKNODE_RPC_URL, json={
+        response = session.post(QUICKNODE_SOL_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getBalance",
             "params": [str(solana_keypair.pubkey())]
         }, timeout=5)
@@ -763,7 +775,7 @@ async def adjust_detection_criteria(message):
     try:
         criteria = message.text.split(",")
         if len(criteria) != 7:
-            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 100,2000000,5000,1000,5000000,2,0.5)")
+            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 100,2000000,5000,1000,5000000,1.5,0.5)")
             return
         min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age = map(float, criteria)
         if min_vol < 0 or max_vol < min_vol or min_liq < 0 or min_mc < 0 or max_mc < min_mc or min_ratio < 0 or max_age < 0:
@@ -785,7 +797,7 @@ async def adjust_detection_criteria(message):
             f"Âge max : {MAX_TOKEN_AGE_HOURS} h"
         ))
     except ValueError:
-        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 100,2000000,5000,1000,5000000,2,0.5)")
+        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 100,2000000,5000,1000,5000000,1.5,0.5)")
 
 async def run_tasks(chat_id):
     await asyncio.gather(
@@ -978,7 +990,7 @@ def callback_query(call):
             queue_message(chat_id, "Entrez le nouveau ratio de réinvestissement (ex. : 0.9) :")
             bot.register_next_step_handler(call.message, adjust_reinvestment_ratio)
         elif call.data == "adjust_detection_criteria":
-            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age) ex. : 100,2000000,5000,1000,5000000,2,0.5 :")
+            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age) ex. : 100,2000000,5000,1000,5000000,1.5,0.5 :")
             bot.register_next_step_handler(call.message, adjust_detection_criteria)
         elif call.data.startswith("sell_pct_"):
             parts = call.data.split("_")
@@ -1000,7 +1012,7 @@ def callback_query(call):
         logger.error(f"Erreur callback: {str(e)}")
 
 if __name__ == "__main__":
-    if not all([TELEGRAM_TOKEN, WALLET_ADDRESS, SOLANA_PRIVATE_KEY, WEBHOOK_URL, QUICKNODE_WS_URL, QUICKNODE_RPC_URL, BIRDEYE_API_KEY, TWITTER_BEARER_TOKEN]):
+    if not all([TELEGRAM_TOKEN, WALLET_ADDRESS, SOLANA_PRIVATE_KEY, WEBHOOK_URL, QUICKNODE_SOL_URL, QUICKNODE_WS_URL, BIRDEYE_API_KEY, TWITTER_BEARER_TOKEN]):
         logger.error("Variables d’environnement manquantes")
         exit(1)
     if set_webhook():
