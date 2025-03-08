@@ -17,7 +17,6 @@ from datetime import datetime
 from waitress import serve
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import backoff
 from queue import Queue
 import aiohttp
 from cryptography.fernet import Fernet
@@ -51,8 +50,8 @@ dynamic_blacklist = set()
 pause_auto_sell = False
 chat_id_global = None
 stop_event = threading.Event()
-active_threads = []
 last_twitter_check = 0
+last_polling_check = 0
 
 # Variables d’environnement
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -65,11 +64,11 @@ TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "0f7563a5bbd10275056bf3c21758
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "AAAAAAAAAAAAAAAAAAAAAD6%2BzQEAAAAAaDN4Thznh7iGRdfqEhebMgWtohs%3DyuaSpNWBCnPcQv5gjERphqmZTIclzPiVqqnirPmdZt4fpRd96D")
 PORT = int(os.getenv("PORT", 8080))
 
-# Chiffrement de la clé privée pour les logs
+# Chiffrement de la clé privée
 cipher_suite = Fernet(Fernet.generate_key())
 encrypted_private_key = cipher_suite.encrypt(SOLANA_PRIVATE_KEY.encode()).decode() if SOLANA_PRIVATE_KEY else "N/A"
 
-# Paramètres de trading
+# Paramètres de trading (inchangés pour sécurité)
 mise_depart_sol = 0.37
 stop_loss_threshold = 15
 trailing_stop_percentage = 5
@@ -90,6 +89,8 @@ MIN_ACCOUNTS_IN_TX = 3
 DETECTION_COOLDOWN = 60
 MIN_SOL_BALANCE = 0.05
 TWITTER_CHECK_INTERVAL = 900
+POLLING_INTERVAL = 60
+HOLDER_CONCENTRATION_THRESHOLD = 0.5
 
 # Constantes Solana
 PUMP_FUN_PROGRAM_ID = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfH43SboMiMEWCPkDPk")
@@ -192,17 +193,17 @@ def quicknode_webhook():
                         continue
 
                     token_data = asyncio.run(get_token_data(token_address))
-                    if token_data and token_data.get('liquidity', 0) > MIN_LIQUIDITY:
+                    if token_data:
                         if asyncio.run(validate_token(chat_id_global, token_address, token_data)):
-                            queue_message(chat_id_global, f"🎯 Token détecté : `{token_address}` (Solana - QuickNode)")
-                            logger.info(f"Token détecté : {token_address}")
+                            queue_message(chat_id_global, f"🎯 Token détecté via QuickNode : `{token_address}`")
+                            logger.info(f"Token détecté via QuickNode : {token_address}")
                             detected_tokens[token_address] = True
                             last_detection_time[token_address] = time.time()
                             asyncio.run(buy_token_solana(chat_id_global, token_address, mise_depart_sol))
                         else:
-                            logger.info(f"Token {token_address} rejeté par critères")
+                            logger.info(f"Token {token_address} rejeté par critères QuickNode")
                     else:
-                        logger.info(f"Token {token_address} ignoré : Liquidité insuffisante")
+                        logger.info(f"Token {token_address} ignoré : Données indisponibles")
             return 'OK', 200
         except Exception as e:
             logger.error(f"Erreur traitement webhook QuickNode: {str(e)}")
@@ -234,7 +235,7 @@ async def get_token_data(token_address):
                 timeout=10
             )
             supply_data = await supply_response.json()
-            supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**9
+            supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**6  # Ajustement décimales
 
             holders_response = await async_session.post(
                 QUICKNODE_SOL_URL,
@@ -243,7 +244,9 @@ async def get_token_data(token_address):
             )
             holders_data = await holders_response.json()
             top_holders = holders_data.get('result', {}).get('value', [])
-            top_holder_ratio = sum(float(h['amount']) for h in top_holders[:5]) / supply if supply > 0 else 0
+            total_top_held = sum(float(h.get('amount', 0)) / 10**6 for h in top_holders[:5])  # Ajustement décimales
+            top_holder_ratio = total_top_held / supply if supply > 0 else 0
+            top_holder_ratio = min(top_holder_ratio, 1.0)  # Limiter à 100%
 
             # Birdeye pour prix et volume
             birdeye_url = f"https://public-api.birdeye.so/public/price?address={token_address}"
@@ -265,9 +268,9 @@ async def get_token_data(token_address):
         liquidity = lamports / 10**9 * 1000
         has_liquidity = liquidity > MIN_LIQUIDITY
         market_cap = supply * price if price > 0 else 0
-        pair_created_at = account_info.get('data', {}).get('parsed', {}).get('info', {}).get('mint', {}).get('created_at', time.time())
+        pair_created_at = time.time()  # Simplification temporaire
 
-        logger.info(f"Token {token_address} - Prix: {price}, Volume: {volume_24h}, Liquidité: {liquidity}, Market Cap: {market_cap}, Top Holder Ratio: {top_holder_ratio}")
+        logger.info(f"Token {token_address} - Prix: {price}, Volume: {volume_24h}, Liquidité: {liquidity}, Market Cap: {market_cap}, Top Holder Ratio: {top_holder_ratio:.2%}")
         return {
             'volume_24h': volume_24h,
             'liquidity': liquidity if has_liquidity else 0,
@@ -285,6 +288,10 @@ async def get_token_data(token_address):
 
 async def validate_token(chat_id, token_address, data):
     try:
+        if not data:
+            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Données indisponibles")
+            return False
+
         volume_24h = data.get('volume_24h', 0)
         liquidity = data.get('liquidity', 0)
         market_cap = data.get('market_cap', 0)
@@ -292,7 +299,7 @@ async def validate_token(chat_id, token_address, data):
         age_hours = (time.time() - data.get('pair_created_at', time.time())) / 3600
         top_holder_ratio = data.get('top_holder_ratio', 0)
 
-        if top_holder_ratio > 0.5:
+        if top_holder_ratio > HOLDER_CONCENTRATION_THRESHOLD:
             queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Concentration holders trop élevée ({top_holder_ratio:.2%})")
             dynamic_blacklist.add(token_address)
             return False
@@ -484,12 +491,44 @@ async def check_twitter_mentions(chat_id):
                 if score >= MIN_SOCIAL_MENTIONS and token not in portfolio and token not in dynamic_blacklist:
                     token_data = await get_token_data(token)
                     if token_data and await validate_token(chat_id, token, token_data):
-                        queue_message(chat_id, f"📣 Token `{token}` détecté via Twitter (score: {score})")
+                        queue_message(chat_id, f"📣 Token détecté via Twitter : `{token}` (score: {score})")
                         await buy_token_solana(chat_id, token, mise_depart_sol)
             last_twitter_check = time.time()
     except Exception as e:
         logger.error(f"Erreur vérification Twitter: {str(e)}")
         queue_message(chat_id, f"⚠️ Erreur Twitter: `{str(e)}`")
+
+async def poll_new_tokens(chat_id):
+    global last_polling_check
+    try:
+        if time.time() - last_polling_check < POLLING_INTERVAL:
+            return
+        async with aiohttp.ClientSession() as async_session:
+            # Polling Birdeye pour nouveaux tokens
+            birdeye_url = "https://public-api.birdeye.so/public/tokenlist?sort_by=volume&sort_type=desc&offset=0&limit=50"
+            birdeye_response = await async_session.get(birdeye_url, headers={"X-API-KEY": BIRDEYE_API_KEY})
+            birdeye_data = await birdeye_response.json()
+            tokens = birdeye_data.get('data', {}).get('tokens', [])
+
+            for token in tokens:
+                token_address = token.get('address')
+                if not token_address or token_address in BLACKLISTED_TOKENS or token_address in detected_tokens or token_address in dynamic_blacklist:
+                    continue
+                if not validate_address(token_address):
+                    continue
+
+                token_data = await get_token_data(token_address)
+                if token_data and await validate_token(chat_id, token_address, token_data):
+                    queue_message(chat_id, f"🎯 Token détecté via polling Birdeye : `{token_address}`")
+                    logger.info(f"Token détecté via polling Birdeye : {token_address}")
+                    detected_tokens[token_address] = True
+                    last_detection_time[token_address] = time.time()
+                    await buy_token_solana(chat_id, token_address, mise_depart_sol)
+
+        last_polling_check = time.time()
+    except Exception as e:
+        logger.error(f"Erreur polling nouveaux tokens: {str(e)}")
+        queue_message(chat_id, f"⚠️ Erreur polling: `{str(e)}`")
 
 async def show_portfolio(chat_id):
     try:
@@ -636,26 +675,23 @@ async def adjust_detection_criteria(message):
 async def run_tasks(chat_id):
     await asyncio.gather(
         monitor_and_sell(chat_id),
-        check_twitter_mentions(chat_id)
+        check_twitter_mentions(chat_id),
+        poll_new_tokens(chat_id)
     )
 
 def initialize_and_run_tasks(chat_id):
-    global trade_active, chat_id_global, active_threads, bot_active
+    global trade_active, chat_id_global, bot_active
     chat_id_global = chat_id
     try:
         initialize_bot(chat_id)
         if solana_keypair:
             trade_active = True
+            bot_active = True
             stop_event.clear()
             queue_message(chat_id, "▶️ Trading Solana lancé avec succès!")
             logger.info(f"Trading démarré pour chat_id {chat_id}")
-            active_threads = [
-                threading.Thread(target=lambda: asyncio.run(run_tasks(chat_id)), daemon=True),
-                threading.Thread(target=heartbeat, args=(chat_id,), daemon=True)
-            ]
-            for thread in active_threads:
-                thread.start()
-                logger.info(f"Tâche lancée dans thread {thread.name}")
+            threading.Thread(target=lambda: asyncio.run(run_tasks(chat_id)), daemon=True).start()
+            threading.Thread(target=heartbeat, args=(chat_id,), daemon=True).start()
         else:
             queue_message(chat_id, "⚠️ Échec initialisation : Solana non connecté")
             logger.error("Échec initialisation: Solana manquant")
@@ -722,21 +758,16 @@ def menu_message(message):
 
 @bot.message_handler(commands=['stop', 'Stop', 'STOP'])
 def stop_message(message):
-    global trade_active, active_threads, bot_active
+    global trade_active, bot_active
     chat_id = message.chat.id
     logger.info(f"Commande /stop reçue de {chat_id}")
     trade_active = False
     bot_active = False
     stop_event.set()
-    for thread in active_threads:
-        if thread.is_alive():
-            logger.info(f"Attente arrêt du thread {thread.name}")
-            thread.join(timeout=2)
-    active_threads = []
     while not message_queue.empty():
         message_queue.get()
     queue_message(chat_id, "⏹️ Trading et bot arrêtés.")
-    logger.info("Trading et bot arrêtés, threads réinitialisés")
+    logger.info("Trading et bot arrêtés")
 
 @bot.message_handler(commands=['pause', 'Pause', 'PAUSE'])
 def pause_auto_sell_handler(message):
@@ -785,7 +816,7 @@ def show_main_menu(chat_id):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_query(call):
-    global trade_active, active_threads, bot_active
+    global trade_active, bot_active
     chat_id = call.message.chat.id
     logger.info(f"Callback reçu: {call.data} de {chat_id}")
     try:
@@ -810,11 +841,6 @@ def callback_query(call):
             trade_active = False
             bot_active = False
             stop_event.set()
-            for thread in active_threads:
-                if thread.is_alive():
-                    logger.info(f"Attente arrêt du thread {thread.name}")
-                    thread.join(timeout=2)
-            active_threads = []
             while not message_queue.empty():
                 message_queue.get()
             queue_message(chat_id, "⏹️ Trading et bot arrêtés.")
