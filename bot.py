@@ -54,7 +54,9 @@ chat_id_global = None
 stop_event = threading.Event()
 last_twitter_check = 0
 last_polling_check = 0
-token_metrics = {}  # Cache pour données temps réel (ratio A/V)
+token_metrics = {}
+solana_keypair = None
+rugcheck_auth_token = None
 
 # Variables d’environnement
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -102,8 +104,6 @@ TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5
 
 app = Flask(__name__)
 bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
-solana_keypair = None
-rugcheck_auth_token = None
 
 def send_message_worker():
     while bot_active:
@@ -128,7 +128,7 @@ def queue_message(chat_id, text, reply_markup=None):
         logger.info(f"Queueing message to {chat_id}: {text}")
         message_queue.put((chat_id, text, reply_markup))
 
-def initialize_bot(chat_id):
+async def initialize_bot(chat_id):
     global solana_keypair, rugcheck_auth_token
     try:
         solana_keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
@@ -190,7 +190,7 @@ async def analyze_token(chat_id, token_address):
             return
 
         if not solana_keypair:
-            initialize_bot(chat_id)
+            await initialize_bot(chat_id)
             if not solana_keypair:
                 queue_message(chat_id, "⚠️ Wallet Solana non initialisé.")
                 return
@@ -552,7 +552,7 @@ async def validate_token_full(chat_id, token_address):
 async def buy_token_solana(chat_id, contract_address, amount):
     try:
         if not solana_keypair:
-            initialize_bot(chat_id)
+            await initialize_bot(chat_id)
             if not solana_keypair:
                 raise Exception("Solana non initialisé")
         sol_balance = await get_solana_balance(chat_id)
@@ -606,7 +606,7 @@ async def sell_token(chat_id, contract_address, amount, current_price):
     global mise_depart_sol
     try:
         if not solana_keypair:
-            initialize_bot(chat_id)
+            await initialize_bot(chat_id)
             if not solana_keypair:
                 raise Exception("Solana non initialisé")
 
@@ -782,7 +782,7 @@ async def show_portfolio(chat_id):
 async def get_solana_balance(chat_id):
     try:
         if not solana_keypair:
-            initialize_bot(chat_id)
+            await initialize_bot(chat_id)
         if not solana_keypair:
             return 0
         response = session.post(QUICKNODE_SOL_URL, json={
@@ -908,7 +908,7 @@ def initialize_and_run_tasks(chat_id):
     global trade_active, chat_id_global, bot_active
     chat_id_global = chat_id
     try:
-        initialize_bot(chat_id)
+        asyncio.run(initialize_bot(chat_id))
         if solana_keypair:
             trade_active = True
             bot_active = True
