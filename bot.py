@@ -27,15 +27,13 @@ from cryptography.fernet import Fernet
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Session HTTP avec retries et timeout
+# Session HTTP avec retries
 session = requests.Session()
-session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
-retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET", "POST"])
+retry_strategy = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
-session.timeout = 10
 
-# File d’attente pour Telegram
+# File d’attente Telegram
 message_queue = Queue()
 message_lock = threading.Lock()
 
@@ -56,7 +54,6 @@ last_twitter_check = 0
 last_polling_check = 0
 token_metrics = {}
 solana_keypair = None
-rugcheck_auth_token = None
 
 # Variables d’environnement
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -70,11 +67,11 @@ TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "0f7563a5bbd10275056bf3c21758
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "AAAAAAAAAAAAAAAAAAAAAD6%2BzQEAAAAAaDN4Thznh7iGRdfqEhebMgWtohs%3DyuaSpNWBCnPcQv5gjERphqmZTIclzPiVqqnirPmdZt4fpRd96D")
 PORT = int(os.getenv("PORT", 8080))
 
-# Chiffrement de la clé privée
+# Chiffrement clé privée
 cipher_suite = Fernet(Fernet.generate_key())
 encrypted_private_key = cipher_suite.encrypt(SOLANA_PRIVATE_KEY.encode()).decode() if SOLANA_PRIVATE_KEY else "N/A"
 
-# Paramètres de trading
+# Paramètres trading
 mise_depart_sol = 0.37
 stop_loss_threshold = 15
 trailing_stop_percentage = 5
@@ -110,53 +107,36 @@ def send_message_worker():
         item = message_queue.get()
         chat_id, text = item[0], item[1]
         reply_markup = item[2] if len(item) > 2 else None
+        message_id = item[3] if len(item) > 3 else None
         try:
             with message_lock:
-                if reply_markup:
-                    bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode='Markdown')
+                if message_id and reply_markup:
+                    bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, parse_mode='Markdown')
+                elif reply_markup:
+                    sent_msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode='Markdown')
+                    if "Analyse de" in text:  # Retourner message_id pour analyses
+                        message_queue.put((chat_id, text, reply_markup, sent_msg.message_id))
                 else:
                     bot.send_message(chat_id, text, parse_mode='Markdown')
             time.sleep(0.1)
         except Exception as e:
-            logger.error(f"Erreur envoi message Telegram: {str(e)}")
+            logger.error(f"Erreur envoi message: {str(e)}")
         message_queue.task_done()
 
 threading.Thread(target=send_message_worker, daemon=True).start()
 
-def queue_message(chat_id, text, reply_markup=None):
-    if bot_active:
-        logger.info(f"Queueing message to {chat_id}: {text}")
-        message_queue.put((chat_id, text, reply_markup))
+def queue_message(chat_id, text, reply_markup=None, message_id=None):
+    logger.info(f"Queueing message to {chat_id}: {text}")
+    message_queue.put((chat_id, text, reply_markup, message_id))
 
 async def initialize_bot(chat_id):
-    global solana_keypair, rugcheck_auth_token
+    global solana_keypair
     try:
         solana_keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
         queue_message(chat_id, "✅ Clé Solana initialisée")
         logger.info(f"Solana initialisé avec clé chiffrée: {encrypted_private_key[:10]}...")
-
-        # Authentification Rugcheck avec signature Solana
-        message_to_sign = "Sign-in to Rugcheck.xyz"
-        signature = solana_keypair.sign_message(message_to_sign.encode())
-        async with aiohttp.ClientSession() as session:
-            auth_response = await session.post(
-                "https://api.rugcheck.xyz/v1/auth/login/solana",
-                json={
-                    "publicKey": str(solana_keypair.pubkey()),
-                    "signature": str(signature),
-                    "message": message_to_sign
-                }
-            )
-            auth_data = await auth_response.json()
-            rugcheck_auth_token = auth_data.get("token")
-            if rugcheck_auth_token:
-                logger.info("Authentification Rugcheck réussie")
-                queue_message(chat_id, "✅ Connexion Rugcheck établie")
-            else:
-                logger.warning("Échec authentification Rugcheck, tentative sans token")
-                queue_message(chat_id, "⚠️ Échec connexion Rugcheck, utilisation sans token")
     except Exception as e:
-        queue_message(chat_id, f"⚠️ Erreur initialisation Solana/Rugcheck: `{str(e)}`")
+        queue_message(chat_id, f"⚠️ Erreur initialisation Solana: `{str(e)}`")
         logger.error(f"Erreur initialisation: {str(e)}")
         solana_keypair = None
 
@@ -169,7 +149,7 @@ def set_webhook():
             logger.info(f"Webhook configuré sur {WEBHOOK_URL}")
             return True
         else:
-            raise Exception("Échec de la configuration du webhook")
+            raise Exception("Échec configuration webhook")
     except Exception as e:
         logger.error(f"Erreur configuration webhook: {str(e)}")
         queue_message(chat_id_global, f"⚠️ Erreur webhook: `{str(e)}`")
@@ -182,44 +162,35 @@ def validate_address(token_address):
     except ValueError:
         return False
 
-async def analyze_token(chat_id, token_address):
-    global rugcheck_auth_token
+async def analyze_token(chat_id, token_address, message_id=None):
     try:
         if not validate_address(token_address):
-            queue_message(chat_id, f"⚠️ `{token_address}` n’est pas une adresse Solana valide.")
+            queue_message(chat_id, f"⚠️ `{token_address}` n’est pas une adresse Solana valide.", message_id=message_id)
             return
 
         if not solana_keypair:
             await initialize_bot(chat_id)
             if not solana_keypair:
-                queue_message(chat_id, "⚠️ Wallet Solana non initialisé.")
+                queue_message(chat_id, "⚠️ Wallet Solana non initialisé.", message_id=message_id)
                 return
 
         async with aiohttp.ClientSession() as session:
-            # Rugcheck avec signature Solana
-            headers = {}
-            if rugcheck_auth_token:
-                headers["Authorization"] = f"Bearer {rugcheck_auth_token}"
-            else:
-                message_to_sign = f"Check token {token_address} on Rugcheck.xyz"
-                signature = solana_keypair.sign_message(message_to_sign.encode())
-                headers["X-Solana-Public-Key"] = str(solana_keypair.pubkey())
-                headers["X-Solana-Signature"] = str(signature)
+            # GMGN.AI pour analyse sécurité (fallback Dexscreener si indisponible)
+            gmgn_url = f"https://api.gmgn.ai/v1/tokens/{token_address}/security"
+            gmgn_response = await session.get(gmgn_url)
+            gmgn_data = await gmgn_response.json() if gmgn_response.status == 200 else {}
+            rug_status = gmgn_data.get("risk_level", "N/A")
+            rug_details = gmgn_data.get("details", "Analyse indisponible")
 
-            rugcheck_url = f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report"
-            rugcheck_response = await session.get(rugcheck_url, headers=headers)
-            rugcheck_data = await rugcheck_response.json()
-            rug_status = rugcheck_data.get("riskLevel", "N/A")
-            rug_details = rugcheck_data.get("summary", "Analyse indisponible")
+            # Dexscreener pour données marché
+            dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+            dex_response = await session.get(dex_url)
+            dex_data = await dex_response.json()
+            pair = dex_data.get('pairs', [{}])[0]
+            market_cap = float(pair.get('marketCap', 0))
+            liquidity = float(pair.get('liquidity', {}).get('usd', 0))
 
-            # Données token en temps réel
-            token_data = await get_token_data(token_address)
-            if not token_data:
-                queue_message(chat_id, f"⚠️ Impossible de récupérer les données pour `{token_address}`.")
-                return
-
-            market_cap = token_data['market_cap']
-            liquidity = token_data['liquidity']
+            # QuickNode pour holders
             holders_response = await session.post(
                 QUICKNODE_SOL_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_address]},
@@ -227,17 +198,24 @@ async def analyze_token(chat_id, token_address):
             )
             holders_data = await holders_response.json()
             num_holders = len(holders_data.get('result', {}).get('value', []))
-            buy_sell_ratio = token_metrics.get(token_address, {}).get('buy_sell_ratio', 1.0)
 
-            # Construction du tableau
+            # Données temps réel via token_metrics
+            metrics = token_metrics.get(token_address, {})
+            buy_sell_ratio = metrics.get('buy_sell_ratio', 1.0)
+            buy_count = metrics.get('buy_count', 0)
+            sell_count = metrics.get('sell_count', 0)
+
+            # Construction tableau
             msg = (
                 f"📊 *Analyse de `{token_address}`*\n\n"
-                f"**Rugcheck** : {rug_status}\n"
+                f"**Sécurité (GMGN)** : {rug_status}\n"
                 f"Détails : {rug_details}\n\n"
                 f"**Market Cap** : ${market_cap:.2f}\n"
                 f"**Liquidité** : ${liquidity:.2f}\n"
-                f"**Nombre de Holders** : {num_holders}\n"
+                f"**Holders** : {num_holders}\n"
                 f"**Ratio Achat/Vente** : {buy_sell_ratio:.2f}\n"
+                f"**Achats (5min)** : {buy_count}\n"
+                f"**Ventes (5min)** : {sell_count}"
             )
 
             markup = InlineKeyboardMarkup()
@@ -249,9 +227,9 @@ async def analyze_token(chat_id, token_address):
                 InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{token_address}")
             )
 
-            queue_message(chat_id, msg, reply_markup=markup)
+            queue_message(chat_id, msg, reply_markup=markup, message_id=message_id)
     except Exception as e:
-        queue_message(chat_id, f"⚠️ Erreur analyse `{token_address}` : `{str(e)}`")
+        queue_message(chat_id, f"⚠️ Erreur analyse `{token_address}` : `{str(e)}`", message_id=message_id)
         logger.error(f"Erreur analyse token: {str(e)}")
 
 @app.route("/quicknode-webhook", methods=['POST'])
@@ -259,15 +237,10 @@ def quicknode_webhook():
     global chat_id_global
     logger.info("Webhook QuickNode appelé")
     if request.method == "POST":
-        content_type = request.headers.get("Content-Type", "")
         try:
-            if "application/json" in content_type.lower():
-                data = request.get_json()
-            else:
-                raw_data = request.get_data(as_text=True)
-                data = json.loads(raw_data) if raw_data else []
+            data = request.get_json()
             logger.info(f"Webhook QuickNode reçu: {json.dumps(data, indent=2)}")
-        except (json.JSONDecodeError, ValueError) as e:
+        except Exception as e:
             logger.error(f"Erreur parsing webhook QuickNode: {str(e)}")
             return "Invalid JSON", 400
 
@@ -279,35 +252,24 @@ def quicknode_webhook():
                 for tx in block.get('transactions', []):
                     token_address = tx.get('info', {}).get('tokenAddress')
                     operation = tx.get('operation')
-                    logger.info(f"Traitement tx: token={token_address}, operation={operation}")
-                    if not token_address or token_address in BLACKLISTED_TOKENS or token_address in detected_tokens or token_address in dynamic_blacklist:
-                        logger.info(f"Token {token_address} ignoré : blacklist ou déjà détecté")
+                    if not token_address or token_address in BLACKLISTED_TOKENS or token_address in detected_tokens:
                         continue
                     if not validate_address(token_address):
-                        logger.info(f"Token {token_address} ignoré : Adresse invalide")
                         continue
                     if operation not in ['buy', 'mint']:
-                        logger.info(f"Token {token_address} ignoré : Opération {operation} non pertinente")
                         continue
 
                     token_data = asyncio.run(get_token_data(token_address))
-                    if token_data:
-                        if asyncio.run(validate_token(chat_id_global, token_address, token_data)):
-                            queue_message(chat_id_global, f"🎯 Token détecté via QuickNode : `{token_address}`")
-                            logger.info(f"Token détecté via QuickNode : {token_address}")
-                            detected_tokens[token_address] = True
-                            last_detection_time[token_address] = time.time()
-                            asyncio.run(buy_token_solana(chat_id_global, token_address, mise_depart_sol))
-                        else:
-                            logger.info(f"Token {token_address} rejeté par critères QuickNode")
-                    else:
-                        logger.info(f"Token {token_address} ignoré : Données indisponibles")
+                    if token_data and asyncio.run(validate_token(chat_id_global, token_address, token_data)):
+                        queue_message(chat_id_global, f"🎯 Token détecté via QuickNode : `{token_address}`")
+                        detected_tokens[token_address] = True
+                        last_detection_time[token_address] = time.time()
+                        asyncio.run(buy_token_solana(chat_id_global, token_address, mise_depart_sol))
             return 'OK', 200
         except Exception as e:
             logger.error(f"Erreur traitement webhook QuickNode: {str(e)}")
             queue_message(chat_id_global, f"⚠️ Erreur webhook QuickNode: `{str(e)}`")
             return f"Erreur: {str(e)}", 500
-    logger.error("Requête invalide")
     return abort(403)
 
 async def websocket_monitor(chat_id):
@@ -318,10 +280,12 @@ async def websocket_monitor(chat_id):
             "method": "programSubscribe",
             "params": [str(PUMP_FUN_PROGRAM_ID), {"encoding": "base64", "commitment": "confirmed"}]
         }))
-        logger.info("WebSocket connecté à QuickNode pour Pump.fun")
-        
+        logger.info("WebSocket connecté à QuickNode")
+
         buy_volume = {}
         sell_volume = {}
+        buy_count = {}
+        sell_count = {}
         token_timestamps = {}
         accounts_in_tx = {}
 
@@ -329,11 +293,9 @@ async def websocket_monitor(chat_id):
             try:
                 message = await asyncio.wait_for(ws.recv(), timeout=1.0)
                 data = json.loads(message)
-                logger.info(f"WebSocket message reçu: {json.dumps(data, indent=2)}")
                 if 'result' not in data:
                     tx_data = data.get('params', {}).get('result', {}).get('value', {})
                     if not tx_data or 'account' not in tx_data:
-                        logger.info("Aucune donnée de compte dans la transaction")
                         continue
 
                     token_address = tx_data['account']['pubkey']
@@ -344,7 +306,6 @@ async def websocket_monitor(chat_id):
                     if instruction and instruction.get('programId') == str(PUMP_FUN_PROGRAM_ID):
                         data_bytes = base58.b58decode(instruction.get('data', ''))
                         if len(data_bytes) < 9:
-                            logger.info(f"Données invalides pour {token_address}")
                             continue
                         amount = int.from_bytes(data_bytes[1:9], 'little') / 10**9
                         accounts = {acc['pubkey'] for acc in instruction.get('accounts', [])}
@@ -352,17 +313,23 @@ async def websocket_monitor(chat_id):
 
                         if data_bytes[0] == 2:  # Buy
                             buy_volume[token_address] = buy_volume.get(token_address, 0) + amount
+                            buy_count[token_address] = buy_count.get(token_address, 0) + 1
                             token_timestamps[token_address] = token_timestamps.get(token_address, time.time())
                         elif data_bytes[0] == 3:  # Sell
                             sell_volume[token_address] = sell_volume.get(token_address, 0) + amount
+                            sell_count[token_address] = sell_count.get(token_address, 0) + 1
 
                         age_hours = (time.time() - token_timestamps.get(token_address, time.time())) / 3600
                         if age_hours <= MAX_TOKEN_AGE_HOURS:
                             bv = buy_volume.get(token_address, 0)
                             sv = sell_volume.get(token_address, 0)
                             ratio = bv / sv if sv > 0 else (bv > 0 and 2 or 1)
-                            logger.info(f"Token {token_address} - Buy: {bv}, Sell: {sv}, Ratio A/V: {ratio:.2f}")
-                            token_metrics[token_address] = {'buy_sell_ratio': ratio, 'last_update': time.time()}
+                            token_metrics[token_address] = {
+                                'buy_sell_ratio': ratio,
+                                'buy_count': buy_count.get(token_address, 0),
+                                'sell_count': sell_count.get(token_address, 0),
+                                'last_update': time.time()
+                            }
 
                             if sv > bv * 0.5:
                                 dynamic_blacklist.add(token_address)
@@ -370,7 +337,6 @@ async def websocket_monitor(chat_id):
                                 continue
 
                             if len(accounts_in_tx.get(token_address, set())) < MIN_ACCOUNTS_IN_TX:
-                                logger.info(f"Token {token_address} rejeté : Pas assez de comptes actifs")
                                 continue
 
                             if ratio >= MIN_BUY_SELL_RATIO:
@@ -381,9 +347,11 @@ async def websocket_monitor(chat_id):
                                     last_detection_time[token_address] = time.time()
                                     await buy_token_solana(chat_id, token_address, mise_depart_sol)
 
-                        if time.time() - token_timestamps.get(token_address, 0) > 15:
+                        if time.time() - token_timestamps.get(token_address, 0) > 300:  # 5min reset
                             buy_volume.pop(token_address, None)
                             sell_volume.pop(token_address, None)
+                            buy_count.pop(token_address, None)
+                            sell_count.pop(token_address, None)
                             accounts_in_tx.pop(token_address, None)
                             token_timestamps.pop(token_address, None)
                             token_metrics.pop(token_address, None)
@@ -396,18 +364,18 @@ async def websocket_monitor(chat_id):
 
 async def get_token_data(token_address):
     try:
-        async with aiohttp.ClientSession() as async_session:
-            dexscreener_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
-            dexscreener_response = await async_session.get(dexscreener_url)
-            dexscreener_data = await dexscreener_response.json()
-            pair = dexscreener_data.get('pairs', [{}])[0]
+        async with aiohttp.ClientSession() as session:
+            dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+            dex_response = await session.get(dex_url)
+            dex_data = await dex_response.json()
+            pair = dex_data.get('pairs', [{}])[0]
             liquidity = float(pair.get('liquidity', {}).get('usd', 0))
             price = float(pair.get('priceUsd', 0)) or 0
             volume_24h = float(pair.get('volume', {}).get('h24', 0)) / 1000 or 0
 
             if not liquidity or not price:
                 birdeye_url = f"https://public-api.birdeye.so/public/token_overview?address={token_address}"
-                birdeye_response = await async_session.get(birdeye_url, headers={"X-API-KEY": BIRDEYE_API_KEY})
+                birdeye_response = await session.get(birdeye_url, headers={"X-API-KEY": BIRDEYE_API_KEY})
                 birdeye_data = await birdeye_response.json()
                 birdeye_info = birdeye_data.get('data', {})
                 liquidity = birdeye_info.get('liquidity', 0)
@@ -419,7 +387,7 @@ async def get_token_data(token_address):
             else:
                 pair_created_at = time.time() - 3600
 
-            supply_response = await async_session.post(
+            supply_response = await session.post(
                 QUICKNODE_SOL_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token_address]},
                 timeout=5
@@ -427,7 +395,7 @@ async def get_token_data(token_address):
             supply_data = await supply_response.json()
             supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**6
 
-            holders_response = await async_session.post(
+            holders_response = await session.post(
                 QUICKNODE_SOL_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_address]},
                 timeout=5
@@ -441,7 +409,6 @@ async def get_token_data(token_address):
                 liquidity = volume_24h * 0.1
 
         market_cap = supply * price if price > 0 else 0
-        logger.info(f"Token {token_address} - Prix: {price}, Volume: {volume_24h}, Liquidité: {liquidity}, Market Cap: {market_cap}, Top Holder Ratio: {top_holder_ratio:.2%}, Âge: {(time.time() - pair_created_at) / 3600:.2f}h")
         return {
             'volume_24h': volume_24h,
             'liquidity': liquidity,
@@ -559,37 +526,19 @@ async def buy_token_solana(chat_id, contract_address, amount):
         if sol_balance < MIN_SOL_AMOUNT + MIN_SOL_BALANCE:
             raise Exception(f"Solde SOL insuffisant: {sol_balance:.4f} < {MIN_SOL_AMOUNT + MIN_SOL_BALANCE:.4f}")
 
-        amount_in = int(amount * 10**9)
-        response = session.post(QUICKNODE_SOL_URL, json={
-            "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
-            "params": [{"commitment": "finalized"}]
-        }, timeout=5)
-        blockhash = response.json()['result']['value']['blockhash']
-        tx = Transaction()
-        tx.recent_blockhash = Pubkey.from_string(blockhash)
-        instruction = Instruction(
-            program_id=PUMP_FUN_PROGRAM_ID,
-            accounts=[
-                {"pubkey": solana_keypair.pubkey(), "is_signer": True, "is_writable": True},
-                {"pubkey": Pubkey.from_string(contract_address), "is_signer": False, "is_writable": True},
-                {"pubkey": TOKEN_PROGRAM_ID, "is_signer": False, "is_writable": False}
-            ],
-            data=bytes([2]) + amount_in.to_bytes(8, 'little')
-        )
-        tx.add(instruction)
-        tx.sign([solana_keypair])
-        tx_hash = session.post(QUICKNODE_SOL_URL, json={
-            "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
-            "params": [base58.b58encode(tx.serialize()).decode('utf-8')]
-        }, timeout=5).json()['result']
+        async with aiohttp.ClientSession() as session:
+            jupiter_url = f"https://quote-api.jupiter.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint={contract_address}&amount={int(amount * 10**9)}"
+            jupiter_response = await session.get(jupiter_url)
+            quote = await jupiter_response.json()
+            swap_tx = await session.post("https://quote-api.jupiter.ag/v6/swap", json={
+                "quoteResponse": quote,
+                "userPublicKey": str(solana_keypair.pubkey())
+            })
+            tx_data = await swap_tx.json()
+            tx_hash = tx_data.get("swapTransaction")
 
         token_data = await get_token_data(contract_address)
         current_price = token_data['price']
-        expected_price = portfolio.get(contract_address, {}).get('entry_price', current_price)
-        slippage = abs(current_price - expected_price) / expected_price if expected_price > 0 else 0
-        if slippage > slippage_max:
-            raise Exception(f"Slippage trop élevé: {slippage:.2%} > {slippage_max:.2%}")
-
         queue_message(chat_id, f"✅ Achat réussi : {amount} SOL de `{contract_address}` (TX: `{tx_hash}`)")
         entry_price = current_price
         portfolio[contract_address] = {
@@ -744,7 +693,6 @@ async def poll_new_tokens(chat_id):
                 token_data = await get_token_data(token_address)
                 if token_data and await validate_token(chat_id, token_address, token_data):
                     queue_message(chat_id, f"🎯 Token détecté via polling Birdeye : `{token_address}`")
-                    logger.info(f"Token détecté via polling Birdeye : {token_address}")
                     detected_tokens[token_address] = True
                     last_detection_time[token_address] = time.time()
                     await buy_token_solana(chat_id, token_address, mise_depart_sol)
@@ -914,12 +862,10 @@ def initialize_and_run_tasks(chat_id):
             bot_active = True
             stop_event.clear()
             queue_message(chat_id, "▶️ Trading Solana lancé avec succès!")
-            logger.info(f"Trading démarré pour chat_id {chat_id}")
             threading.Thread(target=lambda: asyncio.run(run_tasks(chat_id)), daemon=True).start()
             threading.Thread(target=heartbeat, args=(chat_id,), daemon=True).start()
         else:
             queue_message(chat_id, "⚠️ Échec initialisation : Solana non connecté")
-            logger.error("Échec initialisation: Solana manquant")
             trade_active = False
     except Exception as e:
         queue_message(chat_id, f"⚠️ Erreur initialisation: `{str(e)}`")
@@ -948,25 +894,11 @@ def webhook():
     logger.error("Requête webhook Telegram invalide")
     return abort(403)
 
-@app.route("/test-quicknode", methods=['POST'])
-def test_quicknode():
-    sample_data = {
-        "transactions": [
-            {
-                "info": {"tokenAddress": "SAMPLE_TOKEN_ADDRESS"},
-                "operation": "buy"
-            }
-        ]
-    }
-    logger.info("Test QuickNode webhook avec données simulées")
-    return quicknode_webhook.__call__(request=sample_data)
-
 @bot.message_handler(commands=['start', 'Start', 'START'])
 def start_message(message):
     global trade_active, bot_active, chat_id_global
     chat_id = message.chat.id
     chat_id_global = chat_id
-    logger.info(f"Commande /start reçue de {chat_id}")
     bot_active = True
     if not trade_active:
         queue_message(chat_id, "✅ Bot démarré!")
@@ -977,7 +909,6 @@ def start_message(message):
 @bot.message_handler(commands=['menu', 'Menu', 'MENU'])
 def menu_message(message):
     chat_id = message.chat.id
-    logger.info(f"Commande /menu reçue de {chat_id}")
     queue_message(chat_id, "ℹ️ Affichage du menu...")
     show_main_menu(chat_id)
 
@@ -985,7 +916,6 @@ def menu_message(message):
 def stop_message(message):
     global trade_active, bot_active
     chat_id = message.chat.id
-    logger.info(f"Commande /stop reçue de {chat_id}")
     trade_active = False
     bot_active = False
     stop_event.set()
@@ -998,7 +928,6 @@ def stop_message(message):
 def pause_auto_sell_handler(message):
     global pause_auto_sell
     chat_id = message.chat.id
-    logger.info(f"Commande /pause reçue de {chat_id}")
     pause_auto_sell = True
     queue_message(chat_id, "⏸️ Ventes automatiques désactivées.")
 
@@ -1006,7 +935,6 @@ def pause_auto_sell_handler(message):
 def resume_auto_sell_handler(message):
     global pause_auto_sell
     chat_id = message.chat.id
-    logger.info(f"Commande /resume reçue de {chat_id}")
     pause_auto_sell = False
     queue_message(chat_id, "▶️ Ventes automatiques réactivées.")
 
@@ -1014,7 +942,6 @@ def resume_auto_sell_handler(message):
 def handle_token_address(message):
     chat_id = message.chat.id
     token_address = message.text.strip()
-    logger.info(f"Adresse token reçue : {token_address}")
     asyncio.run(analyze_token(chat_id, token_address))
 
 @bot.message_handler(commands=['check'])
@@ -1050,7 +977,6 @@ def show_main_menu(chat_id):
             InlineKeyboardButton("🔍 Ajuster Critères Détection", callback_data="adjust_detection_criteria")
         )
         queue_message(chat_id, "*Menu principal:*", reply_markup=markup)
-        logger.info(f"Menu affiché pour {chat_id}")
     except Exception as e:
         queue_message(chat_id, f"⚠️ Erreur affichage menu: `{str(e)}`")
         logger.error(f"Erreur affichage menu: {str(e)}")
@@ -1059,7 +985,7 @@ def show_main_menu(chat_id):
 def callback_query(call):
     global trade_active, bot_active
     chat_id = call.message.chat.id
-    logger.info(f"Callback reçu: {call.data} de {chat_id}")
+    message_id = call.message.message_id
     try:
         if call.data == "status":
             sol_balance = asyncio.run(get_solana_balance(chat_id))
@@ -1085,7 +1011,6 @@ def callback_query(call):
             while not message_queue.empty():
                 message_queue.get()
             queue_message(chat_id, "⏹️ Trading et bot arrêtés.")
-            logger.info("Trading et bot arrêtés via callback")
         elif call.data == "portfolio":
             asyncio.run(show_portfolio(chat_id))
         elif call.data == "daily_summary":
@@ -1134,7 +1059,7 @@ def callback_query(call):
                 queue_message(chat_id, f"⚠️ `{token_address}` n’est pas dans le portefeuille.")
         elif call.data.startswith("refresh_"):
             token_address = call.data.split("_")[1]
-            asyncio.run(analyze_token(chat_id, token_address))
+            asyncio.run(analyze_token(chat_id, token_address, message_id))
     except Exception as e:
         queue_message(chat_id, f"⚠️ Erreur callback: `{str(e)}`")
         logger.error(f"Erreur callback: {str(e)}")
