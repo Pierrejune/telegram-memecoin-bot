@@ -11,6 +11,7 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import Transaction
 from solders.instruction import Instruction
+from solders.signature import Signature
 import threading
 import asyncio
 from datetime import datetime
@@ -53,14 +54,15 @@ chat_id_global = None
 stop_event = threading.Event()
 last_twitter_check = 0
 last_polling_check = 0
+token_metrics = {}  # Cache pour données temps réel (ratio A/V)
 
 # Variables d’environnement
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-QUICKNODE_SOL_URL = os.getenv("QUICKNODE_SOL_URL")  # RPC existant
-QUICKNODE_WS_URL = os.getenv("QUICKNODE_WS_URL")    # WebSocket
+QUICKNODE_SOL_URL = os.getenv("QUICKNODE_SOL_URL")
+QUICKNODE_WS_URL = os.getenv("QUICKNODE_WS_URL")
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "5be903b581bc47d29bbfb5ab859de2eb")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "0f7563a5bbd10275056bf3c2175823cd")
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "AAAAAAAAAAAAAAAAAAAAAD6%2BzQEAAAAAaDN4Thznh7iGRdfqEhebMgWtohs%3DyuaSpNWBCnPcQv5gjERphqmZTIclzPiVqqnirPmdZt4fpRd96D")
@@ -77,22 +79,22 @@ trailing_stop_percentage = 5
 take_profit_steps = [1.2, 2, 10, 100, 500]
 max_positions = 5
 profit_reinvestment_ratio = 0.9
-slippage_max = 0.05
+slippage_max = 0.15
 MIN_VOLUME_SOL = 100
 MAX_VOLUME_SOL = 2000000
-MIN_LIQUIDITY = 5000
+MIN_LIQUIDITY = 1000
 MIN_MARKET_CAP_SOL = 1000
 MAX_MARKET_CAP_SOL = 5000000
-MIN_BUY_SELL_RATIO = 1.5  # Réduit pour tester
-MAX_TOKEN_AGE_HOURS = 0.5  # 30 minutes
+MIN_BUY_SELL_RATIO = 1.5
+MAX_TOKEN_AGE_HOURS = 0.5
 MIN_SOCIAL_MENTIONS = 5
 MIN_SOL_AMOUNT = 0.1
 MIN_ACCOUNTS_IN_TX = 3
 DETECTION_COOLDOWN = 60
 MIN_SOL_BALANCE = 0.05
 TWITTER_CHECK_INTERVAL = 900
-POLLING_INTERVAL = 15  # Polling toutes les 15s
-HOLDER_CONCENTRATION_THRESHOLD = 0.90  # Tolérance à 90%
+POLLING_INTERVAL = 15
+HOLDER_CONCENTRATION_THRESHOLD = 0.95
 
 # Constantes Solana
 PUMP_FUN_PROGRAM_ID = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfH43SboMiMEWCPkDPk")
@@ -101,6 +103,7 @@ TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5
 app = Flask(__name__)
 bot = telebot.TeleBot(TELEGRAM_TOKEN, threaded=False)
 solana_keypair = None
+rugcheck_auth_token = None
 
 def send_message_worker():
     while bot_active:
@@ -126,14 +129,35 @@ def queue_message(chat_id, text, reply_markup=None):
         message_queue.put((chat_id, text, reply_markup))
 
 def initialize_bot(chat_id):
-    global solana_keypair
+    global solana_keypair, rugcheck_auth_token
     try:
         solana_keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
         queue_message(chat_id, "✅ Clé Solana initialisée")
         logger.info(f"Solana initialisé avec clé chiffrée: {encrypted_private_key[:10]}...")
+
+        # Authentification Rugcheck avec signature Solana
+        message_to_sign = "Sign-in to Rugcheck.xyz"
+        signature = solana_keypair.sign_message(message_to_sign.encode())
+        async with aiohttp.ClientSession() as session:
+            auth_response = await session.post(
+                "https://api.rugcheck.xyz/v1/auth/login/solana",
+                json={
+                    "publicKey": str(solana_keypair.pubkey()),
+                    "signature": str(signature),
+                    "message": message_to_sign
+                }
+            )
+            auth_data = await auth_response.json()
+            rugcheck_auth_token = auth_data.get("token")
+            if rugcheck_auth_token:
+                logger.info("Authentification Rugcheck réussie")
+                queue_message(chat_id, "✅ Connexion Rugcheck établie")
+            else:
+                logger.warning("Échec authentification Rugcheck, tentative sans token")
+                queue_message(chat_id, "⚠️ Échec connexion Rugcheck, utilisation sans token")
     except Exception as e:
-        queue_message(chat_id, f"⚠️ Erreur initialisation Solana: `{str(e)}`")
-        logger.error(f"Erreur Solana: {str(e)}")
+        queue_message(chat_id, f"⚠️ Erreur initialisation Solana/Rugcheck: `{str(e)}`")
+        logger.error(f"Erreur initialisation: {str(e)}")
         solana_keypair = None
 
 def set_webhook():
@@ -157,6 +181,78 @@ def validate_address(token_address):
         return len(token_address) >= 32 and len(token_address) <= 44
     except ValueError:
         return False
+
+async def analyze_token(chat_id, token_address):
+    global rugcheck_auth_token
+    try:
+        if not validate_address(token_address):
+            queue_message(chat_id, f"⚠️ `{token_address}` n’est pas une adresse Solana valide.")
+            return
+
+        if not solana_keypair:
+            initialize_bot(chat_id)
+            if not solana_keypair:
+                queue_message(chat_id, "⚠️ Wallet Solana non initialisé.")
+                return
+
+        async with aiohttp.ClientSession() as session:
+            # Rugcheck avec signature Solana
+            headers = {}
+            if rugcheck_auth_token:
+                headers["Authorization"] = f"Bearer {rugcheck_auth_token}"
+            else:
+                message_to_sign = f"Check token {token_address} on Rugcheck.xyz"
+                signature = solana_keypair.sign_message(message_to_sign.encode())
+                headers["X-Solana-Public-Key"] = str(solana_keypair.pubkey())
+                headers["X-Solana-Signature"] = str(signature)
+
+            rugcheck_url = f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report"
+            rugcheck_response = await session.get(rugcheck_url, headers=headers)
+            rugcheck_data = await rugcheck_response.json()
+            rug_status = rugcheck_data.get("riskLevel", "N/A")
+            rug_details = rugcheck_data.get("summary", "Analyse indisponible")
+
+            # Données token en temps réel
+            token_data = await get_token_data(token_address)
+            if not token_data:
+                queue_message(chat_id, f"⚠️ Impossible de récupérer les données pour `{token_address}`.")
+                return
+
+            market_cap = token_data['market_cap']
+            liquidity = token_data['liquidity']
+            holders_response = await session.post(
+                QUICKNODE_SOL_URL,
+                json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_address]},
+                timeout=5
+            )
+            holders_data = await holders_response.json()
+            num_holders = len(holders_data.get('result', {}).get('value', []))
+            buy_sell_ratio = token_metrics.get(token_address, {}).get('buy_sell_ratio', 1.0)
+
+            # Construction du tableau
+            msg = (
+                f"📊 *Analyse de `{token_address}`*\n\n"
+                f"**Rugcheck** : {rug_status}\n"
+                f"Détails : {rug_details}\n\n"
+                f"**Market Cap** : ${market_cap:.2f}\n"
+                f"**Liquidité** : ${liquidity:.2f}\n"
+                f"**Nombre de Holders** : {num_holders}\n"
+                f"**Ratio Achat/Vente** : {buy_sell_ratio:.2f}\n"
+            )
+
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton(f"💰 Acheter {mise_depart_sol} SOL", callback_data=f"buy_manual_{token_address}"),
+                InlineKeyboardButton("💸 Vendre 100%", callback_data=f"sell_manual_{token_address}")
+            )
+            markup.add(
+                InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{token_address}")
+            )
+
+            queue_message(chat_id, msg, reply_markup=markup)
+    except Exception as e:
+        queue_message(chat_id, f"⚠️ Erreur analyse `{token_address}` : `{str(e)}`")
+        logger.error(f"Erreur analyse token: {str(e)}")
 
 @app.route("/quicknode-webhook", methods=['POST'])
 def quicknode_webhook():
@@ -233,9 +329,11 @@ async def websocket_monitor(chat_id):
             try:
                 message = await asyncio.wait_for(ws.recv(), timeout=1.0)
                 data = json.loads(message)
+                logger.info(f"WebSocket message reçu: {json.dumps(data, indent=2)}")
                 if 'result' not in data:
                     tx_data = data.get('params', {}).get('result', {}).get('value', {})
                     if not tx_data or 'account' not in tx_data:
+                        logger.info("Aucune donnée de compte dans la transaction")
                         continue
 
                     token_address = tx_data['account']['pubkey']
@@ -246,6 +344,7 @@ async def websocket_monitor(chat_id):
                     if instruction and instruction.get('programId') == str(PUMP_FUN_PROGRAM_ID):
                         data_bytes = base58.b58decode(instruction.get('data', ''))
                         if len(data_bytes) < 9:
+                            logger.info(f"Données invalides pour {token_address}")
                             continue
                         amount = int.from_bytes(data_bytes[1:9], 'little') / 10**9
                         accounts = {acc['pubkey'] for acc in instruction.get('accounts', [])}
@@ -263,6 +362,7 @@ async def websocket_monitor(chat_id):
                             sv = sell_volume.get(token_address, 0)
                             ratio = bv / sv if sv > 0 else (bv > 0 and 2 or 1)
                             logger.info(f"Token {token_address} - Buy: {bv}, Sell: {sv}, Ratio A/V: {ratio:.2f}")
+                            token_metrics[token_address] = {'buy_sell_ratio': ratio, 'last_update': time.time()}
 
                             if sv > bv * 0.5:
                                 dynamic_blacklist.add(token_address)
@@ -270,6 +370,7 @@ async def websocket_monitor(chat_id):
                                 continue
 
                             if len(accounts_in_tx.get(token_address, set())) < MIN_ACCOUNTS_IN_TX:
+                                logger.info(f"Token {token_address} rejeté : Pas assez de comptes actifs")
                                 continue
 
                             if ratio >= MIN_BUY_SELL_RATIO:
@@ -285,6 +386,7 @@ async def websocket_monitor(chat_id):
                             sell_volume.pop(token_address, None)
                             accounts_in_tx.pop(token_address, None)
                             token_timestamps.pop(token_address, None)
+                            token_metrics.pop(token_address, None)
 
             except asyncio.TimeoutError:
                 continue
@@ -295,23 +397,32 @@ async def websocket_monitor(chat_id):
 async def get_token_data(token_address):
     try:
         async with aiohttp.ClientSession() as async_session:
-            # Birdeye pour données principales
-            birdeye_url = f"https://public-api.birdeye.so/public/token_overview?address={token_address}"
-            birdeye_response = await async_session.get(birdeye_url, headers={"X-API-KEY": BIRDEYE_API_KEY})
-            birdeye_data = await birdeye_response.json()
-            birdeye_info = birdeye_data.get('data', {})
-            price = birdeye_info.get('price', 0)
-            volume_24h = birdeye_info.get('volume', 0) / 1000
-            liquidity = birdeye_info.get('liquidity', 0)
-            pair_created_at = birdeye_info.get('created_at', time.time())
-            if isinstance(pair_created_at, str):
-                pair_created_at = datetime.strptime(pair_created_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+            dexscreener_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+            dexscreener_response = await async_session.get(dexscreener_url)
+            dexscreener_data = await dexscreener_response.json()
+            pair = dexscreener_data.get('pairs', [{}])[0]
+            liquidity = float(pair.get('liquidity', {}).get('usd', 0))
+            price = float(pair.get('priceUsd', 0)) or 0
+            volume_24h = float(pair.get('volume', {}).get('h24', 0)) / 1000 or 0
 
-            # QuickNode pour supply et holders
+            if not liquidity or not price:
+                birdeye_url = f"https://public-api.birdeye.so/public/token_overview?address={token_address}"
+                birdeye_response = await async_session.get(birdeye_url, headers={"X-API-KEY": BIRDEYE_API_KEY})
+                birdeye_data = await birdeye_response.json()
+                birdeye_info = birdeye_data.get('data', {})
+                liquidity = birdeye_info.get('liquidity', 0)
+                price = birdeye_info.get('price', 0)
+                volume_24h = birdeye_info.get('volume', 0) / 1000
+                pair_created_at = birdeye_info.get('created_at', time.time())
+                if isinstance(pair_created_at, str):
+                    pair_created_at = datetime.strptime(pair_created_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+            else:
+                pair_created_at = time.time() - 3600
+
             supply_response = await async_session.post(
                 QUICKNODE_SOL_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token_address]},
-                timeout=10
+                timeout=5
             )
             supply_data = await supply_response.json()
             supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**6
@@ -319,32 +430,15 @@ async def get_token_data(token_address):
             holders_response = await async_session.post(
                 QUICKNODE_SOL_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_address]},
-                timeout=10
+                timeout=5
             )
             holders_data = await holders_response.json()
             top_holders = holders_data.get('result', {}).get('value', [])
             top_holder_ratio = sum(float(h.get('amount', 0)) / 10**6 for h in top_holders[:5]) / supply if supply > 0 else 0
             top_holder_ratio = min(top_holder_ratio, 1.0)
 
-            # Fallback DexScreener si Birdeye échoue
-            if not liquidity:
-                dexscreener_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
-                dexscreener_response = await async_session.get(dexscreener_url)
-                dexscreener_data = await dexscreener_response.json()
-                pair = dexscreener_data.get('pairs', [{}])[0]
-                liquidity = float(pair.get('liquidity', {}).get('usd', 0)) or liquidity
-                price = float(pair.get('priceUsd', 0)) or price
-                volume_24h = float(pair.get('volume', {}).get('h24', 0)) / 1000 or volume_24h
-
-            # Dernier recours via QuickNode si toujours pas de liquidité
-            if not liquidity:
-                account_info_response = await async_session.post(
-                    QUICKNODE_SOL_URL,
-                    json={"jsonrpc": "2.0", "id": 1, "method": "getAccountInfo", "params": [token_address, {"encoding": "jsonParsed"}]},
-                )
-                account_info = (await account_info_response.json()).get('result', {}).get('value', {})
-                lamports = account_info.get('lamports', 0)
-                liquidity = lamports / 10**9 * price if price > 0 else 0
+            if not liquidity and volume_24h > 0:
+                liquidity = volume_24h * 0.1
 
         market_cap = supply * price if price > 0 else 0
         logger.info(f"Token {token_address} - Prix: {price}, Volume: {volume_24h}, Liquidité: {liquidity}, Market Cap: {market_cap}, Top Holder Ratio: {top_holder_ratio:.2%}, Âge: {(time.time() - pair_created_at) / 3600:.2f}h")
@@ -353,7 +447,7 @@ async def get_token_data(token_address):
             'liquidity': liquidity,
             'market_cap': market_cap,
             'price': price,
-            'buy_sell_ratio': 1,  # Calculé via WebSocket
+            'buy_sell_ratio': token_metrics.get(token_address, {}).get('buy_sell_ratio', 1.0),
             'pair_created_at': pair_created_at,
             'supply': supply,
             'has_liquidity': liquidity > MIN_LIQUIDITY,
@@ -573,13 +667,16 @@ async def monitor_and_sell(chat_id):
                 data['highest_price'] = max(data['highest_price'], current_price)
                 trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
 
-                if len(data['price_history']) > 5 and current_price < data['price_history'][-2] * 0.5:
+                if len(data['price_history']) > 5 and current_price < data['price_history'][-2] * 0.7:
                     dynamic_blacklist.add(contract_address)
                     await sell_token(chat_id, contract_address, amount, current_price)
-                    queue_message(chat_id, f"⚠️ Dump détecté sur `{contract_address}`, vente totale !")
+                    queue_message(chat_id, f"⚠️ Dump sauvage détecté sur `{contract_address}`, vente totale !")
 
                 if not pause_auto_sell:
-                    if profit_pct >= take_profit_steps[4] * 100:
+                    if profit_pct >= 200:
+                        await sell_token(chat_id, contract_address, amount, current_price)
+                        queue_message(chat_id, f"💰 Vente à ×2 sur `{contract_address}` !")
+                    elif profit_pct >= take_profit_steps[4] * 100:
                         await sell_token(chat_id, contract_address, amount * 0.5, current_price)
                     elif profit_pct >= take_profit_steps[3] * 100:
                         await sell_token(chat_id, contract_address, amount * 0.25, current_price)
@@ -775,7 +872,7 @@ async def adjust_detection_criteria(message):
     try:
         criteria = message.text.split(",")
         if len(criteria) != 7:
-            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 100,2000000,5000,1000,5000000,1.5,0.5)")
+            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 100,2000000,1000,1000,5000000,1.5,0.5)")
             return
         min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age = map(float, criteria)
         if min_vol < 0 or max_vol < min_vol or min_liq < 0 or min_mc < 0 or max_mc < min_mc or min_ratio < 0 or max_age < 0:
@@ -797,7 +894,7 @@ async def adjust_detection_criteria(message):
             f"Âge max : {MAX_TOKEN_AGE_HOURS} h"
         ))
     except ValueError:
-        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 100,2000000,5000,1000,5000000,1.5,0.5)")
+        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 100,2000000,1000,1000,5000000,1.5,0.5)")
 
 async def run_tasks(chat_id):
     await asyncio.gather(
@@ -913,6 +1010,22 @@ def resume_auto_sell_handler(message):
     pause_auto_sell = False
     queue_message(chat_id, "▶️ Ventes automatiques réactivées.")
 
+@bot.message_handler(func=lambda message: validate_address(message.text.strip()))
+def handle_token_address(message):
+    chat_id = message.chat.id
+    token_address = message.text.strip()
+    logger.info(f"Adresse token reçue : {token_address}")
+    asyncio.run(analyze_token(chat_id, token_address))
+
+@bot.message_handler(commands=['check'])
+def check_token_command(message):
+    chat_id = message.chat.id
+    try:
+        token_address = message.text.split()[1]
+        asyncio.run(analyze_token(chat_id, token_address))
+    except IndexError:
+        queue_message(chat_id, "⚠️ Veuillez fournir une adresse de token (ex. `/check H5jmVE...pump`).")
+
 def show_main_menu(chat_id):
     try:
         markup = InlineKeyboardMarkup()
@@ -990,7 +1103,7 @@ def callback_query(call):
             queue_message(chat_id, "Entrez le nouveau ratio de réinvestissement (ex. : 0.9) :")
             bot.register_next_step_handler(call.message, adjust_reinvestment_ratio)
         elif call.data == "adjust_detection_criteria":
-            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age) ex. : 100,2000000,5000,1000,5000000,1.5,0.5 :")
+            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age) ex. : 100,2000000,1000,1000,5000000,1.5,0.5 :")
             bot.register_next_step_handler(call.message, adjust_detection_criteria)
         elif call.data.startswith("sell_pct_"):
             parts = call.data.split("_")
@@ -1007,6 +1120,21 @@ def callback_query(call):
                 if current_data:
                     amount = portfolio[contract_address]['amount']
                     asyncio.run(sell_token(chat_id, contract_address, amount, current_data['price']))
+        elif call.data.startswith("buy_manual_"):
+            token_address = call.data.split("_")[2]
+            asyncio.run(buy_token_solana(chat_id, token_address, mise_depart_sol))
+        elif call.data.startswith("sell_manual_"):
+            token_address = call.data.split("_")[2]
+            if token_address in portfolio:
+                current_data = asyncio.run(get_token_data(token_address))
+                if current_data:
+                    amount = portfolio[token_address]['amount']
+                    asyncio.run(sell_token(chat_id, token_address, amount, current_data['price']))
+            else:
+                queue_message(chat_id, f"⚠️ `{token_address}` n’est pas dans le portefeuille.")
+        elif call.data.startswith("refresh_"):
+            token_address = call.data.split("_")[1]
+            asyncio.run(analyze_token(chat_id, token_address))
     except Exception as e:
         queue_message(chat_id, f"⚠️ Erreur callback: `{str(e)}`")
         logger.error(f"Erreur callback: {str(e)}")
