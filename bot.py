@@ -248,7 +248,7 @@ def quicknode_webhook():
                 for tx in block.get('transactions', []):
                     token_address = tx.get('info', {}).get('tokenAddress')
                     operation = tx.get('operation')
-                    if not token_address or token_address in BLACKLISTED_TOKENS or token_address mencionar_tokens:
+                    if not token_address or token_address in BLACKLISTED_TOKENS or token_address in detected_tokens:
                         continue
                     if not validate_address(token_address):
                         continue
