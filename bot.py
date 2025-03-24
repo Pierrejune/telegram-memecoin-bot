@@ -79,22 +79,22 @@ trailing_stop_percentage = 3
 take_profit_steps = [1.2, 2, 10, 100, 500]
 max_positions = 5
 profit_reinvestment_ratio = 0.9
-slippage_max = 0.25  # Augmenté pour éviter les rejets
-MIN_VOLUME_SOL = 100
+slippage_max = 0.25
+MIN_VOLUME_SOL = 10  # Réduit pour plus de détections
 MAX_VOLUME_SOL = 2000000
-MIN_LIQUIDITY = 5000  # Plus élevé pour éviter les rugs
-MIN_MARKET_CAP_SOL = 1000
+MIN_LIQUIDITY = 1000  # Réduit pour plus de détections
+MIN_MARKET_CAP_SOL = 500  # Réduit pour plus de détections
 MAX_MARKET_CAP_SOL = 5000000
-MIN_BUY_SELL_RATIO = 5  # Ratio élevé pour détecter les pumps
-MAX_TOKEN_AGE_SECONDS = 300  # 5 minutes
+MIN_BUY_SELL_RATIO = 3  # Réduit pour plus de détections
+MAX_TOKEN_AGE_SECONDS = 300
 MIN_SOCIAL_MENTIONS = 5
 MIN_SOL_AMOUNT = 0.1
-MIN_ACCOUNTS_IN_TX = 3
-DETECTION_COOLDOWN = 60
+MIN_ACCOUNTS_IN_TX = 2  # Réduit pour plus de détections
+DETECTION_COOLDOWN = 30  # Réduit pour plus de réactivité
 MIN_SOL_BALANCE = 0.05
-TWITTER_CHECK_INTERVAL = 900
-POLLING_INTERVAL = 15
-HOLDER_CONCENTRATION_THRESHOLD = 0.8  # Plus strict pour éviter les rugs
+TWITTER_CHECK_INTERVAL = 300  # Réduit pour plus de réactivité
+POLLING_INTERVAL = 10  # Réduit pour plus de réactivité
+HOLDER_CONCENTRATION_THRESHOLD = 0.9  # Assoupli pour plus de détections
 
 # Constantes Solana
 PUMP_FUN_PROGRAM_ID = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfH43SboMiMEWCPkDPk")
@@ -277,6 +277,7 @@ async def websocket_monitor(chat_id):
             "params": [str(PUMP_FUN_PROGRAM_ID), {"encoding": "base64", "commitment": "confirmed"}]
         }))
         logger.info("WebSocket connecté à QuickNode")
+        queue_message(chat_id, "🔗 Connexion WebSocket établie avec QuickNode")  # Confirmation
 
         buy_volume = {}
         sell_volume = {}
@@ -327,12 +328,16 @@ async def websocket_monitor(chat_id):
                                 'last_update': time.time()
                             }
 
+                            logger.info(f"Token {token_address}: Ratio A/V = {ratio}, BV = {bv}, SV = {sv}")
+                            queue_message(chat_id, f"🔍 Analyse {token_address}: Ratio A/V = {ratio:.2f}, BV = {bv:.2f}, SV = {sv:.2f}")
+
                             if sv > bv * 0.5:
                                 dynamic_blacklist.add(token_address)
                                 queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Dump artificiel détecté")
                                 continue
 
                             if len(accounts_in_tx.get(token_address, set())) < MIN_ACCOUNTS_IN_TX:
+                                queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Pas assez de comptes dans TX")
                                 continue
 
                             if ratio >= MIN_BUY_SELL_RATIO:
@@ -343,7 +348,7 @@ async def websocket_monitor(chat_id):
                                     last_detection_time[token_address] = time.time()
                                     await buy_token_solana(chat_id, token_address, mise_depart_sol)
 
-                        if time.time() - token_timestamps.get(token_address, 0) > 300:  # Reset après 5 min
+                        if time.time() - token_timestamps.get(token_address, 0) > 300:
                             buy_volume.pop(token_address, None)
                             sell_volume.pop(token_address, None)
                             buy_count.pop(token_address, None)
@@ -356,6 +361,7 @@ async def websocket_monitor(chat_id):
                 continue
             except Exception as e:
                 logger.error(f"Erreur WebSocket: {str(e)}")
+                queue_message(chat_id, f"⚠️ Erreur WebSocket: `{str(e)}`")
                 await asyncio.sleep(1)
 
 async def get_token_data(token_address):
@@ -526,7 +532,6 @@ async def buy_token_solana(chat_id, contract_address, amount):
         if sol_balance < MIN_SOL_AMOUNT + MIN_SOL_BALANCE:
             raise Exception(f"Solde SOL insuffisant: {sol_balance:.4f} < {MIN_SOL_AMOUNT + MIN_SOL_BALANCE:.4f}")
 
-        # Randomisation légère pour éviter les sandwichs
         amount = amount * random.uniform(0.95, 1.05)
 
         async with aiohttp.ClientSession() as session:
@@ -542,7 +547,7 @@ async def buy_token_solana(chat_id, contract_address, amount):
 
         token_data = await get_token_data(contract_address)
         current_price = token_data['price']
-        queue_message(chat_id, f"✅ Achat réussi : {amount} SOL de `{contract_address}` (TX: `{tx_hash}`)")
+        queue_message(chat_id, f"✅ Achat réussi : {amount:.4f} SOL de `{contract_address}` (TX: `{tx_hash}`)")
         entry_price = current_price
         portfolio[contract_address] = {
             'amount': amount, 'chain': 'solana', 'entry_price': entry_price,
@@ -591,7 +596,7 @@ async def sell_token(chat_id, contract_address, amount, current_price):
         portfolio[contract_address]['amount'] -= amount
         reinvest_amount = profit * profit_reinvestment_ratio if profit > 0 else 0
         mise_depart_sol += reinvest_amount
-        queue_message(chat_id, f"✅ Vente réussie : {amount} SOL, Profit: {profit:.4f} SOL (TX: `{tx_hash}`)")
+        queue_message(chat_id, f"✅ Vente réussie : {amount:.4f} SOL, Profit: {profit:.4f} SOL (TX: `{tx_hash}`)")
         daily_trades['sells'].append({'token': contract_address, 'amount': amount, 'pnl': profit, 'timestamp': datetime.now().strftime('%H:%M:%S')})
         if portfolio[contract_address]['amount'] <= 0:
             del portfolio[contract_address]
@@ -619,7 +624,6 @@ async def monitor_and_sell(chat_id):
                 data['highest_price'] = max(data['highest_price'], current_price)
                 trailing_stop_price = data['highest_price'] * (1 - trailing_stop_percentage / 100)
 
-                # Détection de dump pour tokens récents
                 if len(data['price_history']) >= 3 and current_price < data['price_history'][-2] * 0.7:
                     dynamic_blacklist.add(contract_address)
                     await sell_token(chat_id, contract_address, amount, current_price)
@@ -753,13 +757,13 @@ async def show_daily_summary(chat_id):
         total_buys = 0
         for trade in daily_trades['buys']:
             total_buys += trade['amount']
-            msg += f"- `{trade['token']}` : {trade['amount']} SOL à {trade['timestamp']}\n"
+            msg += f"- `{trade['token']}` : {trade['amount']:.4f} SOL à {trade['timestamp']}\n"
         msg += f"Total investi : {total_buys:.4f} SOL\n\n"
         msg += "📉 *Ventes* :\n"
         total_profit = 0
         for trade in daily_trades['sells']:
             total_profit += trade['pnl']
-            msg += f"- `{trade['token']}` : {trade['amount']} SOL à {trade['timestamp']}, PNL: {trade['pnl']:.4f} SOL\n"
+            msg += f"- `{trade['token']}` : {trade['amount']:.4f} SOL à {trade['timestamp']}, PNL: {trade['pnl']:.4f} SOL\n"
         msg += f"Profit net : {total_profit:.4f} SOL\n"
         queue_message(chat_id, msg)
     except Exception as e:
@@ -824,7 +828,7 @@ async def adjust_detection_criteria(message):
     try:
         criteria = message.text.split(",")
         if len(criteria) != 7:
-            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 100,2000000,5000,1000,5000000,5,300)")
+            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 10,2000000,1000,500,5000000,3,300)")
             return
         min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age = map(float, criteria)
         if min_vol < 0 or max_vol < min_vol or min_liq < 0 or min_mc < 0 or max_mc < min_mc or min_ratio < 0 or max_age < 0:
@@ -846,7 +850,7 @@ async def adjust_detection_criteria(message):
             f"Âge max : {MAX_TOKEN_AGE_SECONDS/60:.2f} min"
         ))
     except ValueError:
-        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 100,2000000,5000,1000,5000000,5,300)")
+        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 10,2000000,1000,500,5000000,3,300)")
 
 async def run_tasks(chat_id):
     await asyncio.gather(
@@ -1032,7 +1036,7 @@ def callback_query(call):
             queue_message(chat_id, "Entrez le nouveau ratio de réinvestissement (ex. : 0.9) :")
             bot.register_next_step_handler(call.message, adjust_reinvestment_ratio)
         elif call.data == "adjust_detection_criteria":
-            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age_seconds) ex. : 100,2000000,5000,1000,5000000,5,300 :")
+            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age_seconds) ex. : 10,2000000,1000,500,5000000,3,300 :")
             bot.register_next_step_handler(call.message, adjust_detection_criteria)
         elif call.data.startswith("sell_pct_"):
             parts = call.data.split("_")
