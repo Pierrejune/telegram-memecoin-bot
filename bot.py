@@ -278,7 +278,7 @@ def quicknode_webhook():
                     if operation not in ['buy', 'mint']:
                         continue
 
-                    if await check_rug_risk(chat_id_global, token_address):
+                    if asyncio.run(check_rug_risk(chat_id_global, token_address)):
                         token_data = asyncio.run(get_token_data(token_address))
                         if token_data and asyncio.run(validate_token(chat_id_global, token_address, token_data)):
                             queue_message(chat_id_global, f"🎯 Token détecté via QuickNode Webhook : `{token_address}`")
