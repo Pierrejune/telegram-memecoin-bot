@@ -72,7 +72,7 @@ PORT = int(os.getenv("PORT", 8080))
 cipher_suite = Fernet(Fernet.generate_key())
 encrypted_private_key = cipher_suite.encrypt(SOLANA_PRIVATE_KEY.encode()).decode() if SOLANA_PRIVATE_KEY else "N/A"
 
-# Paramètres trading (modifiables via menu)
+# Paramètres trading (modifiables via menu, critères stricts conservés)
 mise_depart_sol = 0.5
 stop_loss_threshold = 10
 trailing_stop_percentage = 3
@@ -80,21 +80,21 @@ take_profit_steps = [1.2, 2, 10, 100, 500]
 max_positions = 5
 profit_reinvestment_ratio = 0.9
 slippage_max = 0.25
-MIN_VOLUME_SOL = 10  # Réduit pour plus de détections
+MIN_VOLUME_SOL = 100
 MAX_VOLUME_SOL = 2000000
-MIN_LIQUIDITY = 1000  # Réduit pour plus de détections
-MIN_MARKET_CAP_SOL = 500  # Réduit pour plus de détections
+MIN_LIQUIDITY = 5000
+MIN_MARKET_CAP_SOL = 1000
 MAX_MARKET_CAP_SOL = 5000000
-MIN_BUY_SELL_RATIO = 3  # Réduit pour plus de détections
+MIN_BUY_SELL_RATIO = 5
 MAX_TOKEN_AGE_SECONDS = 300
 MIN_SOCIAL_MENTIONS = 5
 MIN_SOL_AMOUNT = 0.1
-MIN_ACCOUNTS_IN_TX = 2  # Réduit pour plus de détections
-DETECTION_COOLDOWN = 30  # Réduit pour plus de réactivité
+MIN_ACCOUNTS_IN_TX = 3
+DETECTION_COOLDOWN = 60
 MIN_SOL_BALANCE = 0.05
-TWITTER_CHECK_INTERVAL = 300  # Réduit pour plus de réactivité
-POLLING_INTERVAL = 10  # Réduit pour plus de réactivité
-HOLDER_CONCENTRATION_THRESHOLD = 0.9  # Assoupli pour plus de détections
+TWITTER_CHECK_INTERVAL = 900
+POLLING_INTERVAL = 15
+HOLDER_CONCENTRATION_THRESHOLD = 0.8
 
 # Constantes Solana
 PUMP_FUN_PROGRAM_ID = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfH43SboMiMEWCPkDPk")
@@ -257,7 +257,7 @@ def quicknode_webhook():
 
                     token_data = asyncio.run(get_token_data(token_address))
                     if token_data and asyncio.run(validate_token(chat_id_global, token_address, token_data)):
-                        queue_message(chat_id_global, f"🎯 Token détecté via QuickNode : `{token_address}`")
+                        queue_message(chat_id_global, f"🎯 Token détecté via QuickNode Webhook : `{token_address}`")
                         detected_tokens[token_address] = True
                         last_detection_time[token_address] = time.time()
                         asyncio.run(buy_token_solana(chat_id_global, token_address, mise_depart_sol))
@@ -269,44 +269,63 @@ def quicknode_webhook():
     return abort(403)
 
 async def websocket_monitor(chat_id):
-    async with websockets.connect(QUICKNODE_WS_URL) as ws:
-        await ws.send(json.dumps({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "programSubscribe",
-            "params": [str(PUMP_FUN_PROGRAM_ID), {"encoding": "base64", "commitment": "confirmed"}]
-        }))
-        logger.info("WebSocket connecté à QuickNode")
-        queue_message(chat_id, "🔗 Connexion WebSocket établie avec QuickNode")  # Confirmation
+    while not stop_event.is_set() and bot_active:
+        try:
+            async with websockets.connect(QUICKNODE_WS_URL) as ws:
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "logsSubscribe",
+                    "params": [{"mentions": [str(PUMP_FUN_PROGRAM_ID)]}, {"commitment": "confirmed"}]
+                }))
+                logger.info("WebSocket connecté à QuickNode")
+                queue_message(chat_id, "🔗 Connexion WebSocket établie avec QuickNode")
 
-        buy_volume = {}
-        sell_volume = {}
-        buy_count = {}
-        sell_count = {}
-        token_timestamps = {}
-        accounts_in_tx = {}
+                buy_volume = {}
+                sell_volume = {}
+                buy_count = {}
+                sell_count = {}
+                token_timestamps = {}
+                accounts_in_tx = {}
 
-        while not stop_event.is_set() and bot_active:
-            try:
-                message = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                data = json.loads(message)
-                if 'result' not in data:
-                    tx_data = data.get('params', {}).get('result', {}).get('value', {})
-                    if not tx_data or 'account' not in tx_data:
-                        continue
+                while not stop_event.is_set() and bot_active:
+                    try:
+                        message = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        data = json.loads(message)
+                        if 'result' in data:  # Confirmation d'abonnement
+                            logger.info(f"Abonnement WebSocket confirmé: {data['result']}")
+                            queue_message(chat_id, f"✅ Abonnement WebSocket confirmé: {data['result']}")
+                            continue
 
-                    token_address = tx_data['account']['pubkey']
-                    if token_address in detected_tokens or token_address in dynamic_blacklist:
-                        continue
+                        log_data = data.get('params', {}).get('result', {}).get('value', {})
+                        if not log_data or 'logs' not in log_data:
+                            continue
 
-                    instruction = tx_data.get('instruction', {})
-                    if instruction and instruction.get('programId') == str(PUMP_FUN_PROGRAM_ID):
-                        data_bytes = base58.b58decode(instruction.get('data', ''))
+                        signature = log_data.get('signature')
+                        tx_response = await session.post(
+                            QUICKNODE_SOL_URL,
+                            json={"jsonrpc": "2.0", "id": 1, "method": "getTransaction", "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]}
+                        )
+                        tx_data = (await tx_response.json()).get('result', {})
+                        if not tx_data:
+                            continue
+
+                        token_address = None
+                        for instr in tx_data.get('transaction', {}).get('message', {}).get('instructions', []):
+                            if instr.get('programId') == str(PUMP_FUN_PROGRAM_ID):
+                                accounts = instr.get('accounts', [])
+                                if len(accounts) > 1:
+                                    token_address = accounts[1]  # Deuxième compte souvent le token
+                                    break
+
+                        if not token_address or token_address in detected_tokens or token_address in dynamic_blacklist:
+                            continue
+
+                        data_bytes = base58.b58decode(instr.get('data', ''))
                         if len(data_bytes) < 9:
                             continue
                         amount = int.from_bytes(data_bytes[1:9], 'little') / 10**9
-                        accounts = {acc['pubkey'] for acc in instruction.get('accounts', [])}
-                        accounts_in_tx[token_address] = accounts_in_tx.get(token_address, set()).union(accounts)
+                        accounts = set(accounts)
 
                         if data_bytes[0] == 2:  # Buy
                             buy_volume[token_address] = buy_volume.get(token_address, 0) + amount
@@ -315,6 +334,8 @@ async def websocket_monitor(chat_id):
                         elif data_bytes[0] == 3:  # Sell
                             sell_volume[token_address] = sell_volume.get(token_address, 0) + amount
                             sell_count[token_address] = sell_count.get(token_address, 0) + 1
+
+                        accounts_in_tx[token_address] = accounts_in_tx.get(token_address, set()).union(accounts)
 
                         age_seconds = time.time() - token_timestamps.get(token_address, time.time())
                         if age_seconds <= MAX_TOKEN_AGE_SECONDS:
@@ -357,12 +378,16 @@ async def websocket_monitor(chat_id):
                             token_timestamps.pop(token_address, None)
                             token_metrics.pop(token_address, None)
 
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                logger.error(f"Erreur WebSocket: {str(e)}")
-                queue_message(chat_id, f"⚠️ Erreur WebSocket: `{str(e)}`")
-                await asyncio.sleep(1)
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception as e:
+                        logger.error(f"Erreur WebSocket interne: {str(e)}")
+                        queue_message(chat_id, f"⚠️ Erreur WebSocket interne: `{str(e)}`")
+
+        except Exception as e:
+            logger.error(f"Erreur connexion WebSocket: {str(e)}")
+            queue_message(chat_id, f"⚠️ Erreur connexion WebSocket: `{str(e)}`")
+            await asyncio.sleep(5)  # Reconnexion après 5 secondes
 
 async def get_token_data(token_address):
     try:
@@ -828,7 +853,7 @@ async def adjust_detection_criteria(message):
     try:
         criteria = message.text.split(",")
         if len(criteria) != 7:
-            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 10,2000000,1000,500,5000000,3,300)")
+            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 100,2000000,5000,1000,5000000,5,300)")
             return
         min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age = map(float, criteria)
         if min_vol < 0 or max_vol < min_vol or min_liq < 0 or min_mc < 0 or max_mc < min_mc or min_ratio < 0 or max_age < 0:
@@ -850,7 +875,7 @@ async def adjust_detection_criteria(message):
             f"Âge max : {MAX_TOKEN_AGE_SECONDS/60:.2f} min"
         ))
     except ValueError:
-        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 10,2000000,1000,500,5000000,3,300)")
+        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 100,2000000,5000,1000,5000000,5,300)")
 
 async def run_tasks(chat_id):
     await asyncio.gather(
@@ -1036,7 +1061,7 @@ def callback_query(call):
             queue_message(chat_id, "Entrez le nouveau ratio de réinvestissement (ex. : 0.9) :")
             bot.register_next_step_handler(call.message, adjust_reinvestment_ratio)
         elif call.data == "adjust_detection_criteria":
-            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age_seconds) ex. : 10,2000000,1000,500,5000000,3,300 :")
+            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age_seconds) ex. : 100,2000000,5000,1000,5000000,5,300 :")
             bot.register_next_step_handler(call.message, adjust_detection_criteria)
         elif call.data.startswith("sell_pct_"):
             parts = call.data.split("_")
