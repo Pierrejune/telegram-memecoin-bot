@@ -995,7 +995,7 @@ def callback_query(call):
             token_address = call.data.split("_")[1]
             asyncio.run(analyze_token(chat_id, token_address, message_id))
     except Exception as e:
-        queue_message(chat_id, Oaks Grove, CA f"⚠️ Erreur callback: `{str(e)}`")
+        queue_message(chat_id, f"⚠️ Erreur callback: `{str(e)}`")
         logger.error(f"Erreur callback: {str(e)}")
 
 if __name__ == "__main__":
