@@ -152,32 +152,70 @@ async def get_sol_price_fallback(chat_id):
     global sol_price_usd
     try:
         async with aiohttp.ClientSession() as session:
-            response = await session.get("https://api.jupiter.ag/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=1000000000")
+            response = await session.get(
+                "https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=1000000000",
+                timeout=aiohttp.ClientTimeout(total=10)
+            )
             data = await response.json()
             sol_price_usd = float(data['data'][0]['outAmount']) / 10**6  # USDC / SOL
-            queue_message(chat_id, f"ℹ️ Prix SOL récupéré via HTTP (fallback): ${sol_price_usd:.2f}")
+            queue_message(chat_id, f"ℹ️ Prix SOL récupéré via HTTP (Jupiter): ${sol_price_usd:.2f}")
     except Exception as e:
-        logger.error(f"Erreur fallback prix SOL: {str(e)}")
-        queue_message(chat_id, f"⚠️ Échec récupération prix SOL via HTTP: `{str(e)}`")
+        logger.error(f"Erreur fallback Jupiter: {str(e)}")
+        try:
+            async with aiohttp.ClientSession() as session:
+                response = await session.get(
+                    "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                )
+                data = await response.json()
+                sol_price_usd = float(data['solana']['usd'])
+                queue_message(chat_id, f"ℹ️ Prix SOL récupéré via HTTP (CoinGecko): ${sol_price_usd:.2f}")
+        except Exception as e2:
+            logger.error(f"Erreur fallback CoinGecko: {str(e2)}")
+            try:
+                async with aiohttp.ClientSession() as session:
+                    response = await session.get(
+                        "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT",
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    )
+                    data = await response.json()
+                    sol_price_usd = float(data['price'])
+                    queue_message(chat_id, f"ℹ️ Prix SOL récupéré via HTTP (Binance): ${sol_price_usd:.2f}")
+            except Exception as e3:
+                logger.error(f"Erreur fallback Binance: {str(e3)}")
+                queue_message(chat_id, f"⚠️ Échec récupération prix SOL via HTTP: Jupiter: `{str(e)}`, CoinGecko: `{str(e2)}`, Binance: `{str(e3)}`")
 
 @app.route("/quicknode-webhook", methods=['POST'])
 async def quicknode_webhook():
-    """Endpoint pour recevoir les données du stream QuickNode"""
+    """Endpoint asynchrone pour recevoir les données du stream QuickNode"""
     global sol_price_usd
     if request.method != "POST":
         logger.error("Méthode non autorisée pour /quicknode-webhook")
         return abort(405)
 
     try:
-        data = request.get_json()
+        # Log des en-têtes pour diagnostiquer le Content-Type
+        logger.info(f"En-têtes de la requête QuickNode: {dict(request.headers)}")
+        
+        # Gestion flexible du Content-Type
+        content_type = request.headers.get('Content-Type', '')
+        if 'application/json' in content_type:
+            data = request.get_json()
+        else:
+            # Si ce n’est pas JSON, tenter de parser les données brutes
+            raw_data = request.get_data(as_text=True)
+            try:
+                data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                logger.error(f"Impossible de parser les données brutes: {raw_data[:100]}...")
+                return "Invalid data format", 400
+
         logger.info(f"Données reçues de QuickNode: {json.dumps(data, indent=2)}")
         
-        # Vérification basique du JSON
         if not data or not isinstance(data, dict):
-            logger.error("JSON invalide reçu de QuickNode")
-            return "Invalid JSON", 400
+            logger.error("Données invalides reçues de QuickNode")
+            return "Invalid data", 400
 
-        # Traitement des données (adapté à ce que QuickNode Streams envoie)
         if 'account' in data and 'pubkey' in data['account']:
             token_address = data['account']['pubkey']
             instruction = data.get('instruction', {})
@@ -185,7 +223,7 @@ async def quicknode_webhook():
             if instruction and instruction.get('programId') == str(PUMP_FUN_PROGRAM_ID):
                 data_bytes = base58.b58decode(instruction.get('data', ''))
                 if len(data_bytes) < 9:
-                    return "OK", 200  # Ignorer les données insuffisantes
+                    return "OK", 200
 
                 amount = int.from_bytes(data_bytes[1:9], 'little') / 10**9
                 accounts = {acc['pubkey'] for acc in instruction.get('accounts', [])}
@@ -238,7 +276,6 @@ async def quicknode_webhook():
                     token_timestamps.pop(token_address, None)
                     token_metrics.pop(token_address, None)
 
-        # Traitement du prix SOL (si inclus dans le stream)
         elif 'pubkey' in data and data['pubkey'] == str(SOL_USDC_POOL):
             account_data = data.get('data', [None])[0]
             if account_data:
@@ -249,7 +286,7 @@ async def quicknode_webhook():
                     sol_price_usd = usdc_amount / sol_amount
                     queue_message(chat_id_global, f"💰 Prix SOL mis à jour: ${sol_price_usd:.2f}")
 
-        return "OK", 200  # Réponse attendue par QuickNode
+        return "OK", 200
     except Exception as e:
         logger.error(f"Erreur traitement webhook QuickNode: {str(e)}")
         queue_message(chat_id_global, f"⚠️ Erreur webhook QuickNode: `{str(e)}`")
@@ -478,10 +515,10 @@ async def buy_token_solana(chat_id, contract_address, amount):
         amount = amount * random.uniform(0.95, 1.05)
 
         async with aiohttp.ClientSession() as session:
-            jupiter_url = f"https://quote-api.jupiter.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint={contract_address}&amount={int(amount * 10**9)}&slippageBps={int(slippage_max * 10000)}"
+            jupiter_url = f"https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint={contract_address}&amount={int(amount * 10**9)}&slippageBps={int(slippage_max * 10000)}"
             jupiter_response = await session.get(jupiter_url, timeout=aiohttp.ClientTimeout(total=1))
             quote = await jupiter_response.json()
-            swap_tx = await session.post("https://quote-api.jupiter.ag/v6/swap", json={
+            swap_tx = await session.post("https://quote-api.jup.ag/v6/swap", json={
                 "quoteResponse": quote,
                 "userPublicKey": str(solana_keypair.pubkey())
             }, timeout=aiohttp.ClientTimeout(total=1))
@@ -516,7 +553,7 @@ async def sell_token(chat_id, contract_address, amount, current_price):
                 "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash",
                 "params": [{"commitment": "finalized"}]
             }, timeout=1)
-            blockhash = response.json()['result']['value']['blockhash']
+            blockhash = (await response.json())['result']['value']['blockhash']
         tx = Transaction()
         tx.recent_blockhash = Pubkey.from_string(blockhash)
         instruction = Instruction(
@@ -958,7 +995,7 @@ def callback_query(call):
             token_address = call.data.split("_")[1]
             asyncio.run(analyze_token(chat_id, token_address, message_id))
     except Exception as e:
-        queue_message(chat_id, f"⚠️ Erreur callback: `{str(e)}`")
+        queue_message(chat_id, Oaks Grove, CA f"⚠️ Erreur callback: `{str(e)}`")
         logger.error(f"Erreur callback: {str(e)}")
 
 if __name__ == "__main__":
