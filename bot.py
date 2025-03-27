@@ -16,7 +16,6 @@ from datetime import datetime
 from waitress import serve
 from queue import Queue
 import aiohttp
-import websockets
 from cryptography.fernet import Fernet
 import random
 from collections import deque
@@ -57,9 +56,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-QUICKNODE_SOL_URL = "https://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/"
-QUICKNODE_WS_URL = "wss://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/"  # URL brute
-QUICKNODE_WS_URL_WITH_TOKEN = "wss://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/?auth=5da088be927d31731b0d7284c30a0640d8e4dd50"  # Avec token explicite
+QUICKNODE_SOL_URL = os.getenv("QUICKNODE_SOL_URL", "https://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/")
 PORT = int(os.getenv("PORT", 8080))
 
 # Chiffrement clé privée
@@ -150,7 +147,115 @@ def set_webhook():
         queue_message(chat_id_global, f"⚠️ Erreur webhook: `{str(e)}`")
         return False
 
-def validate_address(token_address):
+async def get_sol_price_fallback(chat_id):
+    """Fallback HTTP pour le prix SOL"""
+    global sol_price_usd
+    try:
+        async with aiohttp.ClientSession() as session:
+            response = await session.get("https://api.jupiter.ag/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=1000000000")
+            data = await response.json()
+            sol_price_usd = float(data['data'][0]['outAmount']) / 10**6  # USDC / SOL
+            queue_message(chat_id, f"ℹ️ Prix SOL récupéré via HTTP (fallback): ${sol_price_usd:.2f}")
+    except Exception as e:
+        logger.error(f"Erreur fallback prix SOL: {str(e)}")
+        queue_message(chat_id, f"⚠️ Échec récupération prix SOL via HTTP: `{str(e)}`")
+
+@app.route("/quicknode-webhook", methods=['POST'])
+async def quicknode_webhook():
+    """Endpoint pour recevoir les données du stream QuickNode"""
+    global sol_price_usd
+    if request.method != "POST":
+        logger.error("Méthode non autorisée pour /quicknode-webhook")
+        return abort(405)
+
+    try:
+        data = request.get_json()
+        logger.info(f"Données reçues de QuickNode: {json.dumps(data, indent=2)}")
+        
+        # Vérification basique du JSON
+        if not data or not isinstance(data, dict):
+            logger.error("JSON invalide reçu de QuickNode")
+            return "Invalid JSON", 400
+
+        # Traitement des données (adapté à ce que QuickNode Streams envoie)
+        if 'account' in data and 'pubkey' in data['account']:
+            token_address = data['account']['pubkey']
+            instruction = data.get('instruction', {})
+
+            if instruction and instruction.get('programId') == str(PUMP_FUN_PROGRAM_ID):
+                data_bytes = base58.b58decode(instruction.get('data', ''))
+                if len(data_bytes) < 9:
+                    return "OK", 200  # Ignorer les données insuffisantes
+
+                amount = int.from_bytes(data_bytes[1:9], 'little') / 10**9
+                accounts = {acc['pubkey'] for acc in instruction.get('accounts', [])}
+                accounts_in_tx[token_address] = accounts_in_tx.get(token_address, set()).union(accounts)
+
+                if data_bytes[0] == 2:  # Buy
+                    buy_volume[token_address] = buy_volume.get(token_address, 0) + amount
+                    buy_count[token_address] = buy_count.get(token_address, 0) + 1
+                    if token_address not in token_timestamps:
+                        token_timestamps[token_address] = time.time()
+                elif data_bytes[0] == 3:  # Sell
+                    sell_volume[token_address] = sell_volume.get(token_address, 0) + amount
+                    sell_count[token_address] = sell_count.get(token_address, 0) + 1
+                    if token_address not in token_timestamps:
+                        token_timestamps[token_address] = time.time()
+
+                age_seconds = time.time() - token_timestamps.get(token_address, time.time())
+                if age_seconds <= MAX_TOKEN_AGE_SECONDS:
+                    bv = buy_volume.get(token_address, 0)
+                    sv = sell_volume.get(token_address, 0)
+                    ratio = bv / sv if sv > 0 else (bv > 0 and float('inf') or 1)
+                    token_metrics[token_address] = {
+                        'buy_sell_ratio': ratio,
+                        'buy_count': buy_count.get(token_address, 0),
+                        'sell_count': sell_count.get(token_address, 0),
+                        'last_update': time.time()
+                    }
+
+                    queue_message(chat_id_global, f"🔍 Analyse {token_address}: Ratio A/V = {ratio:.2f}, BV = {bv:.2f}, SV = {sv:.2f}")
+
+                    if sv > bv * 0.5:
+                        dynamic_blacklist.add(token_address)
+                        queue_message(chat_id_global, f"⚠️ `{token_address}` rejeté : Dump artificiel détecté")
+                    elif len(accounts_in_tx.get(token_address, set())) < MIN_ACCOUNTS_IN_TX:
+                        queue_message(chat_id_global, f"⚠️ `{token_address}` rejeté : Pas assez de comptes dans TX")
+                    elif ratio >= MIN_BUY_SELL_RATIO and await custom_rug_detector(chat_id_global, token_address):
+                        token_data = await validate_token_full(chat_id_global, token_address)
+                        if token_data:
+                            queue_message(chat_id_global, f"🎯 Pump détecté : `{token_address}` (Ratio A/V: {ratio:.2f})")
+                            detected_tokens[token_address] = True
+                            last_detection_time[token_address] = time.time()
+                            await buy_token_solana(chat_id_global, token_address, mise_depart_sol)
+
+                if time.time() - token_timestamps.get(token_address, 0) > 300:
+                    buy_volume.pop(token_address, None)
+                    sell_volume.pop(token_address, None)
+                    buy_count.pop(token_address, None)
+                    sell_count.pop(token_address, None)
+                    accounts_in_tx.pop(token_address, None)
+                    token_timestamps.pop(token_address, None)
+                    token_metrics.pop(token_address, None)
+
+        # Traitement du prix SOL (si inclus dans le stream)
+        elif 'pubkey' in data and data['pubkey'] == str(SOL_USDC_POOL):
+            account_data = data.get('data', [None])[0]
+            if account_data:
+                decoded_data = base58.b58decode(account_data)
+                sol_amount = int.from_bytes(decoded_data[64:80], 'little') / 10**9  # SOL
+                usdc_amount = int.from_bytes(decoded_data[80:96], 'little') / 10**6  # USDC
+                if sol_amount > 0:
+                    sol_price_usd = usdc_amount / sol_amount
+                    queue_message(chat_id_global, f"💰 Prix SOL mis à jour: ${sol_price_usd:.2f}")
+
+        return "OK", 200  # Réponse attendue par QuickNode
+    except Exception as e:
+        logger.error(f"Erreur traitement webhook QuickNode: {str(e)}")
+        queue_message(chat_id_global, f"⚠️ Erreur webhook QuickNode: `{str(e)}`")
+        return "Error processing data", 500
+
+async def validate_address(token_address):
     try:
         Pubkey.from_string(token_address)
         return len(token_address) >= 32 and len(token_address) <= 44
@@ -205,7 +310,7 @@ async def custom_rug_detector(chat_id, token_address):
 
 async def analyze_token(chat_id, token_address, message_id=None):
     try:
-        if not validate_address(token_address):
+        if not await validate_address(token_address):
             queue_message(chat_id, f"⚠️ `{token_address}` n’est pas une adresse Solana valide.", message_id=message_id)
             return
 
@@ -265,157 +370,9 @@ async def analyze_token(chat_id, token_address, message_id=None):
         queue_message(chat_id, f"⚠️ Erreur analyse `{token_address}` : `{str(e)}`", message_id=message_id)
         logger.error(f"Erreur analyse token: {str(e)}")
 
-async def websocket_monitor(chat_id):
-    global sol_price_usd
-    retry_count = 0
-    max_retries = 5
-    urls_to_try = [QUICKNODE_WS_URL, QUICKNODE_WS_URL_WITH_TOKEN]  # Tester les deux URLs
-    for ws_url in urls_to_try:
-        retry_count = 0
-        while not stop_event.is_set() and bot_active and retry_count < max_retries:
-            try:
-                logger.info(f"Tentative de connexion WebSocket à {ws_url}")
-                async with websockets.connect(ws_url, max_size=2**20, ping_interval=10, ping_timeout=20) as ws:
-                    # Abonnement Pump.fun
-                    pump_sub = json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "programSubscribe",
-                        "params": [str(PUMP_FUN_PROGRAM_ID), {"encoding": "base64", "commitment": "confirmed"}]
-                    })
-                    await ws.send(pump_sub)
-                    # Abonnement Raydium pour prix SOL
-                    sol_sub = json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": 2,
-                        "method": "accountSubscribe",
-                        "params": [str(SOL_USDC_POOL), {"encoding": "base64", "commitment": "confirmed"}]
-                    })
-                    await ws.send(sol_sub)
-
-                    queue_message(chat_id, f"🔗 Connexion WebSocket établie avec {ws_url}")
-
-                    confirmation = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                    confirmation_data = json.loads(confirmation)
-                    if confirmation_data.get('result'):
-                        queue_message(chat_id, f"✅ Abonnement Pump.fun confirmé: {confirmation_data['result']}")
-                        retry_count = 0
-                    else:
-                        queue_message(chat_id, "⚠️ Échec abonnement Pump.fun")
-                        break
-
-                    confirmation_sol = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                    confirmation_sol_data = json.loads(confirmation_sol)
-                    if confirmation_sol_data.get('result'):
-                        queue_message(chat_id, f"✅ Abonnement prix SOL confirmé: {confirmation_sol_data['result']}")
-
-                    while not stop_event.is_set() and bot_active:
-                        try:
-                            message = await asyncio.wait_for(ws.recv(), timeout=0.5)
-                            data = json.loads(message)
-                            logger.info(f"Message WebSocket reçu: {json.dumps(data, indent=2)}")
-
-                            if 'params' not in data or 'result' not in data['params']:
-                                continue
-
-                            # Traitement Pump.fun
-                            if data['id'] == 1:
-                                tx_data = data['params']['result']['value']
-                                token_address = tx_data['account']['pubkey']
-                                if token_address in detected_tokens or token_address in dynamic_blacklist or token_address in BLACKLISTED_TOKENS:
-                                    continue
-
-                                instruction = tx_data.get('instruction', {})
-                                if instruction and instruction.get('programId') == str(PUMP_FUN_PROGRAM_ID):
-                                    data_bytes = base58.b58decode(instruction.get('data', ''))
-                                    if len(data_bytes) < 9:
-                                        continue
-                                    amount = int.from_bytes(data_bytes[1:9], 'little') / 10**9
-                                    accounts = {acc['pubkey'] for acc in instruction.get('accounts', [])}
-                                    accounts_in_tx[token_address] = accounts_in_tx.get(token_address, set()).union(accounts)
-
-                                    if data_bytes[0] == 2:  # Buy
-                                        buy_volume[token_address] = buy_volume.get(token_address, 0) + amount
-                                        buy_count[token_address] = buy_count.get(token_address, 0) + 1
-                                        if token_address not in token_timestamps:
-                                            token_timestamps[token_address] = time.time()
-                                    elif data_bytes[0] == 3:  # Sell
-                                        sell_volume[token_address] = sell_volume.get(token_address, 0) + amount
-                                        sell_count[token_address] = sell_count.get(token_address, 0) + 1
-                                        if token_address not in token_timestamps:
-                                            token_timestamps[token_address] = time.time()
-
-                                    age_seconds = time.time() - token_timestamps.get(token_address, time.time())
-                                    if age_seconds <= MAX_TOKEN_AGE_SECONDS:
-                                        bv = buy_volume.get(token_address, 0)
-                                        sv = sell_volume.get(token_address, 0)
-                                        ratio = bv / sv if sv > 0 else (bv > 0 and float('inf') or 1)
-                                        token_metrics[token_address] = {
-                                            'buy_sell_ratio': ratio,
-                                            'buy_count': buy_count.get(token_address, 0),
-                                            'sell_count': sell_count.get(token_address, 0),
-                                            'last_update': time.time()
-                                        }
-
-                                        queue_message(chat_id, f"🔍 Analyse {token_address}: Ratio A/V = {ratio:.2f}, BV = {bv:.2f}, SV = {sv:.2f}")
-
-                                        if sv > bv * 0.5:
-                                            dynamic_blacklist.add(token_address)
-                                            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Dump artificiel détecté")
-                                            continue
-
-                                        if len(accounts_in_tx.get(token_address, set())) < MIN_ACCOUNTS_IN_TX:
-                                            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Pas assez de comptes dans TX")
-                                            continue
-
-                                        if ratio >= MIN_BUY_SELL_RATIO and await custom_rug_detector(chat_id, token_address):
-                                            token_data = await validate_token_full(chat_id, token_address)
-                                            if token_data:
-                                                queue_message(chat_id, f"🎯 Pump détecté : `{token_address}` (Ratio A/V: {ratio:.2f})")
-                                                detected_tokens[token_address] = True
-                                                last_detection_time[token_address] = time.time()
-                                                await buy_token_solana(chat_id, token_address, mise_depart_sol)
-
-                                    if time.time() - token_timestamps.get(token_address, 0) > 300:
-                                        buy_volume.pop(token_address, None)
-                                        sell_volume.pop(token_address, None)
-                                        buy_count.pop(token_address, None)
-                                        sell_count.pop(token_address, None)
-                                        accounts_in_tx.pop(token_address, None)
-                                        token_timestamps.pop(token_address, None)
-                                        token_metrics.pop(token_address, None)
-
-                            # Traitement prix SOL
-                            elif data['id'] == 2:
-                                account_data = data['params']['result']['value']['data']
-                                decoded_data = base58.b58decode(account_data[0])
-                                sol_amount = int.from_bytes(decoded_data[64:80], 'little') / 10**9  # SOL
-                                usdc_amount = int.from_bytes(decoded_data[80:96], 'little') / 10**6  # USDC
-                                if sol_amount > 0:
-                                    sol_price_usd = usdc_amount / sol_amount
-                                    queue_message(chat_id, f"💰 Prix SOL mis à jour: ${sol_price_usd:.2f}")
-
-                        except asyncio.TimeoutError:
-                            queue_message(chat_id, "⏳ WebSocket en attente de données...")
-                            continue
-                        except Exception as e:
-                            logger.error(f"Erreur traitement WebSocket: {str(e)}")
-                            queue_message(chat_id, f"⚠️ Erreur traitement WebSocket: `{str(e)}`")
-                            break
-                    return  # Si ça marche avec cette URL, on sort de la boucle externe
-            except Exception as e:
-                retry_count += 1
-                logger.error(f"Erreur connexion WebSocket à {ws_url} (tentative {retry_count}/{max_retries}): {str(e)}")
-                queue_message(chat_id, f"⚠️ Erreur connexion WebSocket à {ws_url}: `{str(e)}`. Reconnexion ({retry_count}/{max_retries})...")
-                await asyncio.sleep(1)
-        if retry_count >= max_retries:
-            queue_message(chat_id, f"⚠️ Échec WebSocket à {ws_url} après trop de tentatives. Essayons l’autre URL...")
-    queue_message(chat_id, "⚠️ Toutes les URLs WebSocket ont échoué. Vérifiez votre token sur le dashboard QuickNode.")
-
 async def get_token_data(token_address):
     try:
         async with aiohttp.ClientSession() as session:
-            # Supply total
             supply_response = await session.post(
                 QUICKNODE_SOL_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token_address]},
@@ -424,7 +381,6 @@ async def get_token_data(token_address):
             supply_data = await supply_response.json()
             supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**6
 
-            # Liquidité et prix depuis WebSocket
             liquidity_sol = buy_volume.get(token_address, 0) + sell_volume.get(token_address, 0)
             token_amount = buy_count.get(token_address, 0) + sell_count.get(token_address, 0)
             price = liquidity_sol / token_amount if token_amount > 0 else 0
@@ -789,10 +745,7 @@ async def adjust_detection_criteria(message):
         queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 1,2000000,100,50,5000000,1.5,300)")
 
 async def run_tasks(chat_id):
-    await asyncio.gather(
-        monitor_and_sell(chat_id),
-        websocket_monitor(chat_id)
-    )
+    await monitor_and_sell(chat_id)
 
 def initialize_and_run_tasks(chat_id):
     global trade_active, chat_id_global, bot_active
@@ -803,9 +756,10 @@ def initialize_and_run_tasks(chat_id):
             trade_active = True
             bot_active = True
             stop_event.clear()
-            queue_message(chat_id, "▶️ Trading Solana lancé avec succès!")
+            queue_message(chat_id, "▶️ Trading Solana lancé avec succès! En attente des données QuickNode Stream...")
             threading.Thread(target=lambda: asyncio.run(run_tasks(chat_id)), daemon=True).start()
             threading.Thread(target=heartbeat, args=(chat_id,), daemon=True).start()
+            asyncio.run(get_sol_price_fallback(chat_id))  # Prix initial via HTTP
         else:
             queue_message(chat_id, "⚠️ Échec initialisation : Solana non connecté")
             trade_active = False
@@ -820,7 +774,7 @@ def heartbeat(chat_id):
         time.sleep(300)
 
 @app.route("/webhook", methods=['POST'])
-def webhook():
+def telegram_webhook():
     if request.method == "POST" and request.headers.get("content-type") == "application/json":
         update_json = request.get_json()
         logger.info(f"Webhook Telegram reçu: {json.dumps(update_json)}")
