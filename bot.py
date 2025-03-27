@@ -71,9 +71,6 @@ SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 QUICKNODE_SOL_URL = os.getenv("QUICKNODE_SOL_URL")
 QUICKNODE_WS_URL = os.getenv("QUICKNODE_WS_URL")
-BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "5be903b581bc47d29bbfb5ab859de2eb")
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "0f7563a5bbd10275056bf3c2175823cd")
-TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN", "AAAAAAAAAAAAAAAAAAAAAD6%2BzQEAAAAAaDN4Thznh7iGRdfqEhebMgWtohs%3DyuaSpNWBCnPcQv5gjERphqmZTIclzPiVqqnirPmdZt4fpRd96D")
 PORT = int(os.getenv("PORT", 8080))
 
 # Chiffrement clé privée
@@ -95,13 +92,10 @@ MIN_MARKET_CAP_SOL = 50
 MAX_MARKET_CAP_SOL = 5000000
 MIN_BUY_SELL_RATIO = 1.5
 MAX_TOKEN_AGE_SECONDS = 300
-MIN_SOCIAL_MENTIONS = 2
 MIN_SOL_AMOUNT = 0.1
 MIN_ACCOUNTS_IN_TX = 1
 DETECTION_COOLDOWN = 10
 MIN_SOL_BALANCE = 0.05
-TWITTER_CHECK_INTERVAL = 60
-POLLING_INTERVAL = 3
 HOLDER_CONCENTRATION_THRESHOLD = 0.98
 DUMP_THRESHOLD = 0.75
 
@@ -174,59 +168,46 @@ def validate_address(token_address):
 
 async def custom_rug_detector(chat_id, token_address):
     try:
-        async with aiohttp.ClientSession() as session:
-            # Récupérer le supply total
-            supply_response = await session.post(
-                QUICKNODE_SOL_URL,
-                json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token_address]},
-                timeout=2
-            )
-            supply_data = await supply_response.json()
-            supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**6
+        token_data = await get_token_data(token_address)
+        if not token_data:
+            queue_message(chat_id, f"⚠️ `{token_address}`: Données insuffisantes pour analyse rug")
+            return False
 
-            # Récupérer les plus gros holders
+        supply = token_data['supply']
+        liquidity = token_data['liquidity']
+        age_seconds = time.time() - token_data['pair_created_at']
+        buy_count = token_metrics.get(token_address, {}).get('buy_count', 0)
+        sell_count = token_metrics.get(token_address, {}).get('sell_count', 0)
+        sell_buy_ratio = sell_count / buy_count if buy_count > 0 else float('inf')
+
+        async with aiohttp.ClientSession() as session:
             holders_response = await session.post(
                 QUICKNODE_SOL_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_address]},
-                timeout=2
+                timeout=0.5
             )
             holders_data = await holders_response.json()
             top_holders = holders_data.get('result', {}).get('value', [])
             top_5_holdings = sum(float(h.get('amount', 0)) / 10**6 for h in top_holders[:5])
             holder_concentration = top_5_holdings / supply if supply > 0 else 0
 
-            # Récupérer liquidité et âge
-            token_data = await get_token_data(token_address)
-            if not token_data:
-                queue_message(chat_id, f"⚠️ `{token_address}`: Données insuffisantes pour analyse rug")
-                return False
-            liquidity = token_data.get('liquidity', 0)
-            age_seconds = time.time() - token_data.get('pair_created_at', time.time())
+        risks = []
+        if holder_concentration > 0.5:
+            risks.append(f"Concentration holders élevée: {holder_concentration:.2%}")
+        if liquidity < 50:
+            risks.append(f"Liquidité faible: ${liquidity:.2f}")
+        if sell_buy_ratio > 2 and age_seconds < 300:
+            risks.append(f"Activité suspecte: Ratio V/A = {sell_buy_ratio:.2f}")
+        if age_seconds < 300 and (buy_count + sell_count) < 5:
+            risks.append(f"Token trop jeune: {age_seconds/60:.2f} min, {buy_count + sell_count} TX")
+        if supply > 10**12:
+            risks.append(f"Supply excessif: {supply:.2e} tokens")
 
-            # Métriques d’activité
-            metrics = token_metrics.get(token_address, {})
-            buy_count = metrics.get('buy_count', 0)
-            sell_count = metrics.get('sell_count', 0)
-            sell_buy_ratio = sell_count / buy_count if buy_count > 0 else float('inf')
-
-            # Critères de détection de rug
-            risks = []
-            if holder_concentration > 0.5:
-                risks.append(f"Concentration holders élevée: {holder_concentration:.2%}")
-            if liquidity < 50:
-                risks.append(f"Liquidité faible: ${liquidity:.2f}")
-            if sell_buy_ratio > 2 and age_seconds < 300:
-                risks.append(f"Activité suspecte: Ratio V/A = {sell_buy_ratio:.2f}")
-            if age_seconds < 300 and (buy_count + sell_count) < 5:
-                risks.append(f"Token trop jeune: {age_seconds/60:.2f} min, {buy_count + sell_count} TX")
-            if supply > 10**12:
-                risks.append(f"Supply excessif: {supply:.2e} tokens")
-
-            if risks:
-                queue_message(chat_id, f"🚨 `{token_address}` détecté comme risqué: {', '.join(risks)}")
-                return False
-            queue_message(chat_id, f"✅ `{token_address}` semble sûr selon l’analyse personnalisée")
-            return True
+        if risks:
+            queue_message(chat_id, f"🚨 `{token_address}` détecté comme risqué: {', '.join(risks)}")
+            return False
+        queue_message(chat_id, f"✅ `{token_address}` semble sûr - Liquidité: ${liquidity:.2f}")
+        return True
     except Exception as e:
         queue_message(chat_id, f"⚠️ Erreur détection rug `{token_address}`: `{str(e)}`. Considéré comme risqué.")
         return False
@@ -246,51 +227,45 @@ async def analyze_token(chat_id, token_address, message_id=None):
         if not await custom_rug_detector(chat_id, token_address):
             return
 
-        async with aiohttp.ClientSession() as session:
-            dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
-            dex_response = await session.get(dex_url)
-            dex_data = await dex_response.json()
-            pair = dex_data.get('pairs', [{}])[0]
-            market_cap = float(pair.get('marketCap', 0))
-            liquidity = float(pair.get('liquidity', {}).get('usd', 0))
+        token_data = await get_token_data(token_address)
+        if not token_data:
+            queue_message(chat_id, f"⚠️ `{token_address}`: Données indisponibles.", message_id=message_id)
+            return
 
-            holders_response = await session.post(
-                QUICKNODE_SOL_URL,
-                json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_address]},
-                timeout=2
-            )
-            holders_data = await holders_response.json()
-            num_holders = len(holders_data.get('result', {}).get('value', []))
+        market_cap = token_data['market_cap']
+        liquidity = token_data['liquidity']
+        num_holders = len((await aiohttp.ClientSession().post(
+            QUICKNODE_SOL_URL,
+            json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_address]},
+            timeout=0.5
+        )).json().get('result', {}).get('value', []))
+        buy_sell_ratio = token_metrics.get(token_address, {}).get('buy_sell_ratio', 1.0)
+        buy_count = token_metrics.get(token_address, {}).get('buy_count', 0)
+        sell_count = token_metrics.get(token_address, {}).get('sell_count', 0)
 
-            metrics = token_metrics.get(token_address, {})
-            buy_sell_ratio = metrics.get('buy_sell_ratio', 1.0)
-            buy_count = metrics.get('buy_count', 0)
-            sell_count = metrics.get('sell_count', 0)
+        msg = (
+            f"📊 *Analyse de `{token_address}`*\n\n"
+            f"**Market Cap** : ${market_cap:.2f}\n"
+            f"**Liquidité** : ${liquidity:.2f}\n"
+            f"**Holders** : {num_holders}\n"
+            f"**Ratio Achat/Vente** : {buy_sell_ratio:.2f}\n"
+            f"**Achats (5min)** : {buy_count}\n"
+            f"**Ventes (5min)** : {sell_count}"
+        )
 
-            msg = (
-                f"📊 *Analyse de `{token_address}`*\n\n"
-                f"**Market Cap** : ${market_cap:.2f}\n"
-                f"**Liquidité** : ${liquidity:.2f}\n"
-                f"**Holders** : {num_holders}\n"
-                f"**Ratio Achat/Vente** : {buy_sell_ratio:.2f}\n"
-                f"**Achats (5min)** : {buy_count}\n"
-                f"**Ventes (5min)** : {sell_count}"
-            )
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton(f"💰 Acheter {mise_depart_sol} SOL", callback_data=f"buy_manual_{token_address}"),
+            InlineKeyboardButton("💸 Vendre 100%", callback_data=f"sell_manual_{token_address}")
+        )
+        markup.add(
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{token_address}")
+        )
 
-            markup = InlineKeyboardMarkup()
-            markup.add(
-                InlineKeyboardButton(f"💰 Acheter {mise_depart_sol} SOL", callback_data=f"buy_manual_{token_address}"),
-                InlineKeyboardButton("💸 Vendre 100%", callback_data=f"sell_manual_{token_address}")
-            )
-            markup.add(
-                InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh_{token_address}")
-            )
-
-            queue_message(chat_id, msg, reply_markup=markup, message_id=message_id)
-            
-            token_data = await get_token_data(token_address)
-            if token_data and await validate_token(chat_id, token_address, token_data):
-                await buy_token_solana(chat_id, token_address, mise_depart_sol)
+        queue_message(chat_id, msg, reply_markup=markup, message_id=message_id)
+        
+        if token_data and await validate_token(chat_id, token_address, token_data):
+            await buy_token_solana(chat_id, token_address, mise_depart_sol)
     except Exception as e:
         queue_message(chat_id, f"⚠️ Erreur analyse `{token_address}` : `{str(e)}`", message_id=message_id)
         logger.error(f"Erreur analyse token: {str(e)}")
@@ -341,7 +316,7 @@ async def websocket_monitor(chat_id):
     max_retries = 5
     while not stop_event.is_set() and bot_active and retry_count < max_retries:
         try:
-            async with websockets.connect(QUICKNODE_WS_URL, max_size=2**20, ping_interval=10, ping_timeout=20) as ws:
+            async with websockets.connect(QUICKNODE_WS_URL, max_size=2**20, ping_interval=5, ping_timeout=10) as ws:
                 subscription_msg = json.dumps({
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -349,45 +324,36 @@ async def websocket_monitor(chat_id):
                     "params": [str(PUMP_FUN_PROGRAM_ID), {"encoding": "base64", "commitment": "confirmed"}]
                 })
                 await ws.send(subscription_msg)
-                logger.info("WebSocket connecté à QuickNode")
                 queue_message(chat_id, "🔗 Connexion WebSocket établie avec QuickNode")
 
-                confirmation = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                confirmation = await asyncio.wait_for(ws.recv(), timeout=2.0)
                 confirmation_data = json.loads(confirmation)
                 subscription_id = confirmation_data.get('result')
                 if subscription_id:
                     queue_message(chat_id, f"✅ Abonnement WebSocket confirmé: {subscription_id}")
                     retry_count = 0
                 else:
-                    queue_message(chat_id, "⚠️ Échec de l'abonnement WebSocket: Aucune ID reçue")
+                    queue_message(chat_id, "⚠️ Échec abonnement WebSocket")
                     continue
 
                 while not stop_event.is_set() and bot_active:
                     try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        message = await asyncio.wait_for(ws.recv(), timeout=0.5)
                         data = json.loads(message)
-                        logger.info(f"Message WebSocket reçu: {json.dumps(data, indent=2)}")
-                        queue_message(chat_id, f"📩 Données WebSocket reçues: {json.dumps(data)[:100]}...")
+                        logger.info(f"Message WebSocket: {json.dumps(data, indent=2)}")
 
                         if 'params' not in data or 'result' not in data['params']:
-                            queue_message(chat_id, "⚠️ Message WebSocket invalide (pas de params/result)")
                             continue
 
                         tx_data = data['params']['result']['value']
-                        if not tx_data or 'account' not in tx_data:
-                            queue_message(chat_id, "⚠️ Données TX invalides (pas d'account)")
-                            continue
-
                         token_address = tx_data['account']['pubkey']
                         if token_address in detected_tokens or token_address in dynamic_blacklist or token_address in BLACKLISTED_TOKENS:
-                            queue_message(chat_id, f"⚠️ `{token_address}` déjà détecté ou blacklisté")
                             continue
 
                         instruction = tx_data.get('instruction', {})
                         if instruction and instruction.get('programId') == str(PUMP_FUN_PROGRAM_ID):
                             data_bytes = base58.b58decode(instruction.get('data', ''))
                             if len(data_bytes) < 9:
-                                queue_message(chat_id, f"⚠️ `{token_address}` données instruction trop courtes")
                                 continue
                             amount = int.from_bytes(data_bytes[1:9], 'little') / 10**9
                             accounts = {acc['pubkey'] for acc in instruction.get('accounts', [])}
@@ -413,15 +379,11 @@ async def websocket_monitor(chat_id):
                                     'last_update': time.time()
                                 }
 
-                                queue_message(chat_id, f"🔍 Analyse {token_address}: Ratio A/V = {ratio:.2f}, BV = {bv:.2f}, SV = {sv:.2f}")
-
                                 if sv > bv * 0.5:
                                     dynamic_blacklist.add(token_address)
-                                    queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Dump artificiel détecté")
                                     continue
 
                                 if len(accounts_in_tx.get(token_address, set())) < MIN_ACCOUNTS_IN_TX:
-                                    queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Pas assez de comptes dans TX")
                                     continue
 
                                 if ratio >= MIN_BUY_SELL_RATIO and await custom_rug_detector(chat_id, token_address):
@@ -431,93 +393,67 @@ async def websocket_monitor(chat_id):
                                         detected_tokens[token_address] = True
                                         last_detection_time[token_address] = time.time()
                                         await buy_token_solana(chat_id, token_address, mise_depart_sol)
-
-                            if time.time() - token_timestamps.get(token_address, 0) > 300:
-                                buy_volume.pop(token_address, None)
-                                sell_volume.pop(token_address, None)
-                                buy_count.pop(token_address, None)
-                                sell_count.pop(token_address, None)
-                                accounts_in_tx.pop(token_address, None)
-                                token_timestamps.pop(token_address, None)
-                                token_metrics.pop(token_address, None)
-
                     except asyncio.TimeoutError:
                         queue_message(chat_id, "⏳ WebSocket en attente de données...")
                         continue
                     except Exception as e:
-                        logger.error(f"Erreur dans WebSocket: {str(e)}")
-                        queue_message(chat_id, f"⚠️ Erreur traitement WebSocket: `{str(e)}`")
+                        queue_message(chat_id, f"⚠️ Erreur WebSocket: `{str(e)}`")
                         break
         except Exception as e:
             retry_count += 1
-            logger.error(f"Erreur connexion WebSocket (tentative {retry_count}/{max_retries}): {str(e)}")
-            queue_message(chat_id, f"⚠️ Erreur connexion WebSocket: `{str(e)}`. Tentative de reconnexion dans 1s ({retry_count}/{max_retries})...")
-            await asyncio.sleep(1)
+            queue_message(chat_id, f"⚠️ Erreur connexion WebSocket: `{str(e)}`. Reconnexion ({retry_count}/{max_retries})...")
+            await asyncio.sleep(0.5)
     if retry_count >= max_retries:
-        queue_message(chat_id, "⚠️ Échec WebSocket après trop de tentatives. Vérifiez QUICKNODE_WS_URL.")
+        queue_message(chat_id, "⚠️ Échec WebSocket après trop de tentatives.")
 
 async def get_token_data(token_address):
     try:
         async with aiohttp.ClientSession() as session:
-            birdeye_url = f"https://public-api.birdeye.so/public/token_overview?address={token_address}"
-            birdeye_response = await session.get(birdeye_url, headers={"X-API-KEY": BIRDEYE_API_KEY}, timeout=aiohttp.ClientTimeout(total=2))
-            birdeye_data = await birdeye_response.json()
-            birdeye_info = birdeye_data.get('data', {})
-            liquidity = birdeye_info.get('liquidity', 0)
-            price = birdeye_info.get('price', 0)
-            volume_24h = birdeye_info.get('volume', 0) / 1000
-            pair_created_at = birdeye_info.get('created_at', time.time())
-            if isinstance(pair_created_at, str):
-                pair_created_at = datetime.strptime(pair_created_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
-
-            if not liquidity or not price:
-                dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
-                dex_response = await session.get(dex_url, timeout=aiohttp.ClientTimeout(total=2))
-                dex_data = await dex_response.json()
-                pair = dex_data.get('pairs', [{}])[0]
-                liquidity = float(pair.get('liquidity', {}).get('usd', 0))
-                price = float(pair.get('priceUsd', 0)) or 0
-                volume_24h = float(pair.get('volume', {}).get('h24', 0)) / 1000 or 0
-                pair_created_at = time.time() - 3600
-
             supply_response = await session.post(
                 QUICKNODE_SOL_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token_address]},
-                timeout=2
+                timeout=0.5
             )
             supply_data = await supply_response.json()
             supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**6
 
-            holders_response = await session.post(
+            account_response = await session.post(
                 QUICKNODE_SOL_URL,
-                json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_address]},
-                timeout=2
+                json={"jsonrpc": "2.0", "id": 2, "method": "getProgramAccounts", "params": [
+                    str(PUMP_FUN_PROGRAM_ID), {"encoding": "jsonParsed", "filters": [{"dataSize": 165}]}]},
+                timeout=0.5
             )
-            holders_data = await holders_response.json()
-            top_holders = holders_data.get('result', {}).get('value', [])
-            top_holder_ratio = sum(float(h.get('amount', 0)) / 10**6 for h in top_holders[:5]) / supply if supply > 0 else 0
-            top_holder_ratio = min(top_holder_ratio, 1.0)
+            accounts_data = await account_response.json()
+            accounts = accounts_data.get('result', [])
 
-            if not liquidity and volume_24h > 0:
-                liquidity = volume_24h * 0.1
+            liquidity_sol = 0
+            price = 0
+            for account in accounts:
+                account_info = account.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
+                if account_info.get('mint') == token_address:
+                    liquidity_sol = account_info.get('lamports', 0) / 10**9
+                    token_amount = account_info.get('tokenAmount', {}).get('uiAmount', 0)
+                    if token_amount > 0:
+                        price = liquidity_sol / token_amount
+                    break
 
-        market_cap = supply * price if price > 0 else 0
-        
-        if token_address not in price_history:
-            price_history[token_address] = deque(maxlen=20)
-        price_history[token_address].append((time.time(), price))
+            age_seconds = time.time() - token_timestamps.get(token_address, time.time())
+            market_cap = supply * price if price > 0 else 0
 
-        return {
-            'volume_24h': volume_24h,
-            'liquidity': liquidity,
-            'market_cap': market_cap,
-            'price': price,
-            'buy_sell_ratio': token_metrics.get(token_address, {}).get('buy_sell_ratio', 1.0),
-            'pair_created_at': pair_created_at,
-            'supply': supply,
-            'has_liquidity': liquidity > MIN_LIQUIDITY,
-            'top_holder_ratio': top_holder_ratio
-        }
+            if token_address not in price_history:
+                price_history[token_address] = deque(maxlen=20)
+            price_history[token_address].append((time.time(), price))
+
+            return {
+                'volume_24h': buy_volume.get(token_address, 0) + sell_volume.get(token_address, 0),
+                'liquidity': liquidity_sol * price if price > 0 else liquidity_sol,
+                'market_cap': market_cap,
+                'price': price,
+                'buy_sell_ratio': token_metrics.get(token_address, {}).get('buy_sell_ratio', 1.0),
+                'pair_created_at': token_timestamps.get(token_address, time.time()),
+                'supply': supply,
+                'has_liquidity': liquidity_sol > 0
+            }
     except Exception as e:
         logger.error(f"Erreur récupération données pour {token_address}: {str(e)}")
         return None
@@ -533,14 +469,9 @@ async def validate_token(chat_id, token_address, data):
         liquidity = data.get('liquidity', 0)
         market_cap = data.get('market_cap', 0)
         buy_sell_ratio = data.get('buy_sell_ratio', 1)
-        top_holder_ratio = data.get('top_holder_ratio', 0)
 
         if age_seconds > MAX_TOKEN_AGE_SECONDS:
             queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Trop vieux ({age_seconds/60:.2f} min)")
-            return False
-        if top_holder_ratio > HOLDER_CONCENTRATION_THRESHOLD:
-            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Concentration holders trop élevée ({top_holder_ratio:.2%})")
-            dynamic_blacklist.add(token_address)
             return False
         if len(portfolio) >= max_positions:
             queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Limite de {max_positions} positions atteinte")
@@ -563,62 +494,25 @@ async def validate_token(chat_id, token_address, data):
         return False
 
 async def validate_token_full(chat_id, token_address):
-    async with aiohttp.ClientSession() as session:
-        birdeye_url = f"https://public-api.birdeye.so/public/token_overview?address={token_address}"
-        birdeye_response = await session.get(birdeye_url, headers={"X-API-KEY": BIRDEYE_API_KEY}, timeout=aiohttp.ClientTimeout(total=2))
-        birdeye_data = await birdeye_response.json()
-        birdeye_info = birdeye_data.get('data', {})
-        liquidity = birdeye_info.get('liquidity', 0)
-        volume_24h = birdeye_info.get('volume', 0) / 1000
-        price = birdeye_info.get('price', 0)
-        pair_created_at = birdeye_info.get('created_at', time.time())
-        if isinstance(pair_created_at, str):
-            pair_created_at = datetime.strptime(pair_created_at, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()
+    token_data = await get_token_data(token_address)
+    if not token_data:
+        return None
 
-        age_seconds = time.time() - pair_created_at
-        if age_seconds > MAX_TOKEN_AGE_SECONDS:
-            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Trop vieux ({age_seconds/60:.2f} min)")
-            return None
-        if liquidity <= MIN_LIQUIDITY:
-            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Liquidité ${liquidity:.2f} <= ${MIN_LIQUIDITY}")
-            return None
-        if volume_24h < MIN_VOLUME_SOL or volume_24h > MAX_VOLUME_SOL:
-            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Volume ${volume_24h:.2f} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]")
-            return None
+    age_seconds = time.time() - token_data['pair_created_at']
+    if age_seconds > MAX_TOKEN_AGE_SECONDS:
+        queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Trop vieux ({age_seconds/60:.2f} min)")
+        return None
+    if token_data['liquidity'] <= MIN_LIQUIDITY:
+        queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Liquidité ${token_data['liquidity']:.2f} <= ${MIN_LIQUIDITY}")
+        return None
+    if token_data['volume_24h'] < MIN_VOLUME_SOL or token_data['volume_24h'] > MAX_VOLUME_SOL:
+        queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Volume ${token_data['volume_24h']:.2f} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]")
+        return None
+    if token_data['market_cap'] < MIN_MARKET_CAP_SOL or token_data['market_cap'] > MAX_MARKET_CAP_SOL:
+        queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Market Cap ${token_data['market_cap']:.2f} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]")
+        return None
 
-        supply_response = await session.post(
-            QUICKNODE_SOL_URL,
-            json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token_address]},
-            timeout=2
-        )
-        supply_data = await supply_response.json()
-        supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**6
-
-        holders_response = await session.post(
-            QUICKNODE_SOL_URL,
-            json={"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts", "params": [token_address]},
-            timeout=2
-        )
-        holders_data = await holders_response.json()
-        top_holders = holders_data.get('result', {}).get('value', [])
-        top_holder_ratio = sum(float(h.get('amount', 0)) / 10**6 for h in top_holders[:5]) / supply if supply > 0 else 0
-        if top_holder_ratio > HOLDER_CONCENTRATION_THRESHOLD:
-            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Concentration holders trop élevée ({top_holder_ratio:.2%})")
-            return None
-
-        market_cap = supply * price
-        if market_cap < MIN_MARKET_CAP_SOL or market_cap > MAX_MARKET_CAP_SOL:
-            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Market Cap ${market_cap:.2f} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]")
-            return None
-
-        return {
-            'liquidity': liquidity,
-            'volume_24h': volume_24h,
-            'market_cap': market_cap,
-            'price': price,
-            'pair_created_at': pair_created_at,
-            'top_holder_ratio': top_holder_ratio
-        }
+    return token_data
 
 async def buy_token_solana(chat_id, contract_address, amount):
     try:
