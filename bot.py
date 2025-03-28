@@ -16,6 +16,7 @@ from datetime import datetime
 from waitress import serve
 from queue import Queue
 import aiohttp
+import websockets
 from cryptography.fernet import Fernet
 import random
 from collections import deque
@@ -57,6 +58,7 @@ WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 QUICKNODE_SOL_URL = os.getenv("QUICKNODE_SOL_URL", "https://little-maximum-glade.solana-mainnet.quiknode.pro/5da088be927d31731b0d7284c30a0640d8e4dd50/")
+QUICKNODE_WS_URL = os.getenv("QUICKNODE_WS_URL")  # Ajout de l'URL WebSocket
 BITQUERY_ACCESS_TOKEN = os.getenv("BITQUERY_ACCESS_TOKEN")
 PORT = int(os.getenv("PORT", 8080))
 
@@ -64,7 +66,7 @@ PORT = int(os.getenv("PORT", 8080))
 cipher_suite = Fernet(Fernet.generate_key())
 encrypted_private_key = cipher_suite.encrypt(SOLANA_PRIVATE_KEY.encode()).decode() if SOLANA_PRIVATE_KEY else "N/A"
 
-# Paramètres trading
+# Paramètres trading (critères stricts conservés)
 mise_depart_sol = 0.5
 stop_loss_threshold = 10
 trailing_stop_percentage = 3
@@ -156,52 +158,45 @@ async def get_sol_price_fallback(chat_id):
     try:
         async with aiohttp.ClientSession() as session:
             response = await session.get(
-                "https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=1000000000",
+                "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
                 timeout=aiohttp.ClientTimeout(total=10)
             )
             data = await response.json()
-            sol_price_usd = float(data['data'][0]['outAmount']) / 10**6
-            queue_message(chat_id, f"ℹ️ Prix SOL récupéré via HTTP (Jupiter): ${sol_price_usd:.2f}")
+            sol_price_usd = float(data['solana']['usd'])
+            queue_message(chat_id, f"ℹ️ Prix SOL récupéré via HTTP (CoinGecko): ${sol_price_usd:.2f}")
+            logger.info(f"Prix SOL récupéré: ${sol_price_usd:.2f}")
     except Exception as e:
-        logger.error(f"Erreur fallback Jupiter: {str(e)}")
-        try:
-            async with aiohttp.ClientSession() as session:
-                response = await session.get(
-                    "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
-                    timeout=aiohttp.ClientTimeout(total=10)
-                )
-                data = await response.json()
-                sol_price_usd = float(data['solana']['usd'])
-                queue_message(chat_id, f"ℹ️ Prix SOL récupéré via HTTP (CoinGecko): ${sol_price_usd:.2f}")
-        except Exception as e2:
-            logger.error(f"Erreur fallback CoinGecko: {str(e2)}")
-            sol_price_usd = 140.0
-            queue_message(chat_id, f"⚠️ Échec récupération prix SOL, valeur par défaut: ${sol_price_usd:.2f}")
+        logger.error(f"Erreur récupération prix SOL: {str(e)}")
+        sol_price_usd = 140.0
+        queue_message(chat_id, f"⚠️ Échec récupération prix SOL, valeur par défaut: ${sol_price_usd:.2f}")
 
 async def validate_with_bitquery(token_address):
     try:
         async with aiohttp.ClientSession() as session:
-            url = "https://streaming.bitquery.io/graphql"
+            url = "https://graphql.bitquery.io/"
             headers = {
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {BITQUERY_ACCESS_TOKEN}"
+                "X-API-KEY": BITQUERY_ACCESS_TOKEN
             }
-            query = f"""
-            {{
-              Solana {{
-                Token(address: "{token_address}") {{
+            query = """
+            query($address: String!) {
+              Solana {
+                Token(address: $address) {
                   MintAddress
                   Supply
                   Decimals
                   Price(currency: "USD")
                   MarketCap(currency: "USD")
                   CreatedAt
-                }}
-              }}
-            }}
+                }
+              }
+            }
             """
-            response = await session.post(url, json={"query": query}, headers=headers)
+            variables = {"address": token_address}
+            logger.info(f"Envoi requête Bitquery pour {token_address}")
+            response = await session.post(url, json={"query": query, "variables": variables}, headers=headers)
             data = await response.json()
+            logger.info(f"Réponse Bitquery pour {token_address}: {json.dumps(data, indent=2)}")
             if "data" in data and data["data"]["Solana"]["Token"]:
                 token_info = data["data"]["Solana"]["Token"]
                 market_cap = float(token_info["MarketCap"]) if token_info["MarketCap"] else 0
@@ -213,6 +208,7 @@ async def validate_with_bitquery(token_address):
                     "supply": float(token_info["Supply"]) / 10**int(token_info["Decimals"]),
                     "price": float(token_info["Price"]) if token_info["Price"] else 0
                 }
+            logger.warning(f"Aucune donnée Bitquery pour {token_address}")
             return None
     except Exception as e:
         logger.error(f"Erreur Bitquery pour {token_address}: {str(e)}")
@@ -243,6 +239,7 @@ async def quicknode_webhook():
             logger.error(f"Échec parsing JSON: {str(e)}. Données: {raw_data[:1000]}...")
             return "OK", 200
 
+        # Gestion de différents formats de données
         items_to_process = []
         if isinstance(data, list):
             items_to_process = data
@@ -253,6 +250,22 @@ async def quicknode_webhook():
                     items_to_process = result
                 elif isinstance(result, dict):
                     items_to_process = [result]
+            elif 'transactions' in data:  # Format du code test
+                for tx in data.get('transactions', []):
+                    token_address = tx.get('info', {}).get('tokenAddress')
+                    operation = tx.get('operation')
+                    if token_address and operation in ['buy', 'mint']:
+                        logger.info(f"Token détecté via webhook (format alternatif): {token_address}, operation={operation}")
+                        if token_address not in BLACKLISTED_TOKENS and token_address not in detected_tokens and token_address not in dynamic_blacklist:
+                            token_data = await validate_with_bitquery(token_address)
+                            if token_data:
+                                market_cap = token_data["market_cap"]
+                                age_seconds = token_data["age_seconds"]
+                                if age_seconds <= MAX_TOKEN_AGE_SECONDS and MIN_MARKET_CAP_USD <= market_cap <= MAX_MARKET_CAP_USD:
+                                    queue_message(chat_id_global, f"🎯 Token détecté via QuickNode (webhook alternatif) : `{token_address}` (Market Cap: ${market_cap:.2f})")
+                                    detected_tokens[token_address] = True
+                                    last_detection_time[token_address] = time.time()
+                                    await buy_token_solana(chat_id_global, token_address, mise_depart_sol)
             else:
                 items_to_process = [data]
         else:
@@ -266,16 +279,20 @@ async def quicknode_webhook():
 
             if 'accounts' in item and 'instructions' in item:
                 instructions = item.get('instructions', [])
+                logger.info(f"Instructions trouvées: {len(instructions)}")
                 for instruction in instructions:
                     program_id = instruction.get('programId')
                     if not program_id:
+                        logger.warning("Aucune programId trouvée dans l'instruction")
                         continue
 
                     if program_id in [str(PUMP_FUN_PROGRAM_ID), str(RAYDIUM_PROGRAM_ID)]:
                         token_address = None
                         accounts = instruction.get('accounts', [])
+                        logger.info(f"Accounts dans l'instruction: {accounts}")
                         if accounts:
                             token_address = accounts[0].get('pubkey') if isinstance(accounts[0], dict) else accounts[0]
+                            logger.info(f"Token address extrait: {token_address}")
 
                         if not token_address or token_address in BLACKLISTED_TOKENS:
                             logger.warning("Aucune adresse de token trouvée ou token blacklisté")
@@ -283,15 +300,18 @@ async def quicknode_webhook():
 
                         data_bytes = instruction.get('data')
                         if not data_bytes:
+                            logger.warning("Aucune donnée dans l'instruction")
                             continue
 
                         try:
                             data_bytes = base58.b58decode(data_bytes)
+                            logger.info(f"Données décodées: {data_bytes}")
                         except Exception as e:
                             logger.error(f"Échec décodage base58: {str(e)}")
                             continue
 
                         if len(data_bytes) < 9:
+                            logger.warning("Données trop courtes pour analyse")
                             continue
 
                         amount = int.from_bytes(data_bytes[1:9], 'little') / 10**9
@@ -305,11 +325,13 @@ async def quicknode_webhook():
                             buy_count[token_address] = buy_count.get(token_address, 0) + 1
                             if token_address not in token_timestamps:
                                 token_timestamps[token_address] = time.time()
+                            logger.info(f"Achat détecté pour {token_address}: {amount} SOL")
                         elif data_bytes[0] == 3:  # Sell
                             sell_volume[token_address] = sell_volume.get(token_address, 0) + amount
                             sell_count[token_address] = sell_count.get(token_address, 0) + 1
                             if token_address not in token_timestamps:
                                 token_timestamps[token_address] = time.time()
+                            logger.info(f"Vente détectée pour {token_address}: {amount} SOL")
 
                         age_seconds = time.time() - token_timestamps.get(token_address, time.time())
                         if age_seconds <= MAX_TOKEN_AGE_SECONDS:
@@ -326,24 +348,31 @@ async def quicknode_webhook():
                             }
 
                             queue_message(chat_id_global, f"🔍 Analyse {token_address}: Ratio A/V = {ratio:.2f}, BV = {bv:.2f}, SV = {sv:.2f}")
+                            logger.info(f"Analyse pour {token_address}: Ratio A/V = {ratio:.2f}, BV = {bv:.2f}, SV = {sv:.2f}")
 
                             if sv > bv * 0.5:
                                 dynamic_blacklist.add(token_address)
                                 queue_message(chat_id_global, f"⚠️ `{token_address}` rejeté : Dump artificiel détecté")
+                                logger.info(f"Token {token_address} rejeté: Dump artificiel")
                             elif len(accounts_in_tx.get(token_address, set())) < MIN_ACCOUNTS_IN_TX:
                                 queue_message(chat_id_global, f"⚠️ `{token_address}` rejeté : Pas assez de comptes dans TX")
+                                logger.info(f"Token {token_address} rejeté: Pas assez de comptes")
                             elif ratio >= MIN_BUY_SELL_RATIO:
                                 token_data = await validate_with_bitquery(token_address)
                                 if token_data:
                                     market_cap = token_data["market_cap"]
                                     age_seconds = token_data["age_seconds"]
+                                    logger.info(f"Token {token_address}: Market Cap = ${market_cap:.2f}, Âge = {age_seconds/60:.2f} min")
                                     if age_seconds > MAX_TOKEN_AGE_SECONDS:
                                         queue_message(chat_id_global, f"⚠️ `{token_address}` rejeté : Trop vieux ({age_seconds/60:.2f} min)")
+                                        logger.info(f"Token {token_address} rejeté: Trop vieux")
                                         continue
                                     if market_cap < MIN_MARKET_CAP_USD or market_cap > MAX_MARKET_CAP_USD:
                                         queue_message(chat_id_global, f"⚠️ `{token_address}` rejeté : Market Cap ${market_cap:.2f} hors plage [{MIN_MARKET_CAP_USD}, {MAX_MARKET_CAP_USD}]")
+                                        logger.info(f"Token {token_address} rejeté: Market Cap hors plage")
                                         continue
                                     queue_message(chat_id_global, f"🎯 Pump détecté : `{token_address}` (Ratio A/V: {ratio:.2f}, Market Cap: ${market_cap:.2f})")
+                                    logger.info(f"Pump détecté pour {token_address}: Ratio A/V = {ratio:.2f}, Market Cap = ${market_cap:.2f}")
                                     detected_tokens[token_address] = True
                                     last_detection_time[token_address] = time.time()
                                     await buy_token_solana(chat_id_global, token_address, mise_depart_sol)
@@ -366,12 +395,127 @@ async def quicknode_webhook():
                     if sol_amount > 0:
                         sol_price_usd = usdc_amount / sol_amount
                         queue_message(chat_id_global, f"💰 Prix SOL mis à jour: ${sol_price_usd:.2f}")
+                        logger.info(f"Prix SOL mis à jour via SOL_USDC_POOL: ${sol_price_usd:.2f}")
 
         return "OK", 200
     except Exception as e:
         logger.error(f"Erreur critique webhook QuickNode: {str(e)}")
         queue_message(chat_id_global, f"⚠️ Erreur webhook QuickNode: `{str(e)}`")
         return "OK", 200
+
+async def websocket_monitor(chat_id):
+    if not QUICKNODE_WS_URL:
+        logger.error("QUICKNODE_WS_URL non défini, WebSocket désactivé")
+        return
+
+    try:
+        async with websockets.connect(QUICKNODE_WS_URL) as ws:
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "programSubscribe",
+                "params": [str(PUMP_FUN_PROGRAM_ID), {"encoding": "base64", "commitment": "confirmed"}]
+            }))
+            logger.info("WebSocket connecté à QuickNode pour Pump.fun")
+
+            while not stop_event.is_set() and bot_active:
+                try:
+                    message = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    data = json.loads(message)
+                    logger.info(f"WebSocket message reçu: {json.dumps(data, indent=2)}")
+                    if 'result' not in data:
+                        tx_data = data.get('params', {}).get('result', {}).get('value', {})
+                        if not tx_data or 'account' not in tx_data:
+                            logger.info("Aucune donnée de compte dans la transaction")
+                            continue
+
+                        token_address = tx_data['account']['pubkey']
+                        if token_address in detected_tokens or token_address in dynamic_blacklist:
+                            continue
+
+                        instruction = tx_data.get('instruction', {})
+                        if instruction and instruction.get('programId') == str(PUMP_FUN_PROGRAM_ID):
+                            data_bytes = base58.b58decode(instruction.get('data', ''))
+                            if len(data_bytes) < 9:
+                                logger.info(f"Données invalides pour {token_address}")
+                                continue
+                            amount = int.from_bytes(data_bytes[1:9], 'little') / 10**9
+                            accounts = {acc['pubkey'] for acc in instruction.get('accounts', [])}
+                            accounts_in_tx[token_address] = accounts_in_tx.get(token_address, set()).union(accounts)
+
+                            if data_bytes[0] == 2:  # Buy
+                                buy_volume[token_address] = buy_volume.get(token_address, 0) + amount
+                                buy_count[token_address] = buy_count.get(token_address, 0) + 1
+                                if token_address not in token_timestamps:
+                                    token_timestamps[token_address] = time.time()
+                                logger.info(f"Achat détecté pour {token_address}: {amount} SOL")
+                            elif data_bytes[0] == 3:  # Sell
+                                sell_volume[token_address] = sell_volume.get(token_address, 0) + amount
+                                sell_count[token_address] = sell_count.get(token_address, 0) + 1
+                                if token_address not in token_timestamps:
+                                    token_timestamps[token_address] = time.time()
+                                logger.info(f"Vente détectée pour {token_address}: {amount} SOL")
+
+                            age_seconds = time.time() - token_timestamps.get(token_address, time.time())
+                            if age_seconds <= MAX_TOKEN_AGE_SECONDS:
+                                bv = buy_volume.get(token_address, 0)
+                                sv = sell_volume.get(token_address, 0)
+                                ratio = bv / sv if sv > 0 else (bv > 0 and float('inf') or 1)
+                                token_metrics[token_address] = {
+                                    'buy_sell_ratio': ratio,
+                                    'buy_count': buy_count.get(token_address, 0),
+                                    'sell_count': sell_count.get(token_address, 0),
+                                    'last_update': time.time(),
+                                    'top_holders': token_metrics.get(token_address, {}).get('top_holders', {}),
+                                    'sell_activity': token_metrics.get(token_address, {}).get('sell_activity', {})
+                                }
+
+                                queue_message(chat_id, f"🔍 Analyse {token_address}: Ratio A/V = {ratio:.2f}, BV = {bv:.2f}, SV = {sv:.2f}")
+                                logger.info(f"Analyse pour {token_address}: Ratio A/V = {ratio:.2f}, BV = {bv:.2f}, SV = {sv:.2f}")
+
+                                if sv > bv * 0.5:
+                                    dynamic_blacklist.add(token_address)
+                                    queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Dump artificiel détecté")
+                                    continue
+
+                                if len(accounts_in_tx.get(token_address, set())) < MIN_ACCOUNTS_IN_TX:
+                                    logger.info(f"Token {token_address} rejeté : Pas assez de comptes actifs")
+                                    continue
+
+                                if ratio >= MIN_BUY_SELL_RATIO:
+                                    token_data = await validate_with_bitquery(token_address)
+                                    if token_data:
+                                        market_cap = token_data["market_cap"]
+                                        age_seconds = token_data["age_seconds"]
+                                        logger.info(f"Token {token_address}: Market Cap = ${market_cap:.2f}, Âge = {age_seconds/60:.2f} min")
+                                        if age_seconds > MAX_TOKEN_AGE_SECONDS:
+                                            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Trop vieux ({age_seconds/60:.2f} min)")
+                                            continue
+                                        if market_cap < MIN_MARKET_CAP_USD or market_cap > MAX_MARKET_CAP_USD:
+                                            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Market Cap ${market_cap:.2f} hors plage [{MIN_MARKET_CAP_USD}, {MAX_MARKET_CAP_USD}]")
+                                            continue
+                                        queue_message(chat_id, f"🎯 Pump détecté via WebSocket : `{token_address}` (Ratio A/V: {ratio:.2f}, Market Cap: ${market_cap:.2f})")
+                                        detected_tokens[token_address] = True
+                                        last_detection_time[token_address] = time.time()
+                                        await buy_token_solana(chat_id, token_address, mise_depart_sol)
+
+                            if time.time() - token_timestamps.get(token_address, 0) > MAX_TOKEN_AGE_SECONDS:
+                                buy_volume.pop(token_address, None)
+                                sell_volume.pop(token_address, None)
+                                buy_count.pop(token_address, None)
+                                sell_count.pop(token_address, None)
+                                accounts_in_tx.pop(token_address, None)
+                                token_timestamps.pop(token_address, None)
+                                token_metrics.pop(token_address, None)
+
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logger.error(f"Erreur WebSocket: {str(e)}")
+                    await asyncio.sleep(1)
+    except Exception as e:
+        logger.error(f"Erreur connexion WebSocket: {str(e)}")
+        queue_message(chat_id, f"⚠️ Erreur WebSocket: `{str(e)}`")
 
 async def validate_address(token_address):
     try:
@@ -809,7 +953,10 @@ def adjust_detection_criteria(message):
         queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 1,2000000,100,5000,10000,5.0,900)")
 
 async def run_tasks(chat_id):
-    await monitor_and_sell(chat_id)
+    await asyncio.gather(
+        monitor_and_sell(chat_id),
+        websocket_monitor(chat_id)
+    )
 
 def initialize_and_run_tasks(chat_id):
     global trade_active, chat_id_global, bot_active
@@ -1029,12 +1176,12 @@ def callback_query(call):
         logger.error(f"Erreur callback: {str(e)}")
 
 if __name__ == "__main__":
-    if not all([TELEGRAM_TOKEN, WALLET_ADDRESS, SOLANA_PRIVATE_KEY, WEBHOOK_URL, BITQUERY_ACCESS_TOKEN]):
+    if not all([TELEGRAM_TOKEN, WALLET_ADDRESS, SOLANA_PRIVATE_KEY, WEBHOOK_URL, QUICKNODE_SOL_URL, BITQUERY_ACCESS_TOKEN]):
         logger.error("Variables d’environnement manquantes")
         exit(1)
     if set_webhook():
         logger.info("Webhook Telegram configuré, démarrage du serveur...")
-        serve(app, host="0.0.0.0", port=PORT, threads=20)
+        serve(app, host="0.0.0.0", port=PORT, threads=10)
     else:
         logger.error("Échec du webhook Telegram, passage en mode polling")
         bot.polling(none_stop=True)
