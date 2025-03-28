@@ -76,9 +76,9 @@ MIN_VOLUME_SOL = 1
 MAX_VOLUME_SOL = 2000000
 MIN_LIQUIDITY = 100
 MIN_MARKET_CAP_USD = 5000  # Market cap minimum en USD
-MAX_MARKET_CAP_USD = 10000  # Market cap maximum pour détection (nouveau critère)
-MIN_BUY_SELL_RATIO = 5.0  # Ratio achat/vente minimum (nouveau critère)
-MAX_TOKEN_AGE_SECONDS = 900  # 15 minutes (nouveau critère)
+MAX_MARKET_CAP_USD = 10000  # Market cap maximum pour détection
+MIN_BUY_SELL_RATIO = 5.0  # Ratio achat/vente minimum
+MAX_TOKEN_AGE_SECONDS = 900  # 15 minutes
 MIN_SOL_AMOUNT = 0.1
 MIN_ACCOUNTS_IN_TX = 1
 DETECTION_COOLDOWN = 10
@@ -238,8 +238,8 @@ async def quicknode_webhook():
                         if accounts:
                             token_address = accounts[0].get('pubkey') if isinstance(accounts[0], dict) else accounts[0]
 
-                        if not token_address:
-                            logger.warning("Aucune adresse de token trouvée dans l'instruction")
+                        if not token_address or token_address in BLACKLISTED_TOKENS:
+                            logger.warning("Aucune adresse de token trouvée ou token blacklisté")
                             continue
 
                         data_bytes = instruction.get('data')
@@ -320,12 +320,12 @@ async def quicknode_webhook():
                             elif ratio >= MIN_BUY_SELL_RATIO:
                                 token_data = await validate_token_full(chat_id_global, token_address)
                                 if token_data:
-                                    queue_message(chat_id_global, f"🎯 Pump détecté : `{token_address}` (Ratio A/V: {ratio:.2f})")
+                                    queue_message(chat_id_global, f"🎯 Pump détecté : `{token_address}` (Ratio A/V: {ratio:.2f}, Market Cap: ${token_data['market_cap']:.2f})")
                                     detected_tokens[token_address] = True
                                     last_detection_time[token_address] = time.time()
                                     await buy_token_solana(chat_id_global, token_address, mise_depart_sol)
 
-                        if time.time() - token_timestamps.get(token_address, 0) > 300:
+                        if time.time() - token_timestamps.get(token_address, 0) > MAX_TOKEN_AGE_SECONDS:
                             buy_volume.pop(token_address, None)
                             sell_volume.pop(token_address, None)
                             buy_count.pop(token_address, None)
@@ -505,23 +505,30 @@ async def analyze_token(chat_id, token_address, message_id=None):
 async def get_token_data(token_address):
     try:
         async with aiohttp.ClientSession() as session:
+            # Récupérer la supply du token
             supply_response = await session.post(
                 QUICKNODE_SOL_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [token_address]},
                 timeout=0.5
             )
             supply_data = await supply_response.json()
-            supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**6
+            supply = float(supply_data.get('result', {}).get('value', {}).get('amount', '0')) / 10**9  # Ajusté pour décimales
+
+            # Récupérer le prix via Jupiter API
+            price_response = await session.get(
+                f"https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint={token_address}&amount=1000000000",
+                timeout=aiohttp.ClientTimeout(total=2)
+            )
+            price_data = await price_response.json()
+            price = float(price_data['data'][0]['outAmount']) / 10**9 if 'data' in price_data else 0
 
             liquidity_sol = buy_volume.get(token_address, 0) + sell_volume.get(token_address, 0)
-            token_amount = buy_count.get(token_address, 0) + sell_count.get(token_address, 0)
-            price = liquidity_sol / token_amount if token_amount > 0 else 0
             liquidity_usd = liquidity_sol * sol_price_usd if sol_price_usd > 0 else 0
+            market_cap = supply * price if price > 0 else 0
 
             if token_address not in token_timestamps:
                 token_timestamps[token_address] = time.time()
             age_seconds = time.time() - token_timestamps.get(token_address)
-            market_cap = supply * price if price > 0 else 0
 
             if token_address not in price_history:
                 price_history[token_address] = deque(maxlen=20)
