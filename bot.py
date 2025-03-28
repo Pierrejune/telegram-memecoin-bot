@@ -63,7 +63,7 @@ PORT = int(os.getenv("PORT", 8080))
 cipher_suite = Fernet(Fernet.generate_key())
 encrypted_private_key = cipher_suite.encrypt(SOLANA_PRIVATE_KEY.encode()).decode() if SOLANA_PRIVATE_KEY else "N/A"
 
-# Paramètres trading (valeurs initiales conservées)
+# Paramètres trading (ajout des nouveaux critères)
 mise_depart_sol = 0.5
 stop_loss_threshold = 10
 trailing_stop_percentage = 3
@@ -75,10 +75,10 @@ slippage_max = 0.25
 MIN_VOLUME_SOL = 1
 MAX_VOLUME_SOL = 2000000
 MIN_LIQUIDITY = 100
-MIN_MARKET_CAP_SOL = 50
-MAX_MARKET_CAP_SOL = 5000000
-MIN_BUY_SELL_RATIO = 1.5
-MAX_TOKEN_AGE_SECONDS = 300
+MIN_MARKET_CAP_USD = 5000  # Market cap minimum en USD
+MAX_MARKET_CAP_USD = 10000  # Market cap maximum pour détection (nouveau critère)
+MIN_BUY_SELL_RATIO = 5.0  # Ratio achat/vente minimum (nouveau critère)
+MAX_TOKEN_AGE_SECONDS = 900  # 15 minutes (nouveau critère)
 MIN_SOL_AMOUNT = 0.1
 MIN_ACCOUNTS_IN_TX = 1
 DETECTION_COOLDOWN = 10
@@ -207,7 +207,6 @@ async def quicknode_webhook():
         if isinstance(data, list):
             items_to_process = data
         elif isinstance(data, dict):
-            # Vérifier si c'est une réponse JSON-RPC avec un champ 'result'
             if 'result' in data:
                 result = data['result']
                 if isinstance(result, list):
@@ -227,7 +226,6 @@ async def quicknode_webhook():
 
             # Vérifier les champs nécessaires pour Pump.fun ou Raydium
             if 'accounts' in item and 'instructions' in item:
-                # Structure typique d'une transaction Solana
                 instructions = item.get('instructions', [])
                 for instruction in instructions:
                     program_id = instruction.get('programId')
@@ -319,7 +317,7 @@ async def quicknode_webhook():
                                 queue_message(chat_id_global, f"⚠️ `{token_address}` rejeté : Dump artificiel détecté")
                             elif len(accounts_in_tx.get(token_address, set())) < MIN_ACCOUNTS_IN_TX:
                                 queue_message(chat_id_global, f"⚠️ `{token_address}` rejeté : Pas assez de comptes dans TX")
-                            elif ratio >= MIN_BUY_SELL_RATIO and await custom_rug_detector(chat_id_global, token_address):
+                            elif ratio >= MIN_BUY_SELL_RATIO:
                                 token_data = await validate_token_full(chat_id_global, token_address)
                                 if token_data:
                                     queue_message(chat_id_global, f"🎯 Pump détecté : `{token_address}` (Ratio A/V: {ratio:.2f})")
@@ -567,8 +565,8 @@ async def validate_token(chat_id, token_address, data):
         if volume_24h < MIN_VOLUME_SOL or volume_24h > MAX_VOLUME_SOL:
             queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Volume ${volume_24h:.2f} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]")
             return False
-        if market_cap < MIN_MARKET_CAP_SOL or market_cap > MAX_MARKET_CAP_SOL:
-            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Market Cap ${market_cap:.2f} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]")
+        if market_cap < MIN_MARKET_CAP_USD or market_cap > MAX_MARKET_CAP_USD:
+            queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Market Cap ${market_cap:.2f} hors plage [{MIN_MARKET_CAP_USD}, {MAX_MARKET_CAP_USD}]")
             return False
         if buy_sell_ratio < MIN_BUY_SELL_RATIO:
             queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Ratio A/V {buy_sell_ratio:.2f} < {MIN_BUY_SELL_RATIO}")
@@ -593,8 +591,8 @@ async def validate_token_full(chat_id, token_address):
     if token_data['volume_24h'] < MIN_VOLUME_SOL or token_data['volume_24h'] > MAX_VOLUME_SOL:
         queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Volume ${token_data['volume_24h']:.2f} hors plage [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}]")
         return None
-    if token_data['market_cap'] < MIN_MARKET_CAP_SOL or token_data['market_cap'] > MAX_MARKET_CAP_SOL:
-        queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Market Cap ${token_data['market_cap']:.2f} hors plage [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}]")
+    if token_data['market_cap'] < MIN_MARKET_CAP_USD or token_data['market_cap'] > MAX_MARKET_CAP_USD:
+        queue_message(chat_id, f"⚠️ `{token_address}` rejeté : Market Cap ${token_data['market_cap']:.2f} hors plage [{MIN_MARKET_CAP_USD}, {MAX_MARKET_CAP_USD}]")
         return None
 
     return token_data
@@ -856,12 +854,12 @@ def adjust_reinvestment_ratio(message):
         queue_message(chat_id, "⚠️ Erreur : Entrez un nombre valide (ex. : 0.9)")
 
 def adjust_detection_criteria(message):
-    global MIN_VOLUME_SOL, MAX_VOLUME_SOL, MIN_LIQUIDITY, MIN_MARKET_CAP_SOL, MAX_MARKET_CAP_SOL, MIN_BUY_SELL_RATIO, MAX_TOKEN_AGE_SECONDS
+    global MIN_VOLUME_SOL, MAX_VOLUME_SOL, MIN_LIQUIDITY, MIN_MARKET_CAP_USD, MAX_MARKET_CAP_USD, MIN_BUY_SELL_RATIO, MAX_TOKEN_AGE_SECONDS
     chat_id = message.chat.id
     try:
         criteria = [float(x.strip()) for x in message.text.split(",")]
         if len(criteria) != 7:
-            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 1,2000000,100,50,5000000,1.5,300)")
+            queue_message(chat_id, "⚠️ Entrez 7 valeurs séparées par des virgules (ex. : 1,2000000,100,5000,10000,5.0,900)")
             return
         min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age = criteria
         if min_vol < 0 or max_vol < min_vol or min_liq < 0 or min_mc < 0 or max_mc < min_mc or min_ratio < 0 or max_age < 0:
@@ -870,20 +868,20 @@ def adjust_detection_criteria(message):
         MIN_VOLUME_SOL = min_vol
         MAX_VOLUME_SOL = max_vol
         MIN_LIQUIDITY = min_liq
-        MIN_MARKET_CAP_SOL = min_mc
-        MAX_MARKET_CAP_SOL = max_mc
+        MIN_MARKET_CAP_USD = min_mc
+        MAX_MARKET_CAP_USD = max_mc
         MIN_BUY_SELL_RATIO = min_ratio
         MAX_TOKEN_AGE_SECONDS = max_age
         queue_message(chat_id, (
             f"✅ Critères de détection mis à jour :\n"
             f"Volume : [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}] SOL\n"
             f"Liquidité min : {MIN_LIQUIDITY} $\n"
-            f"Market Cap : [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}] $\n"
+            f"Market Cap : [{MIN_MARKET_CAP_USD}, {MAX_MARKET_CAP_USD}] $\n"
             f"Ratio A/V min : {MIN_BUY_SELL_RATIO}\n"
             f"Âge max : {MAX_TOKEN_AGE_SECONDS/60:.2f} min"
         ))
     except ValueError:
-        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 1,2000000,100,50,5000000,1.5,300)")
+        queue_message(chat_id, "⚠️ Erreur : Entrez des nombres valides (ex. : 1,2000000,100,5000,10000,5.0,900)")
 
 async def run_tasks(chat_id):
     await monitor_and_sell(chat_id)
@@ -1038,7 +1036,7 @@ def callback_query(call):
                 f"Mise Solana: {mise_depart_sol} SOL\n"
                 f"Stop-Loss: {stop_loss_threshold}%\n"
                 f"Take-Profit: {take_profit_display}\n"
-                f"Critères détection: Volume [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}] SOL, Liquidité min {MIN_LIQUIDITY} $, Market Cap [{MIN_MARKET_CAP_SOL}, {MAX_MARKET_CAP_SOL}] $, Ratio A/V min {MIN_BUY_SELL_RATIO}, Âge max {MAX_TOKEN_AGE_SECONDS/60:.2f} min"
+                f"Critères détection: Volume [{MIN_VOLUME_SOL}, {MAX_VOLUME_SOL}] SOL, Liquidité min {MIN_LIQUIDITY} $, Market Cap [{MIN_MARKET_CAP_USD}, {MAX_MARKET_CAP_USD}] $, Ratio A/V min {MIN_BUY_SELL_RATIO}, Âge max {MAX_TOKEN_AGE_SECONDS/60:.2f} min"
             ))
         elif call.data == "launch":
             if not trade_active:
@@ -1069,7 +1067,7 @@ def callback_query(call):
             queue_message(chat_id, "Entrez le nouveau ratio de réinvestissement (ex. : 0.9) :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_reinvestment_ratio)
         elif call.data == "adjust_detection_criteria":
-            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age_seconds) ex. : 1,2000000,100,50,5000000,1.5,300 :")
+            queue_message(chat_id, "Entrez les nouveaux critères (min_vol, max_vol, min_liq, min_mc, max_mc, min_ratio, max_age_seconds) ex. : 1,2000000,100,5000,10000,5.0,900 :")
             bot.register_next_step_handler_by_chat_id(chat_id, adjust_detection_criteria)
         elif call.data.startswith("sell_pct_"):
             parts = call.data.split("_")
