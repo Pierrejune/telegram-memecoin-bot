@@ -737,7 +737,7 @@ async def get_solana_balance(chat_id):
     try:
         if not solana_keypair:
             await initialize_bot(chat_id)
-        if not solana_keypair k:
+        if not solana_keypair:
             return 0
         async with aiohttp.ClientSession() as session:
             response = await session.post(QUICKNODE_SOL_URL, json={
