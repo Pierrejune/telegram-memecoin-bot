@@ -68,7 +68,7 @@ mise_depart_sol = 0.5
 stop_loss_threshold = 10
 trailing_stop_percentage = 3
 take_profit_steps = [1.2, 2, 10, 100, 500]
-take_profit_percentages = [10, 15, 20, 25, 50]  # Pourcentages associés à chaque seuil
+take_profit_percentages = [10, 15, 20, 25, 50]
 max_positions = 5
 profit_reinvestment_ratio = 0.9
 slippage_max = 0.25
@@ -200,132 +200,158 @@ async def quicknode_webhook():
             logger.info(f"Données JSON parsées (Content-Type: {content_type}): {json.dumps(data, indent=2)}")
         except json.JSONDecodeError as e:
             logger.error(f"Échec parsing JSON: {str(e)}. Données: {raw_data[:1000]}...")
-            if "account" in raw_data or "pubkey" in raw_data:
-                logger.warning("Données non-JSON détectées, tentative de traitement minimal")
-                data = {"raw": raw_data}
-            else:
-                logger.warning("Données non exploitables, ignorées")
-                return "OK", 200
+            return "OK", 200
 
-        # Gérer les cas où data est une liste (QuickNode peut envoyer une liste de dictionnaires)
+        # Gérer différents formats de données QuickNode
+        items_to_process = []
         if isinstance(data, list):
-            for item in data:
-                if not isinstance(item, dict):
-                    logger.warning(f"Élément de la liste invalide (type: {type(item)}), ignoré")
-                    continue
-                await process_quicknode_item(item)
+            items_to_process = data
         elif isinstance(data, dict):
-            await process_quicknode_item(data)
+            # Vérifier si c'est une réponse JSON-RPC avec un champ 'result'
+            if 'result' in data:
+                result = data['result']
+                if isinstance(result, list):
+                    items_to_process = result
+                elif isinstance(result, dict):
+                    items_to_process = [result]
+            else:
+                items_to_process = [data]
         else:
             logger.warning(f"Données invalides (type: {type(data)}), ignorées")
             return "OK", 200
+
+        for item in items_to_process:
+            if not isinstance(item, dict):
+                logger.warning(f"Élément invalide (type: {type(item)}), ignoré")
+                continue
+
+            # Vérifier les champs nécessaires pour Pump.fun ou Raydium
+            if 'accounts' in item and 'instructions' in item:
+                # Structure typique d'une transaction Solana
+                instructions = item.get('instructions', [])
+                for instruction in instructions:
+                    program_id = instruction.get('programId')
+                    if not program_id:
+                        continue
+
+                    if program_id in [str(PUMP_FUN_PROGRAM_ID), str(RAYDIUM_PROGRAM_ID)]:
+                        token_address = None
+                        accounts = instruction.get('accounts', [])
+                        if accounts:
+                            token_address = accounts[0].get('pubkey') if isinstance(accounts[0], dict) else accounts[0]
+
+                        if not token_address:
+                            logger.warning("Aucune adresse de token trouvée dans l'instruction")
+                            continue
+
+                        data_bytes = instruction.get('data')
+                        if not data_bytes:
+                            continue
+
+                        try:
+                            data_bytes = base58.b58decode(data_bytes)
+                        except Exception as e:
+                            logger.error(f"Échec décodage base58: {str(e)}")
+                            continue
+
+                        if len(data_bytes) < 9:
+                            continue
+
+                        amount = int.from_bytes(data_bytes[1:9], 'little') / 10**9
+                        seller_address = accounts[0] if isinstance(accounts[0], str) else accounts[0].get('pubkey')
+                        accounts_in_tx[token_address] = accounts_in_tx.get(token_address, set()).union(
+                            {acc if isinstance(acc, str) else acc.get('pubkey') for acc in accounts}
+                        )
+
+                        if data_bytes[0] == 2:  # Buy
+                            buy_volume[token_address] = buy_volume.get(token_address, 0) + amount
+                            buy_count[token_address] = buy_count.get(token_address, 0) + 1
+                            if token_address not in token_timestamps:
+                                token_timestamps[token_address] = time.time()
+                        elif data_bytes[0] == 3:  # Sell
+                            sell_volume[token_address] = sell_volume.get(token_address, 0) + amount
+                            sell_count[token_address] = sell_count.get(token_address, 0) + 1
+                            if token_address not in token_timestamps:
+                                token_timestamps[token_address] = time.time()
+
+                            if token_address in token_metrics and 'top_holders' in token_metrics[token_address]:
+                                top_holders = token_metrics[token_address]['top_holders']
+                                if seller_address in top_holders:
+                                    holder_amount = top_holders[seller_address]
+                                    sell_fraction = amount / holder_amount if holder_amount > 0 else 0
+                                    token_data = await get_token_data(token_address)
+                                    liquidity = token_data['liquidity'] if token_data else 0
+                                    price = token_data['price'] if token_data else 0
+
+                                    if 'sell_activity' not in token_metrics[token_address]:
+                                        token_metrics[token_address]['sell_activity'] = {}
+                                    sell_activity = token_metrics[token_address]['sell_activity'].setdefault(seller_address, [])
+                                    sell_activity.append((time.time(), amount))
+                                    sell_activity[:] = [x for x in sell_activity if time.time() - x[0] <= MAX_SELL_ACTIVITY_WINDOW]
+                                    recent_sells = sum(x[1] for x in sell_activity)
+
+                                    if (sell_fraction > DUMP_WARNING_THRESHOLD or 
+                                        amount * price > liquidity * LIQUIDITY_DUMP_THRESHOLD or 
+                                        len(sell_activity) >= 3):
+                                        queue_message(chat_id_global, f"🚨 `{token_address}`: Activité suspecte ! Vendeur `{seller_address}` vend {amount:.2f} SOL ({sell_fraction:.2%} de son solde)")
+                                        if token_address in portfolio:
+                                            queue_message(chat_id_global, f"⚡ Dump imminent sur `{token_address}` ! Vente totale.")
+                                            await sell_token(chat_id_global, token_address, portfolio[token_address]['amount'], price)
+
+                        age_seconds = time.time() - token_timestamps.get(token_address, time.time())
+                        if age_seconds <= MAX_TOKEN_AGE_SECONDS:
+                            bv = buy_volume.get(token_address, 0)
+                            sv = sell_volume.get(token_address, 0)
+                            ratio = bv / sv if sv > 0 else (bv > 0 and float('inf') or 1)
+                            token_metrics[token_address] = {
+                                'buy_sell_ratio': ratio,
+                                'buy_count': buy_count.get(token_address, 0),
+                                'sell_count': sell_count.get(token_address, 0),
+                                'last_update': time.time(),
+                                'top_holders': token_metrics[token_address].get('top_holders', {}),
+                                'sell_activity': token_metrics[token_address].get('sell_activity', {})
+                            }
+
+                            queue_message(chat_id_global, f"🔍 Analyse {token_address}: Ratio A/V = {ratio:.2f}, BV = {bv:.2f}, SV = {sv:.2f}")
+
+                            if sv > bv * 0.5:
+                                dynamic_blacklist.add(token_address)
+                                queue_message(chat_id_global, f"⚠️ `{token_address}` rejeté : Dump artificiel détecté")
+                            elif len(accounts_in_tx.get(token_address, set())) < MIN_ACCOUNTS_IN_TX:
+                                queue_message(chat_id_global, f"⚠️ `{token_address}` rejeté : Pas assez de comptes dans TX")
+                            elif ratio >= MIN_BUY_SELL_RATIO and await custom_rug_detector(chat_id_global, token_address):
+                                token_data = await validate_token_full(chat_id_global, token_address)
+                                if token_data:
+                                    queue_message(chat_id_global, f"🎯 Pump détecté : `{token_address}` (Ratio A/V: {ratio:.2f})")
+                                    detected_tokens[token_address] = True
+                                    last_detection_time[token_address] = time.time()
+                                    await buy_token_solana(chat_id_global, token_address, mise_depart_sol)
+
+                        if time.time() - token_timestamps.get(token_address, 0) > 300:
+                            buy_volume.pop(token_address, None)
+                            sell_volume.pop(token_address, None)
+                            buy_count.pop(token_address, None)
+                            sell_count.pop(token_address, None)
+                            accounts_in_tx.pop(token_address, None)
+                            token_timestamps.pop(token_address, None)
+                            token_metrics.pop(token_address, None)
+
+            # Mise à jour du prix SOL
+            elif 'pubkey' in item and item['pubkey'] == str(SOL_USDC_POOL):
+                account_data = item.get('data', [None])[0]
+                if account_data:
+                    decoded_data = base58.b58decode(account_data)
+                    sol_amount = int.from_bytes(decoded_data[64:80], 'little') / 10**9
+                    usdc_amount = int.from_bytes(decoded_data[80:96], 'little') / 10**6
+                    if sol_amount > 0:
+                        sol_price_usd = usdc_amount / sol_amount
+                        queue_message(chat_id_global, f"💰 Prix SOL mis à jour: ${sol_price_usd:.2f}")
 
         return "OK", 200
     except Exception as e:
         logger.error(f"Erreur critique webhook QuickNode: {str(e)}")
         queue_message(chat_id_global, f"⚠️ Erreur webhook QuickNode: `{str(e)}`")
         return "OK", 200
-
-async def process_quicknode_item(item):
-    global sol_price_usd
-    if 'account' in item and 'pubkey' in item['account']:
-        token_address = item['account']['pubkey']
-        instruction = item.get('instruction', {})
-
-        if instruction and instruction.get('programId') == str(PUMP_FUN_PROGRAM_ID):
-            data_bytes = base58.b58decode(instruction.get('data', ''))
-            if len(data_bytes) < 9:
-                return
-
-            amount = int.from_bytes(data_bytes[1:9], 'little') / 10**9
-            accounts = instruction.get('accounts', [])
-            if not accounts:
-                return
-            seller_address = accounts[0]['pubkey']
-            accounts_in_tx[token_address] = accounts_in_tx.get(token_address, set()).union({acc['pubkey'] for acc in accounts})
-
-            if data_bytes[0] == 2:  # Buy
-                buy_volume[token_address] = buy_volume.get(token_address, 0) + amount
-                buy_count[token_address] = buy_count.get(token_address, 0) + 1
-                if token_address not in token_timestamps:
-                    token_timestamps[token_address] = time.time()
-            elif data_bytes[0] == 3:  # Sell
-                sell_volume[token_address] = sell_volume.get(token_address, 0) + amount
-                sell_count[token_address] = sell_count.get(token_address, 0) + 1
-                if token_address not in token_timestamps:
-                    token_timestamps[token_address] = time.time()
-
-                if token_address in token_metrics and 'top_holders' in token_metrics[token_address]:
-                    top_holders = token_metrics[token_address]['top_holders']
-                    if seller_address in top_holders:
-                        holder_amount = top_holders[seller_address]
-                        sell_fraction = amount / holder_amount if holder_amount > 0 else 0
-                        token_data = await get_token_data(token_address)
-                        liquidity = token_data['liquidity'] if token_data else 0
-                        price = token_data['price'] if token_data else 0
-
-                        if 'sell_activity' not in token_metrics[token_address]:
-                            token_metrics[token_address]['sell_activity'] = {}
-                        sell_activity = token_metrics[token_address]['sell_activity'].setdefault(seller_address, [])
-                        sell_activity.append((time.time(), amount))
-                        sell_activity[:] = [x for x in sell_activity if time.time() - x[0] <= MAX_SELL_ACTIVITY_WINDOW]
-                        recent_sells = sum(x[1] for x in sell_activity)
-
-                        if (sell_fraction > DUMP_WARNING_THRESHOLD or 
-                            amount * price > liquidity * LIQUIDITY_DUMP_THRESHOLD or 
-                            len(sell_activity) >= 3):
-                            queue_message(chat_id_global, f"🚨 `{token_address}`: Activité suspecte ! Vendeur `{seller_address}` vend {amount:.2f} SOL ({sell_fraction:.2%} de son solde)")
-                            if token_address in portfolio:
-                                queue_message(chat_id_global, f"⚡ Dump imminent sur `{token_address}` ! Vente totale.")
-                                await sell_token(chat_id_global, token_address, portfolio[token_address]['amount'], price)
-
-            age_seconds = time.time() - token_timestamps.get(token_address, time.time())
-            if age_seconds <= MAX_TOKEN_AGE_SECONDS:
-                bv = buy_volume.get(token_address, 0)
-                sv = sell_volume.get(token_address, 0)
-                ratio = bv / sv if sv > 0 else (bv > 0 and float('inf') or 1)
-                token_metrics[token_address] = {
-                    'buy_sell_ratio': ratio,
-                    'buy_count': buy_count.get(token_address, 0),
-                    'sell_count': sell_count.get(token_address, 0),
-                    'last_update': time.time(),
-                    'top_holders': token_metrics[token_address].get('top_holders', {}),
-                    'sell_activity': token_metrics[token_address].get('sell_activity', {})
-                }
-
-                queue_message(chat_id_global, f"🔍 Analyse {token_address}: Ratio A/V = {ratio:.2f}, BV = {bv:.2f}, SV = {sv:.2f}")
-
-                if sv > bv * 0.5:
-                    dynamic_blacklist.add(token_address)
-                    queue_message(chat_id_global, f"⚠️ `{token_address}` rejeté : Dump artificiel détecté")
-                elif len(accounts_in_tx.get(token_address, set())) < MIN_ACCOUNTS_IN_TX:
-                    queue_message(chat_id_global, f"⚠️ `{token_address}` rejeté : Pas assez de comptes dans TX")
-                elif ratio >= MIN_BUY_SELL_RATIO and await custom_rug_detector(chat_id_global, token_address):
-                    token_data = await validate_token_full(chat_id_global, token_address)
-                    if token_data:
-                        queue_message(chat_id_global, f"🎯 Pump détecté : `{token_address}` (Ratio A/V: {ratio:.2f})")
-                        detected_tokens[token_address] = True
-                        last_detection_time[token_address] = time.time()
-                        await buy_token_solana(chat_id_global, token_address, mise_depart_sol)
-
-            if time.time() - token_timestamps.get(token_address, 0) > 300:
-                buy_volume.pop(token_address, None)
-                sell_volume.pop(token_address, None)
-                buy_count.pop(token_address, None)
-                sell_count.pop(token_address, None)
-                accounts_in_tx.pop(token_address, None)
-                token_timestamps.pop(token_address, None)
-                token_metrics.pop(token_address, None)
-
-    elif 'pubkey' in item and item['pubkey'] == str(SOL_USDC_POOL):
-        account_data = item.get('data', [None])[0]
-        if account_data:
-            decoded_data = base58.b58decode(account_data)
-            sol_amount = int.from_bytes(decoded_data[64:80], 'little') / 10**9
-            usdc_amount = int.from_bytes(decoded_data[80:96], 'little') / 10**6
-            if sol_amount > 0:
-                sol_price_usd = usdc_amount / sol_amount
-                queue_message(chat_id_global, f"💰 Prix SOL mis à jour: ${sol_price_usd:.2f}")
 
 async def validate_address(token_address):
     try:
@@ -805,8 +831,8 @@ def adjust_take_profit(message):
         if len(values) != 10:
             queue_message(chat_id, "⚠️ Entrez 10 valeurs (seuil1,pct1,seuil2,pct2,...,seuil5,pct5) ex. : 1.2,10,2,15,10,20,100,25,500,50")
             return
-        new_steps = values[0::2]  # Seuils (1.2, 2, 10, 100, 500)
-        new_percentages = values[1::2]  # Pourcentages (10, 15, 20, 25, 50)
+        new_steps = values[0::2]
+        new_percentages = values[1::2]
         if all(x > 0 for x in new_steps) and all(0 < x <= 100 for x in new_percentages):
             take_profit_steps = new_steps
             take_profit_percentages = new_percentages
